@@ -1,19 +1,17 @@
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures_util::StreamExt;
-use futures::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use libp2p::tcp;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, error, info, warn};
-use serde::{Deserialize, Serialize};
 use libp2p::{
     identify::{self, Event as IdentifyEvent},
     identity,
     kad::{
-        self, store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig, Event as KademliaEvent,
-        Mode, Record, GetRecordOk, PutRecordOk, QueryResult
+        self, store::MemoryStore, Behaviour as Kademlia, Config as KademliaConfig,
+        Event as KademliaEvent, GetRecordOk, Mode, PutRecordOk, QueryResult, Record,
     },
     mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent},
     ping::{self, Behaviour as Ping, Event as PingEvent},
@@ -21,6 +19,9 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
@@ -48,14 +49,18 @@ pub enum DhtCommand {
     SearchFile(String),
     ConnectPeer(String),
     GetPeerCount(oneshot::Sender<usize>),
-    Echo { peer: PeerId, payload: Vec<u8>, tx: oneshot::Sender<Result<Vec<u8>, String>> },
+    Echo {
+        peer: PeerId,
+        payload: Vec<u8>,
+        tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
     Shutdown(oneshot::Sender<()>),
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub enum DhtEvent {
     PeerDiscovered(String),
-    PeerConnected(String), // Replaced by ProxyStatus
+    PeerConnected(String),    // Replaced by ProxyStatus
     PeerDisconnected(String), // Replaced by ProxyStatus
     FileDiscovered(FileMetadata),
     FileNotFound(String),
@@ -67,7 +72,10 @@ pub enum DhtEvent {
         latency_ms: Option<u64>,
         error: Option<String>,
     },
-    PeerRtt { peer: String, rtt_ms: u64 },
+    PeerRtt {
+        peer: String,
+        rtt_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,7 +118,10 @@ async fn read_framed<T: AsyncRead + Unpin + Send>(io: &mut T) -> std::io::Result
     io.read_exact(&mut data).await?;
     Ok(data)
 }
-async fn write_framed<T: AsyncWrite + Unpin + Send>(io: &mut T, data: Vec<u8>) -> std::io::Result<()> {
+async fn write_framed<T: AsyncWrite + Unpin + Send>(
+    io: &mut T,
+    data: Vec<u8>,
+) -> std::io::Result<()> {
     io.write_all(&(data.len() as u32).to_le_bytes()).await?;
     io.write_all(&data).await?;
     io.flush().await
@@ -119,23 +130,49 @@ async fn write_framed<T: AsyncWrite + Unpin + Send>(io: &mut T, data: Vec<u8>) -
 #[async_trait::async_trait]
 impl rr::Codec for ProxyCodec {
     type Protocol = String;
-    type Request  = EchoRequest;
+    type Request = EchoRequest;
     type Response = EchoResponse;
 
-    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Self::Request>
-    where T: AsyncRead + Unpin + Send {
+    async fn read_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
         Ok(EchoRequest(read_framed(io).await?))
     }
-    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> std::io::Result<Self::Response>
-    where T: AsyncRead + Unpin + Send {
+    async fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> std::io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
         Ok(EchoResponse(read_framed(io).await?))
     }
-    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, EchoRequest(data): EchoRequest) -> std::io::Result<()>
-    where T: AsyncWrite + Unpin + Send {
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        EchoRequest(data): EchoRequest,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
         write_framed(io, data).await
     }
-    async fn write_response<T>(&mut self, _: &Self::Protocol, io: &mut T, EchoResponse(data): EchoResponse) -> std::io::Result<()>
-    where T: AsyncWrite + Unpin + Send {
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        EchoResponse(data): EchoResponse,
+    ) -> std::io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
         write_framed(io, data).await
     }
 }
@@ -162,7 +199,11 @@ impl DhtMetricsSnapshot {
 impl DhtMetrics {
     fn record_listen_addr(&mut self, addr: &Multiaddr) {
         let addr_str = addr.to_string();
-        if !self.listen_addrs.iter().any(|existing| existing == &addr_str) {
+        if !self
+            .listen_addrs
+            .iter()
+            .any(|existing| existing == &addr_str)
+        {
             self.listen_addrs.push(addr_str);
         }
     }
@@ -175,7 +216,9 @@ async fn run_dht_node(
     event_tx: mpsc::Sender<DhtEvent>,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
     metrics: Arc<Mutex<DhtMetrics>>,
-    pending_echo: Arc<Mutex<HashMap<rr::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+    pending_echo: Arc<
+        Mutex<HashMap<rr::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>>,
+    >,
 ) {
     // Periodic bootstrap interval
     let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
@@ -546,7 +589,9 @@ async fn handle_ping_event(event: PingEvent) {
 
 impl DhtService {
     pub async fn echo(&self, peer_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-        let peer: PeerId = peer_id.parse().map_err(|e| format!("invalid peer id: {e}"))?;
+        let peer: PeerId = peer_id
+            .parse()
+            .map_err(|e| format!("invalid peer id: {e}"))?;
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(DhtCommand::Echo { peer, payload, tx })
@@ -563,7 +608,8 @@ pub struct DhtService {
     peer_id: String,
     connected_peers: Arc<Mutex<HashSet<PeerId>>>,
     metrics: Arc<Mutex<DhtMetrics>>,
-    pending_echo: Arc<Mutex<HashMap<rr::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+    pending_echo:
+        Arc<Mutex<HashMap<rr::OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>>>,
 }
 
 impl DhtService {
@@ -615,7 +661,8 @@ impl DhtService {
 
         // Request-Response behaviour
         let rr_cfg = rr::Config::default();
-        let protocols = std::iter::once(("/chiral/proxy/1.0.0".to_string(), rr::ProtocolSupport::Full));
+        let protocols =
+            std::iter::once(("/chiral/proxy/1.0.0".to_string(), rr::ProtocolSupport::Full));
         let proxy_rr = rr::Behaviour::new(protocols, rr_cfg);
 
         let behaviour = DhtBehaviour {
@@ -625,18 +672,18 @@ impl DhtService {
             ping: Ping::new(ping::Config::new()),
             proxy_rr,
         };
-
+        let tcp_config = tcp::Config::default().nodelay(true);
         // Create the swarm
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
-                Default::default(),
+                tcp_config,
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
             )?
             .with_behaviour(|_| behaviour)?
             .with_swarm_config(
-                |c| c.with_idle_connection_timeout(Duration::from_secs(300)), // 5 minutes
+                |c| c.with_idle_connection_timeout(0), // 5 minutes
             )
             .build();
 
@@ -831,13 +878,10 @@ mod tests {
     #[test]
     fn metrics_snapshot_carries_listen_addrs() {
         let mut metrics = DhtMetrics::default();
-        metrics
-            .record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
-        metrics
-            .record_listen_addr(&"/ip4/0.0.0.0/tcp/4001".parse::<Multiaddr>().unwrap());
+        metrics.record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
+        metrics.record_listen_addr(&"/ip4/0.0.0.0/tcp/4001".parse::<Multiaddr>().unwrap());
         // Duplicate should be ignored
-        metrics
-            .record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
+        metrics.record_listen_addr(&"/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap());
 
         let snapshot = DhtMetricsSnapshot::from(metrics, 5);
         assert_eq!(snapshot.peer_count, 5);
