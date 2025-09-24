@@ -257,6 +257,8 @@ async fn run_dht_node(
     // Periodic bootstrap interval
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
 
+    let mut ping_failures: HashMap<PeerId, u8> = HashMap::new();
+
     'outer: loop {
         tokio::select! {
 
@@ -359,16 +361,68 @@ async fn run_dht_node(
                                         rtt_ms: rtt.as_millis() as u64,
                                     })
                                     .await;
+
+                                ping_failures.remove(&peer);
                             }
                             libp2p::ping::Event { peer, result: Err(libp2p::ping::Failure::Timeout), .. } => {
                                 let _ = event_tx
                                     .send(DhtEvent::Error(format!("Ping timeout {}", peer)))
                                     .await;
+
+                                let count = ping_failures.entry(peer).or_insert(0);
+                                *count += 1;
+
+                                if *count >= 3 {
+                                    info!(
+                                        "Kademlia routing table: {:?}",
+                                        for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+                                            println!("Bucket range: {:?}", bucket.range());
+                                            println!("Nodes in bucket:");
+                                            for entry in bucket.iter() {
+                                                println!(
+                                                    "  Peer ID: {:?}, Available At: {:?}",
+                                                    entry.node.key.preimage(),
+                                                    entry.node.value
+                                                );
+                                            }
+                                        }
+                                    );
+                                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                                    ping_failures.remove(&peer);
+                                    let _ = event_tx.send(DhtEvent::Error(format!(
+                                        "Peer {} removed after 3 failed pings", peer
+                                    ))).await;
+                                }
+
                             }
                             libp2p::ping::Event { peer, result: Err(e), .. } => {
                                 warn!("ping error with {}: {}", peer, e);
                                 // If needed, also send to UI
                                 // let _ = event_tx.send(DhtEvent::Error(format!("Ping error {}: {}", peer, e))).await;
+                                let count = ping_failures.entry(peer).or_insert(0);
+                                *count += 1;
+                                if *count >= 3 {
+                                    info!(
+                                        "Kademlia routing table: {:?}",
+                                        for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+                                            println!("Bucket range: {:?}", bucket.range());
+                                            println!("Nodes in bucket:");
+                                            for entry in bucket.iter() {
+                                                println!(
+                                                    "  Peer ID: {:?}, Available At: {:?}",
+                                                    entry.node.key.preimage(),
+                                                    entry.node.value
+                                                );
+                                            }
+                                        }
+                                    );
+
+                                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                                    ping_failures.remove(&peer);
+                                    let _ = event_tx.send(DhtEvent::Error(format!(
+                                        "Peer {} removed after 3 failed pings", peer
+                                    ))).await;
+                                }
                             }
                         }
                     }
@@ -589,11 +643,12 @@ async fn handle_identify_event(
             // Add identified peer to Kademlia routing table
             if info.protocol_version != EXPECTED_PROTOCOL_VERSION {
                 warn!(
-                    "Peer {} has a mismatched protocol version: '{}'. Expected: '{}'. Banning peer.",
+                    "Peer {} has a mismatched protocol version: '{}'. Expected: '{}'. Removing peer.",
                     peer_id,
                     info.protocol_version,
                     EXPECTED_PROTOCOL_VERSION
                 );
+                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             } else {
                 for addr in info.listen_addrs {
                     if not_loopback(&addr){
