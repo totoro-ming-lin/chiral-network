@@ -1,8 +1,9 @@
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures_util::StreamExt;
 use libp2p::tcp;
-
+use libp2p::multiaddr::Protocol;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -22,7 +23,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
-
+const EXPECTED_PROTOCOL_VERSION: &str = "/chiral/1.0.0";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     /// The Merkle root of the file's chunks, which serves as its unique identifier.
@@ -221,19 +222,11 @@ async fn run_dht_node(
     >,
 ) {
     // Periodic bootstrap interval
-    let mut bootstrap_interval = tokio::time::interval(Duration::from_secs(30));
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
 
     'outer: loop {
         tokio::select! {
-            _ = bootstrap_interval.tick() => {
-                // Periodically bootstrap to maintain connections
-                let _ = swarm.behaviour_mut().kademlia.bootstrap();
-                if let Ok(mut m) = metrics.try_lock() {
-                    m.last_bootstrap = Some(SystemTime::now());
-                }
-                debug!("Performing periodic Kademlia bootstrap");
-            }
+
 
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -345,9 +338,6 @@ async fn run_dht_node(
                         info!("✅ CONNECTION ESTABLISHED with peer: {}", peer_id);
                         info!("   Endpoint: {:?}", endpoint);
 
-                        // Add peer to Kademlia routing table
-                        swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
-
                         let remote_addr_str = endpoint.get_remote_address().to_string();
                         let _ = event_tx.send(DhtEvent::ProxyStatus {
                             id: peer_id.to_string(),
@@ -410,6 +400,7 @@ async fn run_dht_node(
                             } else if error.to_string().contains("Transport") {
                                 warn!("   ℹ Hint: Transport protocol negotiation failed.");
                             }
+                            swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
                         } else {
                             error!("❌ Outgoing connection error to unknown peer: {}", error);
                         }
@@ -538,8 +529,19 @@ async fn handle_identify_event(
         IdentifyEvent::Received { peer_id, info, .. } => {
             info!("Identified peer {}: {:?}", peer_id, info.protocol_version);
             // Add identified peer to Kademlia routing table
-            for addr in info.listen_addrs {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            if info.protocol_version != EXPECTED_PROTOCOL_VERSION {
+                warn!(
+                    "Peer {} has a mismatched protocol version: '{}'. Expected: '{}'. Banning peer.",
+                    peer_id,
+                    info.protocol_version,
+                    EXPECTED_PROTOCOL_VERSION
+                );
+            } else {
+                for addr in info.listen_addrs {
+                    if not_start_with_127_or_10(&addr){
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    }
+                }
             }
         }
         IdentifyEvent::Sent { peer_id, .. } => {
@@ -640,7 +642,11 @@ impl DhtService {
         let store = MemoryStore::new(local_peer_id);
         let mut kad_cfg = KademliaConfig::new(StreamProtocol::new("/chiral/kad/1.0.0"));
         // Align with docs: shorter queries, higher replication
-        kad_cfg.set_query_timeout(Duration::from_secs(10));
+        kad_cfg.set_query_timeout(Duration::from_secs(40));
+        let bootstrap_interval = Duration::from_secs(30);
+
+        kad_cfg.set_periodic_bootstrap_interval(Some(bootstrap_interval));
+
         // Replication factor of 20 (as per spec table)
         if let Some(nz) = std::num::NonZeroUsize::new(20) {
             kad_cfg.set_replication_factor(nz);
@@ -652,7 +658,7 @@ impl DhtService {
 
         // Create identify behaviour
         let identify = identify::Behaviour::new(identify::Config::new(
-            "/chiral/1.0.0".to_string(),
+            EXPECTED_PROTOCOL_VERSION.to_string(),
             local_key.public(),
         ));
 
@@ -683,7 +689,7 @@ impl DhtService {
             )?
             .with_behaviour(|_| behaviour)?
             .with_swarm_config(
-                |c| c.with_idle_connection_timeout(0), // 5 minutes
+                |c| c.with_idle_connection_timeout(Duration::from_secs(300)), // 5 minutes
             )
             .build();
 
@@ -842,6 +848,87 @@ impl DhtService {
         }
         events
     }
+}
+
+// Not filtering out some locals because SBU peer connections are being done over local IPs
+fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    
+    // Check if it's a global address by excluding all local/private ranges
+    !(
+        // RFC1918 private ranges
+        (octets[0] == 10) ||
+        // (octets[0] == 172 && (16..=31).contains(&octets[1])) ||
+        // (octets[0] == 192 && octets[1] == 168) ||
+        
+        // Loopback (127.0.0.0/8)
+        (octets[0] == 127) ||
+        
+        // // Link-local (169.254.0.0/16)
+        // (octets[0] == 169 && octets[1] == 254) ||
+        
+        // // Multicast (224.0.0.0/4)
+        // (octets[0] >= 224 && octets[0] <= 239) ||
+        
+        // // Reserved/experimental (240.0.0.0/4)
+        // (octets[0] >= 240) ||
+        
+        // // This network (0.0.0.0/8) - though rarely seen
+        // (octets[0] == 0) ||
+        
+        // Broadcast address
+        (octets == [255, 255, 255, 255])
+    )
+}
+
+fn is_global_v6(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let seg0 = segments[0];
+    
+    !(
+        // Loopback (::1)
+        ip.is_loopback() ||
+        
+        // Unspecified (::)
+        ip.is_unspecified() ||
+        
+        // Link-local (fe80::/10)
+        (seg0 & 0xffc0 == 0xfe80) ||
+        
+        // Unique local (fc00::/7)
+        (seg0 & 0xfe00 == 0xfc00) ||
+        
+        // Site-local (deprecated, fec0::/10)
+        (seg0 & 0xffc0 == 0xfec0) ||
+        
+        // Multicast (ff00::/8)
+        (seg0 & 0xff00 == 0xff00) ||
+        
+        // IPv4-mapped IPv6 addresses (::ffff:0:0/96) - check if the mapped IPv4 is local
+        (ip.to_ipv4_mapped().map_or(false, |v4| !is_global_v4(v4)))
+    )
+}
+
+fn not_start_with_127_or_10(ip: &Multiaddr) -> bool {
+    if let Some(ip) = multiaddr_to_ip(ip) {
+        match ip {
+            IpAddr::V4(v4) => is_global_v4(v4),
+            IpAddr::V6(v6) => is_global_v6(v6),
+        }
+    } else {
+        false
+    }
+}
+
+fn multiaddr_to_ip(addr: &Multiaddr) -> Option<IpAddr> {
+    for comp in addr.iter() {
+        match comp {
+            Protocol::Ip4(ipv4) => return Some(IpAddr::V4(ipv4)),
+            Protocol::Ip6(ipv6) => return Some(IpAddr::V6(ipv6)),
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
