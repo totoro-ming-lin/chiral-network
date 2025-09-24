@@ -224,6 +224,8 @@ async fn run_dht_node(
     // Periodic bootstrap interval
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
 
+    let mut ping_failures: HashMap<PeerId, u8> = HashMap::new();
+
     'outer: loop {
         tokio::select! {
 
@@ -321,16 +323,68 @@ async fn run_dht_node(
                                         rtt_ms: rtt.as_millis() as u64,
                                     })
                                     .await;
+
+                                ping_failures.remove(&peer);
                             }
                             libp2p::ping::Event { peer, result: Err(libp2p::ping::Failure::Timeout), .. } => {
                                 let _ = event_tx
                                     .send(DhtEvent::Error(format!("Ping timeout {}", peer)))
                                     .await;
+
+                                let count = ping_failures.entry(peer).or_insert(0);
+                                *count += 1;
+
+                                if *count >= 3 {
+                                    info!(
+                                        "Kademlia routing table: {:?}",
+                                        for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+                                            println!("Bucket range: {:?}", bucket.range());
+                                            println!("Nodes in bucket:");
+                                            for entry in bucket.iter() {
+                                                println!(
+                                                    "  Peer ID: {:?}, Available At: {:?}",
+                                                    entry.node.key.preimage(),
+                                                    entry.node.value
+                                                );
+                                            }
+                                        }
+                                    );
+                                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                                    ping_failures.remove(&peer);
+                                    let _ = event_tx.send(DhtEvent::Error(format!(
+                                        "Peer {} removed after 3 failed pings", peer
+                                    ))).await;
+                                }
+
                             }
                             libp2p::ping::Event { peer, result: Err(e), .. } => {
                                 warn!("ping error with {}: {}", peer, e);
                                 // If needed, also send to UI
                                 // let _ = event_tx.send(DhtEvent::Error(format!("Ping error {}: {}", peer, e))).await;
+                                let count = ping_failures.entry(peer).or_insert(0);
+                                *count += 1;
+                                if *count >= 3 {
+                                    info!(
+                                        "Kademlia routing table: {:?}",
+                                        for bucket in swarm.behaviour_mut().kademlia.kbuckets() {
+                                            println!("Bucket range: {:?}", bucket.range());
+                                            println!("Nodes in bucket:");
+                                            for entry in bucket.iter() {
+                                                println!(
+                                                    "  Peer ID: {:?}, Available At: {:?}",
+                                                    entry.node.key.preimage(),
+                                                    entry.node.value
+                                                );
+                                            }
+                                        }
+                                    );
+
+                                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                                    ping_failures.remove(&peer);
+                                    let _ = event_tx.send(DhtEvent::Error(format!(
+                                        "Peer {} removed after 3 failed pings", peer
+                                    ))).await;
+                                }
                             }
                         }
                     }
@@ -853,29 +907,29 @@ impl DhtService {
 // Not filtering out some locals because SBU peer connections are being done over local IPs
 fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
     let octets = ip.octets();
-    
+
     // Check if it's a global address by excluding all local/private ranges
     !(
         // RFC1918 private ranges
         (octets[0] == 10) ||
         // (octets[0] == 172 && (16..=31).contains(&octets[1])) ||
         // (octets[0] == 192 && octets[1] == 168) ||
-        
+
         // Loopback (127.0.0.0/8)
         // (octets[0] == 127) ||
-        
+
         // // Link-local (169.254.0.0/16)
         // (octets[0] == 169 && octets[1] == 254) ||
-        
+
         // // Multicast (224.0.0.0/4)
         // (octets[0] >= 224 && octets[0] <= 239) ||
-        
+
         // // Reserved/experimental (240.0.0.0/4)
         // (octets[0] >= 240) ||
-        
+
         // // This network (0.0.0.0/8) - though rarely seen
         // (octets[0] == 0) ||
-        
+
         // Broadcast address
         (octets == [255, 255, 255, 255])
     )
@@ -884,26 +938,26 @@ fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
 fn is_global_v6(ip: std::net::Ipv6Addr) -> bool {
     let segments = ip.segments();
     let seg0 = segments[0];
-    
+
     !(
         // Loopback (::1)
         ip.is_loopback() ||
-        
+
         // Unspecified (::)
         ip.is_unspecified() ||
-        
+
         // Link-local (fe80::/10)
         (seg0 & 0xffc0 == 0xfe80) ||
-        
+
         // Unique local (fc00::/7)
         (seg0 & 0xfe00 == 0xfc00) ||
-        
+
         // Site-local (deprecated, fec0::/10)
         (seg0 & 0xffc0 == 0xfec0) ||
-        
+
         // Multicast (ff00::/8)
         (seg0 & 0xff00 == 0xff00) ||
-        
+
         // IPv4-mapped IPv6 addresses (::ffff:0:0/96) - check if the mapped IPv4 is local
         (ip.to_ipv4_mapped().map_or(false, |v4| !is_global_v4(v4)))
     )
