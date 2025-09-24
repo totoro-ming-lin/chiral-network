@@ -538,7 +538,7 @@ async fn handle_identify_event(
                 );
             } else {
                 for addr in info.listen_addrs {
-                    if not_start_with_127_or_10(&addr){
+                    if not_loopback(&addr){
                         swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                     }
                 }
@@ -862,7 +862,7 @@ fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
         // (octets[0] == 192 && octets[1] == 168) ||
         
         // Loopback (127.0.0.0/8)
-        (octets[0] == 127) ||
+        // (octets[0] == 127) ||
         
         // // Link-local (169.254.0.0/16)
         // (octets[0] == 169 && octets[1] == 254) ||
@@ -909,7 +909,7 @@ fn is_global_v6(ip: std::net::Ipv6Addr) -> bool {
     )
 }
 
-fn not_start_with_127_or_10(ip: &Multiaddr) -> bool {
+fn not_loopback(ip: &Multiaddr) -> bool {
     if let Some(ip) = multiaddr_to_ip(ip) {
         match ip {
             IpAddr::V4(v4) => is_global_v4(v4),
