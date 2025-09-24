@@ -1,5 +1,8 @@
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures_util::StreamExt;
+use libp2p::multiaddr::Protocol;
+use async_std::net::IpAddr;
+use libp2p::tcp;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
