@@ -26,6 +26,16 @@ export interface FileMetadata {
   mimeType?: string;
 }
 
+export interface DhtHealth {
+  peerCount: number;
+  lastBootstrap: number | null;
+  lastPeerEvent: number | null;
+  lastError: string | null;
+  lastErrorAt: number | null;
+  bootstrapFailures: number;
+  listenAddrs: string[];
+}
+
 export class DhtService {
   private static instance: DhtService | null = null;
   private peerId: string | null = null;
@@ -170,6 +180,16 @@ export class DhtService {
     } catch (error) {
       console.error("Failed to get peer count:", error);
       return 0;
+    }
+  }
+
+  async getHealth(): Promise<DhtHealth | null> {
+    try {
+      const health = await invoke<DhtHealth | null>("get_dht_health");
+      return health;
+    } catch (error) {
+      console.error("Failed to get DHT health:", error);
+      return null;
     }
   }
 }
