@@ -46,6 +46,9 @@ pub struct CliArgs {
     // Generate consistent peerid
     #[arg(long)]
     pub secret: Option<String>,
+
+    // Runs in bootstrap mode
+    pub is_bootstrap: bool,
 }
 
 pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +68,7 @@ pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     // Start DHT node
-    let dht_service = DhtService::new(args.dht_port, bootstrap_nodes.clone(), args.secret).await?;
+    let dht_service = DhtService::new(args.dht_port, bootstrap_nodes.clone(), args.secret, args.is_bootstrap).await?;
     let peer_id = dht_service.get_peer_id().await;
 
     // Start the DHT running in background

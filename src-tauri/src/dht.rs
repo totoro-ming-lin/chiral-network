@@ -679,6 +679,7 @@ impl DhtService {
         port: u16,
         bootstrap_nodes: Vec<String>,
         secret: Option<String>,
+        is_bootstrap: bool
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Generate a new keypair for this node
         // Generate a keypair either from the secret or randomly
@@ -703,9 +704,14 @@ impl DhtService {
         let mut kad_cfg = KademliaConfig::new(StreamProtocol::new("/chiral/kad/1.0.0"));
         // Align with docs: shorter queries, higher replication
         kad_cfg.set_query_timeout(Duration::from_secs(10));
-        let bootstrap_interval = Duration::from_secs(30);
+        let bootstrap_interval = if is_bootstrap {
+            None
+        }
+        else {
+            Some(Duration::from_secs(30))
+        };
 
-        kad_cfg.set_periodic_bootstrap_interval(Some(bootstrap_interval));
+        kad_cfg.set_periodic_bootstrap_interval(bootstrap_interval);
 
         // Replication factor of 20 (as per spec table)
         if let Some(nz) = std::num::NonZeroUsize::new(20) {
@@ -978,29 +984,29 @@ impl DhtService {
 // Not filtering out some locals because SBU peer connections are being done over local IPs
 fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
     let octets = ip.octets();
-    
+
     // Check if it's a global address by excluding all local/private ranges
     !(
         // RFC1918 private ranges
         (octets[0] == 10) ||
         // (octets[0] == 172 && (16..=31).contains(&octets[1])) ||
         // (octets[0] == 192 && octets[1] == 168) ||
-        
+
         // Loopback (127.0.0.0/8)
         // (octets[0] == 127) ||
-        
+
         // // Link-local (169.254.0.0/16)
         // (octets[0] == 169 && octets[1] == 254) ||
-        
+
         // // Multicast (224.0.0.0/4)
         // (octets[0] >= 224 && octets[0] <= 239) ||
-        
+
         // // Reserved/experimental (240.0.0.0/4)
         // (octets[0] >= 240) ||
-        
+
         // // This network (0.0.0.0/8) - though rarely seen
         // (octets[0] == 0) ||
-        
+
         // Broadcast address
         (octets == [255, 255, 255, 255])
     )
@@ -1009,26 +1015,26 @@ fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
 fn is_global_v6(ip: std::net::Ipv6Addr) -> bool {
     let segments = ip.segments();
     let seg0 = segments[0];
-    
+
     !(
         // Loopback (::1)
         ip.is_loopback() ||
-        
+
         // Unspecified (::)
         ip.is_unspecified() ||
-        
+
         // Link-local (fe80::/10)
         (seg0 & 0xffc0 == 0xfe80) ||
-        
+
         // Unique local (fc00::/7)
         (seg0 & 0xfe00 == 0xfc00) ||
-        
+
         // Site-local (deprecated, fec0::/10)
         (seg0 & 0xffc0 == 0xfec0) ||
-        
+
         // Multicast (ff00::/8)
         (seg0 & 0xff00 == 0xff00) ||
-        
+
         // IPv4-mapped IPv6 addresses (::ffff:0:0/96) - check if the mapped IPv4 is local
         (ip.to_ipv4_mapped().map_or(false, |v4| !is_global_v4(v4)))
     )
@@ -1062,7 +1068,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_command_stops_dht_service() {
-        let service = match DhtService::new(0, Vec::new(), None).await {
+        let service = match DhtService::new(0, Vec::new(), None, false).await {
             Ok(service) => service,
             Err(err) => {
                 let message = err.to_string();
