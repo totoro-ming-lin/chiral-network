@@ -3,6 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 
 // Default bootstrap nodes for network connectivity
 export const DEFAULT_BOOTSTRAP_NODES = [
+  "/ip4/145.40.118.135/tcp/4001/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+  "/ip4/139.178.91.71/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+  "/ip4/147.75.87.27/tcp/4001/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+  "/ip4/139.178.65.157/tcp/4001/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+  "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
   "/ip4/54.198.145.146/tcp/4001/p2p/12D3KooWNHdYWRTe98KMF1cDXXqGXvNjd1SAchDaeP5o4MsoJLu2",
 ];
 
@@ -19,16 +24,6 @@ export interface FileMetadata {
   seeders: string[];
   createdAt: number;
   mimeType?: string;
-}
-
-export interface DhtHealth {
-  peerCount: number;
-  lastBootstrap: number | null;
-  lastPeerEvent: number | null;
-  lastError: string | null;
-  lastErrorAt: number | null;
-  bootstrapFailures: number;
-  listenAddrs: string[];
 }
 
 export class DhtService {
@@ -175,16 +170,6 @@ export class DhtService {
     } catch (error) {
       console.error("Failed to get peer count:", error);
       return 0;
-    }
-  }
-
-  async getHealth(): Promise<DhtHealth | null> {
-    try {
-      const health = await invoke<DhtHealth | null>("get_dht_health");
-      return health;
-    } catch (error) {
-      console.error("Failed to get DHT health:", error);
-      return null;
     }
   }
 }
