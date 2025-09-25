@@ -757,6 +757,12 @@ impl DhtService {
         // Create a Kademlia behaviour with tuned configuration
         let store = MemoryStore::new(local_peer_id);
         let mut kad_cfg = KademliaConfig::new(StreamProtocol::new("/chiral/kad/1.0.0"));
+
+        if is_bootstrap {
+            kad_cfg.set_record_ttl(Some(Duration::from_secs(0)));
+            kad_cfg.set_provider_record_ttl(Some(Duration::from_secs(0)));
+        }
+
         // Align with docs: shorter queries, higher replication
         kad_cfg.set_query_timeout(Duration::from_secs(10));
         let bootstrap_interval = if is_bootstrap {
