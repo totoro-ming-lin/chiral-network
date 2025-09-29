@@ -2,54 +2,6 @@
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
 )]
-
-pub mod commands;
-mod crypto;
-mod dht;
-mod manager;
-mod encryption;
-mod ethereum;
-mod file_transfer;
-mod geth_downloader;
-mod headless;
-mod keystore;
-pub mod net;
-mod peer_selection;
-use crate::commands::proxy::{
-    list_proxies, proxy_connect, proxy_disconnect, proxy_echo, ProxyNode,
-};
-use dht::{DhtEvent, DhtMetricsSnapshot, DhtService, FileMetadata};
-use ethereum::{
-    create_new_account, get_account_from_private_key, get_balance, get_block_number, get_hashrate,
-    get_mined_blocks_count, get_mining_logs, get_mining_performance, get_mining_status,
-    get_network_difficulty, get_network_hashrate, get_peer_count, get_recent_mined_blocks,
-    start_mining, stop_mining, EthAccount, GethProcess, MinedBlock,
-};
-use file_transfer::{DownloadMetricsSnapshot, FileTransferEvent, FileTransferService};
-use fs2::available_space;
-use geth_downloader::GethDownloader;
-use keystore::Keystore;
-use serde::Serialize;
-use std::collections::VecDeque;
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{
-    io::{BufRead, BufReader},
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use sysinfo::{Components, System, MINIMUM_CPU_UPDATE_INTERVAL};
-use systemstat::{Platform, System as SystemStat};
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, State,
-};
-use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
-use totp_rs::{Algorithm, Secret, TOTP};
-use tracing::{info, warn};
-
 struct AppState {
     geth: Mutex<GethProcess>,
     downloader: Arc<GethDownloader>,
