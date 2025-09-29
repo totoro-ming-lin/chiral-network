@@ -58,7 +58,7 @@ jobs:
         workspaces: "src-tauri"
     - name: Build backen
       run: |
-          cd src-tauri
           cargo check
           cargo build --release
+          working-directory: "src-tauri"
         cache-on-failure: true
