@@ -35,10 +35,7 @@ jobs:
     - name: Build frontend
       run: npm run build
 
-    - name: Set up cache
-      uses: Swatinem/rust-cache@v2
     - name: Building backend
-      run: |
-            cd src-tauri
-            cargo check
-            cargo build --release
+      uses: Swatinem/rust-cache@v2
+      with:
+        working-dir: "src-tauri"
