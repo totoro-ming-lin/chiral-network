@@ -52,8 +52,13 @@ jobs:
     - name: Build frontend
       run: npm run build
     
-    - name: Build backend
+    - name: Restoring backend cache
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: "src-tauri"
+    - name: Build backen
+      run: |
+          cd src-tauri
+          cargo check
+          cargo build --release
         cache-on-failure: true
