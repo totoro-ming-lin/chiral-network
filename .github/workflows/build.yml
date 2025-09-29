@@ -41,4 +41,4 @@ jobs:
       run: |
             cargo check
             cargo build --release
-            working-directory: src/tauri
+            working-directory: src-tauri
