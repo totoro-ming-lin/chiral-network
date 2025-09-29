@@ -4,14 +4,17 @@
 )]
 
 pub mod commands;
-mod encryption;
+mod crypto;
 mod dht;
+mod manager;
+mod encryption;
 mod ethereum;
 mod file_transfer;
 mod geth_downloader;
 mod headless;
 mod keystore;
 pub mod net;
+mod peer_selection;
 use crate::commands::proxy::{
     list_proxies, proxy_connect, proxy_disconnect, proxy_echo, ProxyNode,
 };
@@ -22,7 +25,7 @@ use ethereum::{
     get_network_difficulty, get_network_hashrate, get_peer_count, get_recent_mined_blocks,
     start_mining, stop_mining, EthAccount, GethProcess, MinedBlock,
 };
-use file_transfer::{FileTransferEvent, FileTransferService};
+use file_transfer::{DownloadMetricsSnapshot, FileTransferEvent, FileTransferService};
 use fs2::available_space;
 use geth_downloader::GethDownloader;
 use keystore::Keystore;
@@ -34,7 +37,7 @@ use std::process::Command;
 use std::{
     io::{BufRead, BufReader},
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Components, System, MINIMUM_CPU_UPDATE_INTERVAL};
 use systemstat::{Platform, System as SystemStat};
@@ -43,7 +46,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, State,
 };
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 use totp_rs::{Algorithm, Secret, TOTP};
 use tracing::{info, warn};
 
@@ -57,6 +60,8 @@ struct AppState {
     dht: Mutex<Option<Arc<DhtService>>>,
     file_transfer: Mutex<Option<Arc<FileTransferService>>>,
     proxies: Arc<Mutex<Vec<ProxyNode>>>,
+    file_transfer_pump: Mutex<Option<JoinHandle<()>>>,
+    socks5_proxy_cli: Mutex<Option<String>>,
 }
 
 #[tauri::command]
@@ -337,6 +342,10 @@ async fn start_dht_node(
     state: State<'_, AppState>,
     port: u16,
     bootstrap_nodes: Vec<String>,
+    enable_autonat: Option<bool>,
+    autonat_probe_interval_secs: Option<u64>,
+    autonat_servers: Option<Vec<String>>,
+    proxy_address: Option<String>,
 ) -> Result<String, String> {
     {
         let dht_guard = state.dht.lock().await;
@@ -345,9 +354,27 @@ async fn start_dht_node(
         }
     }
 
-    let dht_service = DhtService::new(port, bootstrap_nodes, None, false)
-        .await
-        .map_err(|e| format!("Failed to start DHT: {}", e))?;
+    let auto_enabled = enable_autonat.unwrap_or(true);
+    let probe_interval = autonat_probe_interval_secs.map(Duration::from_secs);
+    let autonat_server_list = autonat_servers.unwrap_or_default();
+
+    // Get the proxy from the command line, if it was provided at launch
+    let cli_proxy = state.socks5_proxy_cli.lock().await.clone();
+    // Prioritize the command-line argument. Fall back to the one from the UI.
+    let final_proxy_address = cli_proxy.or(proxy_address.clone());
+
+    let dht_service = DhtService::new(
+        port,
+        bootstrap_nodes,
+        None,
+        false,
+        auto_enabled,
+        probe_interval,
+        autonat_server_list,
+        final_proxy_address,
+    )
+    .await
+    .map_err(|e| format!("Failed to start DHT: {}", e))?;
 
     let peer_id = dht_service.get_peer_id().await;
 
@@ -428,6 +455,20 @@ async fn start_dht_node(
                             proxies.push(new_node.clone());
                             let _ = app_handle.emit("proxy_status_update", new_node);
                         }
+                    }
+                    DhtEvent::NatStatus {
+                        state,
+                        confidence,
+                        last_error,
+                        summary,
+                    } => {
+                        let payload = serde_json::json!({
+                            "state": state,
+                            "confidence": confidence,
+                            "lastError": last_error,
+                            "summary": summary,
+                        });
+                        let _ = app_handle.emit("nat_status_update", payload);
                     }
                     DhtEvent::EchoReceived { from, utf8, bytes } => {
                         // Sending inbox event to frontend
@@ -636,6 +677,20 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                         }
                     )
                 }
+                DhtEvent::NatStatus {
+                    state,
+                    confidence,
+                    last_error,
+                    summary,
+                } => match serde_json::to_string(&serde_json::json!({
+                    "state": state,
+                    "confidence": confidence,
+                    "lastError": last_error,
+                    "summary": summary,
+                })) {
+                    Ok(json) => format!("nat_status:{json}"),
+                    Err(_) => "nat_status:{}".to_string(),
+                },
                 DhtEvent::PeerRtt { peer, rtt_ms } => format!("peer_rtt:{peer}:{rtt_ms}"),
                 DhtEvent::EchoReceived { from, utf8, bytes } => format!(
                     "echo_received:{}:{}:{}",
@@ -919,7 +974,10 @@ fn detect_locale() -> String {
 }
 
 #[tauri::command]
-async fn start_file_transfer_service(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_file_transfer_service(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     {
         let ft_guard = state.file_transfer.lock().await;
         if ft_guard.is_some() {
@@ -931,9 +989,22 @@ async fn start_file_transfer_service(state: State<'_, AppState>) -> Result<(), S
         .await
         .map_err(|e| format!("Failed to start file transfer service: {}", e))?;
 
+    let ft_arc = Arc::new(file_transfer_service);
     {
         let mut ft_guard = state.file_transfer.lock().await;
-        *ft_guard = Some(Arc::new(file_transfer_service));
+        *ft_guard = Some(ft_arc.clone());
+    }
+
+    {
+        let mut pump_guard = state.file_transfer_pump.lock().await;
+        if pump_guard.is_none() {
+            let app_handle = app.clone();
+            let ft_clone = ft_arc.clone();
+            let handle = tokio::spawn(async move {
+                pump_file_transfer_events(app_handle, ft_clone).await;
+            });
+            *pump_guard = Some(handle);
+        }
     }
 
     Ok(())
@@ -1144,11 +1215,61 @@ async fn get_file_transfer_events(state: State<'_, AppState>) -> Result<Vec<Stri
                 FileTransferEvent::Error { message } => {
                     format!("error:{}", message)
                 }
+                FileTransferEvent::DownloadAttempt(snapshot) => {
+                    match serde_json::to_string(&snapshot) {
+                        Ok(json) => format!("download_attempt:{}", json),
+                        Err(_) => "download_attempt:{}".to_string(),
+                    }
+                }
             })
             .collect();
         Ok(mapped)
     } else {
         Ok(vec![])
+    }
+}
+
+#[tauri::command]
+async fn get_download_metrics(
+    state: State<'_, AppState>,
+) -> Result<DownloadMetricsSnapshot, String> {
+    let ft = {
+        let ft_guard = state.file_transfer.lock().await;
+        ft_guard.as_ref().cloned()
+    };
+
+    if let Some(ft) = ft {
+        Ok(ft.download_metrics_snapshot().await)
+    } else {
+        Ok(DownloadMetricsSnapshot::default())
+    }
+}
+
+async fn pump_file_transfer_events(app: tauri::AppHandle, ft: Arc<FileTransferService>) {
+    loop {
+        let events = ft.drain_events(64).await;
+        if events.is_empty() {
+            if Arc::strong_count(&ft) <= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+
+        for event in events {
+            match event {
+                FileTransferEvent::DownloadAttempt(snapshot) => {
+                    if let Err(err) = app.emit("download_attempt", &snapshot) {
+                        warn!("Failed to emit download_attempt event: {}", err);
+                    }
+                }
+                other => {
+                    if let Err(err) = app.emit("file_transfer_event", format!("{:?}", other)) {
+                        warn!("Failed to emit file_transfer_event: {}", err);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1167,11 +1288,8 @@ async fn encrypt_file_with_password(
         return Err("Input file does not exist".to_string());
     }
 
-    let result = encryption::FileEncryption::encrypt_file_with_password(
-        input,
-        output,
-        &password,
-    ).await?;
+    let result =
+        encryption::FileEncryption::encrypt_file_with_password(input, output, &password).await?;
 
     Ok(result.encryption_info)
 }
@@ -1197,7 +1315,8 @@ async fn decrypt_file_with_password(
         output,
         &password,
         &encryption_info,
-    ).await
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1216,22 +1335,17 @@ async fn encrypt_file_for_upload(
     let encrypted_path = input.with_extension("enc");
 
     let result = if let Some(pwd) = password {
-        encryption::FileEncryption::encrypt_file_with_password(
-            input,
-            &encrypted_path,
-            &pwd,
-        ).await?
+        encryption::FileEncryption::encrypt_file_with_password(input, &encrypted_path, &pwd).await?
     } else {
         // Generate random key for no-password encryption
         let key = encryption::FileEncryption::generate_random_key();
-        encryption::FileEncryption::encrypt_file(
-            input,
-            &encrypted_path,
-            &key,
-        ).await?
+        encryption::FileEncryption::encrypt_file(input, &encrypted_path, &key).await?
     };
 
-    Ok((encrypted_path.to_string_lossy().to_string(), result.encryption_info))
+    Ok((
+        encrypted_path.to_string_lossy().to_string(),
+        result.encryption_info,
+    ))
 }
 
 #[tauri::command]
@@ -1537,6 +1651,134 @@ async fn disable_2fa(password: String, state: State<'_, AppState>) -> Result<(),
     keystore.remove_2fa_secret(&address, &password)?;
     Ok(())
 }
+
+// Peer Selection Commands
+
+#[tauri::command]
+async fn get_recommended_peers_for_file(
+    state: State<'_, AppState>,
+    file_hash: String,
+    file_size: u64,
+    require_encryption: bool,
+) -> Result<Vec<String>, String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        Ok(dht
+            .get_recommended_peers_for_download(&file_hash, file_size, require_encryption)
+            .await)
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn record_transfer_success(
+    state: State<'_, AppState>,
+    peer_id: String,
+    bytes: u64,
+    duration_ms: u64,
+) -> Result<(), String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        dht.record_transfer_success(&peer_id, bytes, duration_ms)
+            .await;
+        Ok(())
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn record_transfer_failure(
+    state: State<'_, AppState>,
+    peer_id: String,
+    error: String,
+) -> Result<(), String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        dht.record_transfer_failure(&peer_id, &error).await;
+        Ok(())
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_peer_metrics(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::peer_selection::PeerMetrics>, String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        Ok(dht.get_peer_metrics().await)
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn select_peers_with_strategy(
+    state: State<'_, AppState>,
+    available_peers: Vec<String>,
+    count: usize,
+    strategy: String,
+    require_encryption: bool,
+) -> Result<Vec<String>, String> {
+    use crate::peer_selection::SelectionStrategy;
+
+    let selection_strategy = match strategy.as_str() {
+        "fastest" => SelectionStrategy::FastestFirst,
+        "reliable" => SelectionStrategy::MostReliable,
+        "bandwidth" => SelectionStrategy::HighestBandwidth,
+        "balanced" => SelectionStrategy::Balanced,
+        "encryption" => SelectionStrategy::EncryptionPreferred,
+        "load_balanced" => SelectionStrategy::LoadBalanced,
+        _ => SelectionStrategy::Balanced,
+    };
+
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        Ok(dht
+            .select_peers_with_strategy(
+                &available_peers,
+                count,
+                selection_strategy,
+                require_encryption,
+            )
+            .await)
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn set_peer_encryption_support(
+    state: State<'_, AppState>,
+    peer_id: String,
+    supported: bool,
+) -> Result<(), String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        dht.set_peer_encryption_support(&peer_id, supported).await;
+        Ok(())
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+
+#[tauri::command]
+async fn cleanup_inactive_peers(
+    state: State<'_, AppState>,
+    max_age_seconds: u64,
+) -> Result<(), String> {
+    let dht_guard = state.dht.lock().await;
+    if let Some(ref dht) = *dht_guard {
+        dht.cleanup_inactive_peers(max_age_seconds).await;
+        Ok(())
+    } else {
+        Err("DHT service not available".to_string())
+    }
+}
+#[cfg(not(test))]
 fn main() {
     // Initialize logging for debug builds
     #[cfg(debug_assertions)]
@@ -1585,6 +1827,8 @@ fn main() {
             dht: Mutex::new(None),
             file_transfer: Mutex::new(None),
             proxies: Arc::new(Mutex::new(Vec::new())),
+            file_transfer_pump: Mutex::new(None),
+            socks5_proxy_cli: Mutex::new(args.socks5_proxy),
         })
         .invoke_handler(tauri::generate_handler![
             create_chiral_account,
@@ -1629,6 +1873,7 @@ fn main() {
             upload_file_data_to_network,
             download_file_from_network,
             get_file_transfer_events,
+            get_download_metrics,
             encrypt_file_with_password,
             decrypt_file_with_password,
             encrypt_file_for_upload,
@@ -1644,6 +1889,13 @@ fn main() {
             verify_totp_code,
             logout,
             disable_2fa,
+            get_recommended_peers_for_file,
+            record_transfer_success,
+            record_transfer_failure,
+            get_peer_metrics,
+            select_peers_with_strategy,
+            set_peer_encryption_support,
+            cleanup_inactive_peers,
         ])
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_os::init())

@@ -988,7 +988,7 @@ pub async fn get_mined_blocks_count(miner_address: &str) -> Result<u64, String> 
         .map_err(|e| format!("Failed to parse block number: {}", e))?;
 
     // Check recent blocks (last 100 or current block count, whichever is smaller)
-    let blocks_to_check = std::cmp::min(100, current_block);
+    let blocks_to_check = std::cmp::min(1000, current_block);
     let start_block = current_block.saturating_sub(blocks_to_check);
 
     // Normalize the miner address for comparison
@@ -1172,10 +1172,10 @@ pub async fn get_recent_mined_blocks(
         //         None
         //     }
         // };
-        
+
         // Since Geth's default reward (2.0) doesn't match the intended Chiral Network
         // reward, we hardcode the intended value of 5.0 here.
-        let reward = Some(5.0); 
+        let reward = Some(5.0);
 
         out.push(MinedBlock {
             hash,

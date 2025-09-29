@@ -109,8 +109,7 @@
 
   $: displayedTemperature = temperatureUnit === 'F' ? toFahrenheit(temperature).toFixed(1) : temperature.toFixed(1);
 
-  $: expectedTotalRewards = $miningState.blocksFound * 2;
-  $: $miningState.totalRewards = expectedTotalRewards;
+
   
 
   function parseHashRate(rateStr: string): number {
@@ -202,10 +201,12 @@
 
   const navigation = getContext('navigation') as { setCurrentPage: (page: string) => void };
   
-  // Computed values for actual threads based on intensity
+  // Computed values for threads based on intensity
   const maxThreads = cpuThreads
-  $: actualThreads = Math.ceil(($miningState.minerIntensity / 100) * maxThreads)
-  // Don't directly modify store in reactive statement to avoid infinite loops
+  // Intensity slider directly controls selectedThreads
+  $: if (!$miningState.isMining) {
+    selectedThreads = Math.ceil(($miningState.minerIntensity / 100) * maxThreads)
+  }
 
 
   // Threads warning
@@ -314,10 +315,15 @@
           if (hashRateFromLogs > 0) {
             // Use actual hash rate from logs
             $miningState.hashRate = formatHashRate(hashRateFromLogs)
-            if (blocksFound > $miningState.blocksFound) {
-              $miningState.blocksFound = blocksFound*5; 
-              //Visualization Now Handled By Backend
-            }
+            
+            console.log('From mining stats - blocks:', blocksFound);
+            console.log('Current blocksFound before:', $miningState.blocksFound);
+            
+            $miningState.blocksFound = blocksFound;
+            
+            console.log('blocksFound after:', $miningState.blocksFound);
+          
+            
           } else if ($miningState.activeThreads > 0) {
             // Fall back to simulation if no log data yet
             const elapsed = (Date.now() - sessionStartTime) / 1000 // seconds
@@ -410,11 +416,16 @@
       }  
               
       // Update blocks mined from blockchain query
+      
       if (results[4] !== undefined) {
         const blocksMined = results[4] as number;
-        if (blocksMined > $miningState.blocksFound) {
-          $miningState.blocksFound = blocksMined;
-        }
+        
+        console.log('Backend returned blocks:', blocksMined);
+        console.log('Current blocksFound before update:', $miningState.blocksFound);
+        
+        $miningState.blocksFound = blocksMined;
+        
+        console.log('blocksFound after update:', $miningState.blocksFound);
       }
     }
   } catch (e) {
@@ -485,7 +496,7 @@
       sessionStartTime = Date.now()
       // Store session start time in the store for persistence
       $miningState.sessionStartTime = sessionStartTime
-      $miningState.activeThreads = actualThreads  // Use computed actualThreads
+      $miningState.activeThreads = selectedThreads  // Use selectedThreads
       totalHashes = 0 // Reset total hashes
       lastHashUpdate = Date.now()
       startUptimeTimer() 
@@ -611,7 +622,7 @@ function pushRecentBlock(b: {
           difficulty: b.difficulty ? parseInt(b.difficulty, 16) : undefined,
           timestamp: new Date((b.timestamp || 0) * 1000),
           number: b.number,
-          reward: 5
+          reward: 2
         });
       }
       // Hard de-duplication by hash as a safety net

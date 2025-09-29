@@ -1,17 +1,41 @@
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use async_trait::async_trait;
+use futures::future::{BoxFuture, FutureExt};
+use futures::io::{AsyncRead as FAsyncRead, AsyncWrite as FAsyncWrite};
+use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use futures_util::StreamExt;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use libp2p::multiaddr::Protocol;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
+use crate::peer_selection::{PeerMetrics, PeerSelectionService, SelectionStrategy};
+
+use std::error::Error;
+use std::io::{self};
+use tokio_socks::tcp::Socks5Stream;
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+// Trait alias to abstract over async I/O types used by proxy transport
+pub trait AsyncIo: FAsyncRead + FAsyncWrite + Unpin + Send {}
+impl<T: FAsyncRead + FAsyncWrite + Unpin + Send> AsyncIo for T {}
+
+use libp2p::core::upgrade::Version;
 use libp2p::{
+    autonat::v2,
+    core::{
+        muxing::StreamMuxerBox,
+        // FIXED E0432: ListenerEvent is removed, only import what is available.
+        transport::{Boxed, DialOpts, ListenerId, Transport, TransportError, TransportEvent},
+    },
     identify::{self, Event as IdentifyEvent},
     identity,
     kad::{
@@ -19,12 +43,15 @@ use libp2p::{
         Event as KademliaEvent, GetRecordOk, Mode, PutRecordOk, QueryResult, Record,
     },
     mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent},
+    noise,
     ping::{self, Behaviour as Ping, Event as PingEvent},
     request_response as rr,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    swarm::{behaviour::toggle, NetworkBehaviour, SwarmEvent},
+    tcp, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
+use rand::rngs::OsRng;
 const EXPECTED_PROTOCOL_VERSION: &str = "/chiral/1.0.0";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileMetadata {
@@ -43,6 +70,51 @@ pub struct FileMetadata {
     pub key_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NatReachabilityState {
+    Unknown,
+    Public,
+    Private,
+}
+
+impl Default for NatReachabilityState {
+    fn default() -> Self {
+        NatReachabilityState::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NatConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for NatConfidence {
+    fn default() -> Self {
+        NatConfidence::Low
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NatHistoryItem {
+    pub state: NatReachabilityState,
+    pub confidence: NatConfidence,
+    pub timestamp: u64,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReachabilityRecord {
+    state: NatReachabilityState,
+    confidence: NatConfidence,
+    timestamp: SystemTime,
+    summary: Option<String>,
+}
+
 #[derive(NetworkBehaviour)]
 struct DhtBehaviour {
     kademlia: Kademlia<MemoryStore>,
@@ -50,6 +122,8 @@ struct DhtBehaviour {
     mdns: Mdns,
     ping: ping::Behaviour,
     proxy_rr: rr::Behaviour<ProxyCodec>,
+    autonat_client: toggle::Toggle<v2::client::Behaviour>,
+    autonat_server: toggle::Toggle<v2::server::Behaviour>,
 }
 
 #[derive(Debug)]
@@ -57,6 +131,7 @@ pub enum DhtCommand {
     PublishFile(FileMetadata),
     SearchFile(String),
     ConnectPeer(String),
+    DisconnectPeer(PeerId),
     GetPeerCount(oneshot::Sender<usize>),
     Echo {
         peer: PeerId,
@@ -91,6 +166,12 @@ pub enum DhtEvent {
         utf8: Option<String>,
         bytes: usize,
     },
+    NatStatus {
+        state: NatReachabilityState,
+        confidence: NatConfidence,
+        last_error: Option<String>,
+        summary: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +194,16 @@ struct DhtMetrics {
     last_error: Option<String>,
     bootstrap_failures: u64,
     listen_addrs: Vec<String>,
+    reachability_state: NatReachabilityState,
+    reachability_confidence: NatConfidence,
+    last_reachability_change: Option<SystemTime>,
+    last_probe_at: Option<SystemTime>,
+    last_reachability_error: Option<String>,
+    observed_addrs: Vec<String>,
+    reachability_history: VecDeque<ReachabilityRecord>,
+    success_streak: u32,
+    failure_streak: u32,
+    autonat_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +216,14 @@ pub struct DhtMetricsSnapshot {
     pub last_error_at: Option<u64>,
     pub bootstrap_failures: u64,
     pub listen_addrs: Vec<String>,
+    pub reachability: NatReachabilityState,
+    pub reachability_confidence: NatConfidence,
+    pub last_reachability_change: Option<u64>,
+    pub last_probe_at: Option<u64>,
+    pub last_reachability_error: Option<String>,
+    pub observed_addrs: Vec<String>,
+    pub reachability_history: Vec<NatHistoryItem>,
+    pub autonat_enabled: bool,
 }
 
 // ------Proxy Protocol Implementation------
@@ -137,7 +236,7 @@ struct EchoRequest(pub Vec<u8>);
 struct EchoResponse(pub Vec<u8>);
 
 // 4byte LE length prefix
-async fn read_framed<T: AsyncRead + Unpin + Send>(io: &mut T) -> std::io::Result<Vec<u8>> {
+async fn read_framed<T: FAsyncRead + Unpin + Send>(io: &mut T) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     io.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -145,7 +244,7 @@ async fn read_framed<T: AsyncRead + Unpin + Send>(io: &mut T) -> std::io::Result
     io.read_exact(&mut data).await?;
     Ok(data)
 }
-async fn write_framed<T: AsyncWrite + Unpin + Send>(
+async fn write_framed<T: FAsyncWrite + Unpin + Send>(
     io: &mut T,
     data: Vec<u8>,
 ) -> std::io::Result<()> {
@@ -166,7 +265,8 @@ impl rr::Codec for ProxyCodec {
         io: &mut T,
     ) -> std::io::Result<Self::Request>
     where
-        T: AsyncRead + Unpin + Send,
+        // CORRECTED: FAsyncRead is now correctly defined via the new imports
+        T: FAsyncRead + Unpin + Send,
     {
         Ok(EchoRequest(read_framed(io).await?))
     }
@@ -176,7 +276,8 @@ impl rr::Codec for ProxyCodec {
         io: &mut T,
     ) -> std::io::Result<Self::Response>
     where
-        T: AsyncRead + Unpin + Send,
+        // CORRECTED: FAsyncRead is now correctly defined via the new imports
+        T: FAsyncRead + Unpin + Send,
     {
         Ok(EchoResponse(read_framed(io).await?))
     }
@@ -187,7 +288,8 @@ impl rr::Codec for ProxyCodec {
         EchoRequest(data): EchoRequest,
     ) -> std::io::Result<()>
     where
-        T: AsyncWrite + Unpin + Send,
+        // CORRECTED: FAsyncWrite is now correctly defined via the new imports
+        T: FAsyncWrite + Unpin + Send,
     {
         write_framed(io, data).await
     }
@@ -198,12 +300,97 @@ impl rr::Codec for ProxyCodec {
         EchoResponse(data): EchoResponse,
     ) -> std::io::Result<()>
     where
-        T: AsyncWrite + Unpin + Send,
+        // CORRECTED: FAsyncWrite is now correctly defined via the new imports
+        T: FAsyncWrite + Unpin + Send,
     {
         write_framed(io, data).await
     }
 }
+
 // ------End Proxy Protocol Implementation------
+#[derive(Clone)]
+struct Socks5Transport {
+    proxy: SocketAddr,
+}
+
+#[async_trait]
+impl Transport for Socks5Transport {
+    type Output = Box<dyn AsyncIo>;
+    type Error = io::Error;
+    type ListenerUpgrade = futures::future::Pending<Result<Self::Output, Self::Error>>;
+    // FIXED E0412: Use imported BoxFuture
+    type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
+
+    // FIXED E0050, E0046: Corrected implementation
+    fn listen_on(
+        &mut self,
+        _id: ListenerId,
+        _addr: libp2p::Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        Err(TransportError::Other(io::Error::new(
+            io::ErrorKind::Other,
+            "SOCKS5 transport does not support listening",
+        )))
+    }
+
+    fn remove_listener(&mut self, _id: ListenerId) -> bool {
+        false
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Poll::Pending
+    }
+
+    fn dial(
+        &mut self,
+        addr: libp2p::Multiaddr,
+        _opts: DialOpts,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let proxy = self.proxy;
+
+        // Convert Multiaddr to string for SOCKS5 connection
+        let target = match addr_to_socket_addr(&addr) {
+            Some(socket_addr) => socket_addr.to_string(),
+            None => {
+                return Err(TransportError::Other(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid address for SOCKS5",
+                )))
+            }
+        };
+
+        Ok(async move {
+            let stream = Socks5Stream::connect(proxy, target)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+            // CORRECT: Convert tokio stream to futures stream via .compat().
+            let compat = stream.compat();
+            // The compat stream correctly implements FAsyncRead/FAsyncWrite required by AsyncIo.
+            Ok(Box::new(compat) as Box<dyn AsyncIo>)
+        }
+        .boxed())
+    }
+}
+
+// Helper function to convert Multiaddr to SocketAddr
+fn addr_to_socket_addr(addr: &libp2p::Multiaddr) -> Option<SocketAddr> {
+    use libp2p::multiaddr::Protocol;
+
+    let mut iter = addr.iter();
+    match (iter.next(), iter.next()) {
+        (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) => {
+            Some(SocketAddr::new(ip.into(), port))
+        }
+        (Some(Protocol::Ip6(ip)), Some(Protocol::Tcp(port))) => {
+            Some(SocketAddr::new(ip.into(), port))
+        }
+        _ => None,
+    }
+}
 
 impl DhtMetricsSnapshot {
     fn from(metrics: DhtMetrics, peer_count: usize) -> Self {
@@ -211,14 +398,55 @@ impl DhtMetricsSnapshot {
             ts.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
         }
 
+        let DhtMetrics {
+            last_bootstrap,
+            last_success,
+            last_error_at,
+            last_error,
+            bootstrap_failures,
+            listen_addrs,
+            reachability_state,
+            reachability_confidence,
+            last_reachability_change,
+            last_probe_at,
+            last_reachability_error,
+            observed_addrs,
+            reachability_history,
+            autonat_enabled,
+            ..
+        } = metrics;
+
+        let history: Vec<NatHistoryItem> = reachability_history
+            .into_iter()
+            .map(|record| NatHistoryItem {
+                state: record.state,
+                confidence: record.confidence,
+                timestamp: record
+                    .timestamp
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+                summary: record.summary,
+            })
+            .collect();
+
         DhtMetricsSnapshot {
             peer_count,
-            last_bootstrap: metrics.last_bootstrap.and_then(to_secs),
-            last_peer_event: metrics.last_success.and_then(to_secs),
-            last_error: metrics.last_error,
-            last_error_at: metrics.last_error_at.and_then(to_secs),
-            bootstrap_failures: metrics.bootstrap_failures,
-            listen_addrs: metrics.listen_addrs,
+            last_bootstrap: last_bootstrap.and_then(to_secs),
+            last_peer_event: last_success.and_then(to_secs),
+            last_error,
+            last_error_at: last_error_at.and_then(to_secs),
+            bootstrap_failures,
+            listen_addrs,
+            reachability: reachability_state,
+            reachability_confidence,
+            last_reachability_change: last_reachability_change.and_then(to_secs),
+            last_probe_at: last_probe_at.and_then(to_secs),
+            last_reachability_error,
+            observed_addrs,
+            reachability_history: history,
+            autonat_enabled,
         }
     }
 }
@@ -233,6 +461,89 @@ impl DhtMetrics {
         {
             self.listen_addrs.push(addr_str);
         }
+    }
+
+    fn record_observed_addr(&mut self, addr: &Multiaddr) {
+        let addr_str = addr.to_string();
+        if self
+            .observed_addrs
+            .iter()
+            .any(|existing| existing == &addr_str)
+        {
+            return;
+        }
+        self.observed_addrs.push(addr_str);
+        if self.observed_addrs.len() > 8 {
+            self.observed_addrs.remove(0);
+        }
+    }
+
+    fn remove_observed_addr(&mut self, addr: &Multiaddr) {
+        let addr_str = addr.to_string();
+        self.observed_addrs.retain(|existing| existing != &addr_str);
+    }
+
+    fn confidence_from_streak(&self, streak: u32) -> NatConfidence {
+        match streak {
+            0 | 1 => NatConfidence::Low,
+            2 | 3 => NatConfidence::Medium,
+            _ => NatConfidence::High,
+        }
+    }
+
+    fn push_history(&mut self, record: ReachabilityRecord) {
+        self.reachability_history.push_front(record);
+        if self.reachability_history.len() > 10 {
+            self.reachability_history.pop_back();
+        }
+    }
+
+    fn update_reachability(&mut self, state: NatReachabilityState, summary: Option<String>) {
+        let now = SystemTime::now();
+        self.last_probe_at = Some(now);
+
+        match state {
+            NatReachabilityState::Public => {
+                self.success_streak = self.success_streak.saturating_add(1);
+                self.failure_streak = 0;
+                self.last_reachability_error = None;
+                self.reachability_confidence = self.confidence_from_streak(self.success_streak);
+            }
+            NatReachabilityState::Private => {
+                self.failure_streak = self.failure_streak.saturating_add(1);
+                self.success_streak = 0;
+                if let Some(ref s) = summary {
+                    self.last_reachability_error = Some(s.clone());
+                }
+                self.reachability_confidence = self.confidence_from_streak(self.failure_streak);
+            }
+            NatReachabilityState::Unknown => {
+                self.success_streak = 0;
+                self.failure_streak = 0;
+                self.reachability_confidence = NatConfidence::Low;
+                self.last_reachability_error = summary.clone();
+            }
+        }
+
+        let state_changed = self.reachability_state != state;
+        self.reachability_state = state;
+
+        if state_changed {
+            self.last_reachability_change = Some(now);
+        }
+
+        if state_changed || summary.is_some() {
+            self.push_history(ReachabilityRecord {
+                state,
+                confidence: self.reachability_confidence,
+                timestamp: now,
+                summary,
+            });
+        }
+    }
+
+    fn note_probe_failure(&mut self, error: String) {
+        self.last_reachability_error = Some(error);
     }
 }
 
@@ -280,10 +591,12 @@ async fn run_dht_node(
     pending_searches: Arc<Mutex<HashMap<String, Vec<PendingSearch>>>>,
     proxy_targets: Arc<Mutex<HashSet<PeerId>>>,
     proxy_capable: Arc<Mutex<HashSet<PeerId>>>,
+    peer_selection: Arc<Mutex<PeerSelectionService>>,
     is_bootstrap: bool,
 ) {
     // Periodic bootstrap interval
     let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+    let mut ping_failures: HashMap<PeerId, u8> = HashMap::new();
 
     'outer: loop {
         tokio::select! {
@@ -358,6 +671,74 @@ async fn run_dht_node(
                             let _ = event_tx.send(DhtEvent::Error(format!("Invalid address: {}", addr))).await;
                         }
                     }
+                    // Some(DhtCommand::DisconnectPeer(peer_id)) => {
+                    //     info!("Requesting disconnect from peer: {}", peer_id);
+                    //     let was_proxy = is_proxy_peer(&peer_id, &proxy_targets, &proxy_capable).await;
+                    //     let peer_id_str = peer_id.to_string();
+
+                    //     match swarm.disconnect_peer_id(peer_id.clone()) {
+                    //         Ok(()) => {
+                    //             if was_proxy {
+                    //                 proxy_targets.lock().await.remove(&peer_id);
+                    //                 proxy_capable.lock().await.remove(&peer_id);
+
+                    //                 let _ = event_tx
+                    //                     .send(DhtEvent::ProxyStatus {
+                    //                         id: peer_id_str,
+                    //                         address: String::new(),
+                    //                         status: "offline".to_string(),
+                    //                         latency_ms: None,
+                    //                         error: None,
+                    //                     })
+                    //                     .await;
+                    //             }
+                    //         }
+                    //         Err(e) => {
+                    //             error!("Failed to disconnect from {}: {}", peer_id, e);
+                    //             let _ = event_tx
+                    //                 .send(DhtEvent::Error(format!(
+                    //                     "Failed to disconnect from {}: {}",
+                    //                     peer_id, e
+                    //                 )))
+                    //                 .await;
+                    //         }
+                    //     }
+                    // }
+                    Some(DhtCommand::DisconnectPeer(peer_id)) => {
+                        info!("Requesting disconnect from peer: {}", peer_id);
+                        let was_proxy = is_proxy_peer(&peer_id, &proxy_targets, &proxy_capable).await;
+                        let peer_id_str = peer_id.to_string();
+
+                        match swarm.disconnect_peer_id(peer_id.clone()) {
+                            Ok(()) => {
+                                if was_proxy {
+                                    proxy_targets.lock().await.remove(&peer_id);
+                                    proxy_capable.lock().await.remove(&peer_id);
+
+                                    let _ = event_tx
+                                        .send(DhtEvent::ProxyStatus {
+                                            id: peer_id_str,
+                                            address: String::new(),
+                                            status: "offline".to_string(),
+                                            latency_ms: None,
+                                            error: None,
+                                        })
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                // Use Debug formatting (`{:?}`) because the error type is `()`, not `Display`.
+                                error!("Failed to disconnect from {}: {:?}", peer_id, e);
+                                let _ = event_tx
+                                    .send(DhtEvent::Error(format!(
+                                        "Failed to disconnect from {}: {:?}",
+                                        peer_id, e
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+
                     Some(DhtCommand::GetPeerCount(tx)) => {
                         let count = connected_peers.lock().await.len();
                         let _ = tx.send(count);
@@ -395,6 +776,13 @@ async fn run_dht_node(
                         match ev {
                             libp2p::ping::Event { peer, result: Ok(rtt), .. } => {
                                 let is_connected = connected_peers.lock().await.contains(&peer);
+                                let rtt_ms = rtt.as_millis() as u64;
+
+                                // Update peer selection metrics with latency
+                                {
+                                    let mut selection = peer_selection.lock().await;
+                                    selection.update_peer_latency(&peer.to_string(), rtt_ms);
+                                }
 
                                 let show_as_proxy = {
                                     let t = proxy_targets.lock().await;
@@ -406,9 +794,11 @@ async fn run_dht_node(
                                     let _ = event_tx
                                         .send(DhtEvent::PeerRtt {
                                             peer: peer.to_string(),
-                                            rtt_ms: rtt.as_millis() as u64,
+                                            rtt_ms,
                                         })
                                         .await;
+
+                                        ping_failures.remove(&peer);
                                 } else {
                                     debug!("skip rtt update for non-proxy/offline peer {}", peer);
                                 }
@@ -417,17 +807,58 @@ async fn run_dht_node(
                                 let _ = event_tx
                                     .send(DhtEvent::Error(format!("Ping timeout {}", peer)))
                                     .await;
+                                let count = ping_failures.entry(peer).or_insert(0);
+                                *count += 1;
+                                if *count >= 3 {
+                                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                                    ping_failures.remove(&peer);
+                                    let _ = event_tx.send(DhtEvent::Error(format!(
+                                        "Peer {} removed after 3 failed pings", peer
+                                    ))).await;
+                                }
                             }
                             libp2p::ping::Event { peer, result: Err(e), .. } => {
                                 warn!("ping error with {}: {}", peer, e);
-                                // If needed, also send to UI
-                                // let _ = event_tx.send(DhtEvent::Error(format!("Ping error {}: {}", peer, e))).await;
+                                let count = ping_failures.entry(peer).or_insert(0);
+                                *count += 1;
+                                if *count >= 3 {
+                                    swarm.behaviour_mut().kademlia.remove_peer(&peer);
+                                    ping_failures.remove(&peer);
+                                    let _ = event_tx.send(DhtEvent::Error(format!(
+                                        "Peer {} removed after 3 failed pings", peer
+                                    ))).await;
+                                }
                             }
                         }
+                    }
+                    SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatClient(ev)) => {
+                        handle_autonat_client_event(ev, &metrics, &event_tx).await;
+                    }
+                    SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatServer(ev)) => {
+                        debug!(?ev, "AutoNAT server event");
+                    }
+                    SwarmEvent::ExternalAddrConfirmed { address, .. } => {
+                        handle_external_addr_confirmed(&address, &metrics, &event_tx).await;
+                    }
+                    SwarmEvent::ExternalAddrExpired { address, .. } => {
+                        handle_external_addr_expired(&address, &metrics, &event_tx).await;
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         info!("✅ CONNECTION ESTABLISHED with peer: {}", peer_id);
                         info!("   Endpoint: {:?}", endpoint);
+
+                        // Initialize peer metrics for smart selection
+                        {
+                            let mut selection = peer_selection.lock().await;
+                            let peer_metrics = PeerMetrics::new(
+                                peer_id.to_string(),
+                                endpoint.get_remote_address().to_string(),
+                            );
+                            selection.update_peer_metrics(peer_metrics);
+                        }
+
+                        // Add peer to Kademlia routing table
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
 
                         if is_proxy_peer(&peer_id, &proxy_targets, &proxy_capable).await {
                             let remote_addr_str = endpoint.get_remote_address().to_string();
@@ -765,6 +1196,192 @@ async fn handle_ping_event(event: PingEvent) {
     }
 }
 
+async fn handle_autonat_client_event(
+    event: v2::client::Event,
+    metrics: &Arc<Mutex<DhtMetrics>>,
+    event_tx: &mpsc::Sender<DhtEvent>,
+) {
+    let v2::client::Event {
+        tested_addr,
+        server,
+        bytes_sent,
+        result,
+    } = event;
+
+    let mut metrics_guard = metrics.lock().await;
+    if !metrics_guard.autonat_enabled {
+        return;
+    }
+
+    let addr_str = tested_addr.to_string();
+    let server_str = server.to_string();
+    let (state, summary) = match result {
+        Ok(()) => {
+            metrics_guard.record_observed_addr(&tested_addr);
+            info!(
+                server = %server_str,
+                address = %addr_str,
+                bytes = bytes_sent,
+                "AutoNAT probe succeeded"
+            );
+            (
+                NatReachabilityState::Public,
+                Some(format!(
+                    "Confirmed reachability via {addr_str} (server {server_str})"
+                )),
+            )
+        }
+        Err(err) => {
+            let err_msg = err.to_string();
+            warn!(
+                server = %server_str,
+                address = %addr_str,
+                error = %err_msg,
+                bytes = bytes_sent,
+                "AutoNAT probe failed"
+            );
+            (
+                NatReachabilityState::Private,
+                Some(format!(
+                    "Probe via {addr_str} (server {server_str}) failed: {err_msg}"
+                )),
+            )
+        }
+    };
+
+    metrics_guard.update_reachability(state, summary.clone());
+    let nat_state = metrics_guard.reachability_state;
+    let confidence = metrics_guard.reachability_confidence;
+    let last_error = metrics_guard.last_reachability_error.clone();
+    drop(metrics_guard);
+
+    let _ = event_tx
+        .send(DhtEvent::NatStatus {
+            state: nat_state,
+            confidence,
+            last_error,
+            summary,
+        })
+        .await;
+}
+
+async fn handle_external_addr_confirmed(
+    addr: &Multiaddr,
+    metrics: &Arc<Mutex<DhtMetrics>>,
+    event_tx: &mpsc::Sender<DhtEvent>,
+) {
+    let mut metrics_guard = metrics.lock().await;
+    let nat_enabled = metrics_guard.autonat_enabled;
+    metrics_guard.record_observed_addr(addr);
+    if metrics_guard.reachability_state == NatReachabilityState::Public {
+        drop(metrics_guard);
+        return;
+    }
+    let summary = Some(format!("External address confirmed: {}", addr));
+    metrics_guard.update_reachability(NatReachabilityState::Public, summary.clone());
+    let state = metrics_guard.reachability_state;
+    let confidence = metrics_guard.reachability_confidence;
+    let last_error = metrics_guard.last_reachability_error.clone();
+    drop(metrics_guard);
+
+    if !nat_enabled {
+        return;
+    }
+
+    let _ = event_tx
+        .send(DhtEvent::NatStatus {
+            state,
+            confidence,
+            last_error,
+            summary,
+        })
+        .await;
+}
+
+async fn handle_external_addr_expired(
+    addr: &Multiaddr,
+    metrics: &Arc<Mutex<DhtMetrics>>,
+    event_tx: &mpsc::Sender<DhtEvent>,
+) {
+    let summary_text = format!("External address expired: {}", addr);
+    let mut metrics_guard = metrics.lock().await;
+    let nat_enabled = metrics_guard.autonat_enabled;
+    metrics_guard.remove_observed_addr(addr);
+
+    if metrics_guard.observed_addrs.is_empty()
+        && metrics_guard.reachability_state != NatReachabilityState::Unknown
+    {
+        let summary = Some(summary_text);
+        metrics_guard.update_reachability(NatReachabilityState::Unknown, summary.clone());
+        let state = metrics_guard.reachability_state;
+        let confidence = metrics_guard.reachability_confidence;
+        let last_error = metrics_guard.last_reachability_error.clone();
+        drop(metrics_guard);
+
+        if !nat_enabled {
+            return;
+        }
+
+        let _ = event_tx
+            .send(DhtEvent::NatStatus {
+                state,
+                confidence,
+                last_error,
+                summary,
+            })
+            .await;
+    }
+}
+
+impl Socks5Transport {
+    pub fn new(proxy: SocketAddr) -> Self {
+        Self { proxy }
+    }
+}
+
+/// Build a libp2p transport, optionally tunneling through a SOCKS5 proxy.
+pub fn build_custom_transport(
+    keypair: identity::Keypair,
+    proxy_address: Option<String>,
+) -> Result<Boxed<(PeerId, StreamMuxerBox)>, Box<dyn Error>> {
+    let noise_keys = noise::Config::new(&keypair)?;
+    let yamux_config = libp2p::yamux::Config::default();
+
+    // CORRECTED: The full transport stack is now built inside each branch
+    // to ensure the final types are identical.
+    if let Some(proxy) = proxy_address {
+        info!(
+            "SOCKS5 enabled. Routing all P2P dialing traffic via {}",
+            proxy
+        );
+        let proxy_addr = proxy.parse::<SocketAddr>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid proxy address: {}", e),
+            )
+        })?;
+        let socks5_transport = Socks5Transport::new(proxy_addr);
+
+        Ok(socks5_transport
+            .upgrade(Version::V1)
+            .authenticate(noise_keys)
+            .multiplex(yamux_config)
+            .timeout(Duration::from_secs(30))
+            .boxed())
+    } else {
+        info!("Direct P2P connection mode.");
+        let direct_tcp = tcp::tokio::Transport::new(tcp::Config::default())
+            .map(|s, _| Box::new(s.0.compat()) as Box<dyn AsyncIo>);
+
+        Ok(direct_tcp
+            .upgrade(Version::V1)
+            .authenticate(noise_keys)
+            .multiplex(yamux_config)
+            .timeout(Duration::from_secs(30))
+            .boxed())
+    }
+}
+
 impl DhtService {
     pub async fn echo(&self, peer_id: String, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         let peer: PeerId = peer_id
@@ -792,6 +1409,7 @@ pub struct DhtService {
     search_counter: Arc<AtomicU64>,
     proxy_targets: Arc<Mutex<HashSet<PeerId>>>,
     proxy_capable: Arc<Mutex<HashSet<PeerId>>>,
+    peer_selection: Arc<Mutex<PeerSelectionService>>,
 }
 
 impl DhtService {
@@ -800,7 +1418,11 @@ impl DhtService {
         bootstrap_nodes: Vec<String>,
         secret: Option<String>,
         is_bootstrap: bool,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        enable_autonat: bool,
+        autonat_probe_interval: Option<Duration>,
+        autonat_servers: Vec<String>,
+        proxy_address: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
         // Generate a new keypair for this node
         // Generate a keypair either from the secret or randomly
         let local_key = match secret {
@@ -861,22 +1483,55 @@ impl DhtService {
             std::iter::once(("/chiral/proxy/1.0.0".to_string(), rr::ProtocolSupport::Full));
         let proxy_rr = rr::Behaviour::new(protocols, rr_cfg);
 
+        let probe_interval = autonat_probe_interval.unwrap_or(Duration::from_secs(30));
+        let autonat_client_behaviour = if enable_autonat {
+            info!(
+                "AutoNAT enabled (probe interval: {}s)",
+                probe_interval.as_secs()
+            );
+            Some(v2::client::Behaviour::new(
+                OsRng,
+                v2::client::Config::default().with_probe_interval(probe_interval),
+            ))
+        } else {
+            info!("AutoNAT disabled");
+            None
+        };
+        let autonat_server_behaviour = if enable_autonat {
+            Some(v2::server::Behaviour::new(OsRng))
+        } else {
+            None
+        };
+
         let behaviour = DhtBehaviour {
             kademlia,
             identify,
             mdns,
             ping: Ping::new(ping::Config::new()),
             proxy_rr,
+            autonat_client: toggle::Toggle::from(autonat_client_behaviour),
+            autonat_server: toggle::Toggle::from(autonat_server_behaviour),
         };
+
+        let bootstrap_set: HashSet<String> = bootstrap_nodes.iter().cloned().collect();
+        let mut autonat_targets: HashSet<String> = if enable_autonat && !autonat_servers.is_empty()
+        {
+            autonat_servers.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        if enable_autonat {
+            autonat_targets.extend(bootstrap_set.iter().cloned());
+        }
+
+        // Use the new SOCKS5-aware transport builder
+        let transport = build_custom_transport(local_key.clone(), proxy_address)?;
 
         // Create the swarm
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
-            .with_tcp(
-                Default::default(),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )?
+            .with_other_transport(|_| Ok(transport))
+            .expect("Failed to create libp2p transport")
             .with_behaviour(|_| behaviour)?
             .with_swarm_config(
                 |c| c.with_idle_connection_timeout(Duration::from_secs(300)), // 5 minutes
@@ -920,6 +1575,25 @@ impl DhtService {
             }
         }
 
+        if enable_autonat {
+            for server_addr in &autonat_targets {
+                if bootstrap_set.contains(server_addr) {
+                    continue;
+                }
+                match server_addr.parse::<Multiaddr>() {
+                    Ok(addr) => match swarm.dial(addr.clone()) {
+                        Ok(_) => {
+                            info!("Dialing AutoNAT server: {}", server_addr);
+                        }
+                        Err(e) => {
+                            debug!("Failed to dial AutoNAT server {}: {}", server_addr, e);
+                        }
+                    },
+                    Err(e) => warn!("Invalid AutoNAT server address {}: {}", server_addr, e),
+                }
+            }
+        }
+
         // Trigger initial bootstrap if we have any bootstrap nodes (even if connection failed)
         if !bootstrap_nodes.is_empty() {
             let _ = swarm.behaviour_mut().kademlia.bootstrap();
@@ -946,6 +1620,12 @@ impl DhtService {
         let search_counter = Arc::new(AtomicU64::new(1));
         let proxy_targets = Arc::new(Mutex::new(HashSet::new()));
         let proxy_capable = Arc::new(Mutex::new(HashSet::new()));
+        let peer_selection = Arc::new(Mutex::new(PeerSelectionService::new()));
+
+        {
+            let mut guard = metrics.lock().await;
+            guard.autonat_enabled = enable_autonat;
+        }
 
         // Spawn the DHT node task
         tokio::spawn(run_dht_node(
@@ -959,6 +1639,7 @@ impl DhtService {
             pending_searches.clone(),
             proxy_targets.clone(),
             proxy_capable.clone(),
+            peer_selection.clone(),
             is_bootstrap,
         ));
 
@@ -973,6 +1654,7 @@ impl DhtService {
             search_counter,
             proxy_targets,
             proxy_capable,
+            peer_selection,
         })
     }
 
@@ -1072,6 +1754,13 @@ impl DhtService {
             .map_err(|e| e.to_string())
     }
 
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> Result<(), String> {
+        self.cmd_tx
+            .send(DhtCommand::DisconnectPeer(peer_id))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn get_peer_id(&self) -> String {
         self.peer_id.clone()
     }
@@ -1116,6 +1805,75 @@ impl DhtService {
         }
         events
     }
+
+    /// Get recommended peers for file download using smart selection
+    pub async fn get_recommended_peers_for_download(
+        &self,
+        file_hash: &str,
+        file_size: u64,
+        require_encryption: bool,
+    ) -> Vec<String> {
+        // First get peers that have the file
+        let available_peers = self.get_seeders_for_file(file_hash).await;
+
+        if available_peers.is_empty() {
+            return Vec::new();
+        }
+
+        // Use smart peer selection
+        let mut peer_selection = self.peer_selection.lock().await;
+        peer_selection.recommend_peers_for_file(&available_peers, file_size, require_encryption)
+    }
+
+    /// Record successful transfer for peer metrics
+    pub async fn record_transfer_success(&self, peer_id: &str, bytes: u64, duration_ms: u64) {
+        let mut peer_selection = self.peer_selection.lock().await;
+        peer_selection.record_transfer_success(peer_id, bytes, duration_ms);
+    }
+
+    /// Record failed transfer for peer metrics
+    pub async fn record_transfer_failure(&self, peer_id: &str, error: &str) {
+        let mut peer_selection = self.peer_selection.lock().await;
+        peer_selection.record_transfer_failure(peer_id, error);
+    }
+
+    /// Update peer encryption support
+    pub async fn set_peer_encryption_support(&self, peer_id: &str, supported: bool) {
+        let mut peer_selection = self.peer_selection.lock().await;
+        peer_selection.set_peer_encryption_support(peer_id, supported);
+    }
+
+    /// Get all peer metrics for monitoring
+    pub async fn get_peer_metrics(&self) -> Vec<PeerMetrics> {
+        let peer_selection = self.peer_selection.lock().await;
+        peer_selection.get_all_metrics()
+    }
+
+    /// Select best peers using a specific strategy
+    pub async fn select_peers_with_strategy(
+        &self,
+        available_peers: &[String],
+        count: usize,
+        strategy: SelectionStrategy,
+        require_encryption: bool,
+    ) -> Vec<String> {
+        let mut peer_selection = self.peer_selection.lock().await;
+        peer_selection.select_peers(available_peers, count, strategy, require_encryption)
+    }
+
+    /// Clean up inactive peer metrics
+    pub async fn cleanup_inactive_peers(&self, max_age_seconds: u64) {
+        let mut peer_selection = self.peer_selection.lock().await;
+        peer_selection.cleanup_inactive_peers(max_age_seconds);
+    }
+
+    /// Get seeders for a specific file (helper method)
+    async fn get_seeders_for_file(&self, _file_hash: &str) -> Vec<String> {
+        // This would typically search the DHT for peers that have the file
+        // For now, return connected peers as potential seeders
+        let connected = self.connected_peers.lock().await;
+        connected.iter().map(|p| p.to_string()).collect()
+    }
 }
 
 fn not_loopback(ip: &Multiaddr) -> bool {
@@ -1143,7 +1901,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_command_stops_dht_service() {
-        let service = match DhtService::new(0, Vec::new(), None, false).await {
+        let service = match DhtService::new(
+            0,
+            Vec::new(),
+            None,
+            false,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        {
             Ok(service) => service,
             Err(err) => {
                 let message = err.to_string();
@@ -1166,6 +1935,7 @@ mod tests {
 
         let snapshot = service.metrics_snapshot().await;
         assert_eq!(snapshot.peer_count, 0);
+        assert_eq!(snapshot.reachability, NatReachabilityState::Unknown);
     }
 
     #[test]
@@ -1185,5 +1955,7 @@ mod tests {
         assert!(snapshot
             .listen_addrs
             .contains(&"/ip4/0.0.0.0/tcp/4001".to_string()));
+        assert!(snapshot.observed_addrs.is_empty());
+        assert!(snapshot.reachability_history.is_empty());
     }
 }
