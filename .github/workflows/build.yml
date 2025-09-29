@@ -55,10 +55,10 @@ jobs:
     - name: Restoring backend cache
       uses: Swatinem/rust-cache@v2
       with:
-        workspaces: "src-tauri"
+        workspaces: src-tauri
+        cache-on-failure: true
     - name: Build backen
       run: |
           cargo check
           cargo build --release
-          working-directory: "src-tauri"
-        cache-on-failure: true
+          working-directory: src-tauri
