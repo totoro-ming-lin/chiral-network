@@ -39,6 +39,6 @@ jobs:
       uses: Swatinem/rust-cache@v2
     - name: Building backend
       run: |
+            cd src-tauri
             cargo check
             cargo build --release
-            working-directory: src-tauri
