@@ -4,6 +4,7 @@
 
 Chiral Network is a decentralized peer-to-peer file storage and sharing system that combines blockchain technology with distributed hash table (DHT) based file storage. The system creates a separate Ethereum-compatible blockchain network with custom parameters for handling transactions while using a DHT-based approach similar to IPFS for completely decentralized file storage and retrieval without any centralized market servers.
 
+
 ## Design Philosophy
 
 This implementation synthesizes concepts from multiple design teams, focusing on legitimate use cases for distributed storage:
