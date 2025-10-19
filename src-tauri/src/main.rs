@@ -36,6 +36,7 @@ use crate::stream_auth::{
     AuthMessage, HmacKeyExchangeConfirmation, HmacKeyExchangeRequest, HmacKeyExchangeResponse,
     StreamAuthService,
 };
+use chrono;
 use dht::{DhtEvent, DhtMetricsSnapshot, DhtService, FileMetadata};
 use directories::ProjectDirs;
 use ethereum::{
@@ -65,7 +66,35 @@ use keystore::Keystore;
 use lazy_static::lazy_static;
 use multi_source_download::{MultiSourceDownloadService, MultiSourceEvent, MultiSourceProgress};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
+use std::collections::VecDeque;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex as StdMutex;
+use std::{
+    io::{BufRead, BufReader},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use sysinfo::{Components, System};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager, State,
+};
+use tokio::time::{timeout as tokio_timeout, Duration as TokioDuration};
+use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
+use totp_rs::{Algorithm, Secret, TOTP};
+use tracing::{debug, error, info, warn};
+use webrtc_service::{WebRTCFileRequest, WebRTCService};
 
+use crate::manager::ChunkManager; // Import the ChunkManager
+                                  // For key encoding
+use blockstore::block::Block;
+use x25519_dalek::{PublicKey, StaticSecret}; // For key handling
+
+/// Detect MIME type from file extension
 fn detect_mime_type_from_filename(filename: &str) -> Option<String> {
     let extension = filename.rsplit('.').next()?.to_lowercase();
 

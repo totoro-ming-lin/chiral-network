@@ -83,7 +83,6 @@ pub const RAW_CODEC: u64 = 0x55;
 const FILE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// File seeder TTL – if no heartbeat lands within this window, drop the entry.
 const FILE_HEARTBEAT_TTL: Duration = Duration::from_secs(60);
-pub struct PendingKeywordIndex;
 
 /// Extracts a set of unique, searchable keywords from a filename.
 fn extract_keywords(file_name: &str) -> Vec<String> {
