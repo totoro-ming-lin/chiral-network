@@ -79,11 +79,9 @@ jobs:
           set +e
           cargo test --release --no-fail-fast | tee output.log
           # Check for "could not compile" lines that do not include "test"
-          if grep -qi "could not compile" output.log; then
-            if grep -qi "could not compile" output.log | grep -vqi "test"; then
-              echo "Build failed: Found 'could not compile' not related to test"
-              exit 1
-            fi
+          if grep -i "could not compile" output.log | grep -vqi "test"; then
+            echo "Build failed: Found 'could not compile' not related to test"
+            exit 1
           fi
           exit 0
         continue-on-error: false
