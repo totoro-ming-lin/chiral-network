@@ -87,7 +87,7 @@ jobs:
             fi
           fi
           exit $result
-        continue-on-error: true
+        continue-on-error: false
         timeout-minutes: 10
 
   relay:
