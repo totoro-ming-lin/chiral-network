@@ -72,14 +72,13 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
             libglib2.0-dev pkg-config build-essential libgtk-3-dev curl libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev
-
       - name: Build backend and run all tests
         run: |
           cd src-tauri
           set +e
           cargo test --release --no-fail-fast | tee output.log
           # Check for "could not compile" lines that do not include "test"
-          if grep -i "could not compile" output.log | grep -vqi "test"; then
+          if grep -i "could not compile" output.log | grep -vi "test" > /dev/null; then
             echo "Build failed: Found 'could not compile' not related to test"
             exit 1
           fi
