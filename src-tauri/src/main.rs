@@ -1074,6 +1074,7 @@ async fn start_dht_node(
 
     // AutoNAT disabled by default - users can enable in settings if needed for NAT detection
     let auto_enabled = enable_autonat.unwrap_or(false);
+    info!("AUTONAT {}", auto_enabled);
     let probe_interval = autonat_probe_interval_secs.map(Duration::from_secs);
     let autonat_server_list = autonat_servers.unwrap_or_default();
 
@@ -1119,7 +1120,7 @@ async fn start_dht_node(
         bootstrap_nodes,
         None,
         is_bootstrap.unwrap_or(false),
-        /* enable AutoNAT by default for WAN */ auto_enabled,
+        auto_enabled,
         probe_interval,
         autonat_server_list,
         final_proxy_address,
