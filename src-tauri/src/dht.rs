@@ -5440,10 +5440,14 @@ impl DhtService {
     ) -> Result<Self, Box<dyn Error>> {
         // ---- Hotfix: finalize AutoRelay flag (bootstrap OFF + ENV OFF)
         let mut final_enable_autorelay = enable_autorelay;
-        if is_bootstrap {
-            final_enable_autorelay = false;
-            info!("AutoRelay disabled on bootstrap (hotfix).");
-        }
+
+        // force enable autorelay to facilitate autonat/dcutr
+        final_enable_autorelay = true;
+        info!("FINAL ENABLE AUTORELAY {}", enable_autorelay);
+        // if is_bootstrap {
+        //     final_enable_autorelay = false;
+        //     info!("AutoRelay disabled on bootstrap (hotfix).");
+        // }
         if std::env::var("CHIRAL_DISABLE_AUTORELAY").ok().as_deref() == Some("1") {
             final_enable_autorelay = false;
             info!("AutoRelay disabled via env CHIRAL_DISABLE_AUTORELAY=1");
