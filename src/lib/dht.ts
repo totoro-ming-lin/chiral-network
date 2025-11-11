@@ -478,7 +478,6 @@ export class DhtService {
   async getHealth(): Promise<DhtHealth | null> {
     try {
       let health = await invoke<DhtHealth | null>("get_dht_health");
-      console.log(health)
       return health;
     } catch (error) {
       console.error("Failed to get DHT health:", error);
