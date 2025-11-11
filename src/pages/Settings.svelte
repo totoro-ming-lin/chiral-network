@@ -23,7 +23,7 @@
     Upload as UploadIcon
   } from "lucide-svelte";
   import { onMount } from "svelte";
-  import {open, save} from "@tauri-apps/plugin-dialog";
+  import {open} from "@tauri-apps/plugin-dialog";
   import { homeDir } from "@tauri-apps/api/path";
   import { getVersion } from "@tauri-apps/api/app";
   import { userLocation } from "$lib/stores";
