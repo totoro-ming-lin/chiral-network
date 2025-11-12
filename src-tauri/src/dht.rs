@@ -3692,8 +3692,15 @@ async fn run_dht_node(
                             }
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 // Check if this error is for an unreachable address before recording it
-
-                                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                               match peer_id {
+                Some(peer_id) => {
+                    swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                    warn!("Connection error with {}: {:?}", peer_id, error);
+                }
+                None => {
+                    warn!("Connection error (no peer_id): {:?}", error);
+                }
+            }
 
 
                                 // let is_unreachable_addr = if let Some(pid) = peer_id {
