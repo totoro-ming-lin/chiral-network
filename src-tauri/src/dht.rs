@@ -643,7 +643,7 @@ struct DhtBehaviour {
     autonat_server: toggle::Toggle<v2::server::Behaviour>,
     relay_client: relay::client::Behaviour,
     relay_server: toggle::Toggle<relay::Behaviour>,
-    dcutr: toggle::Toggle<dcutr::Behaviour>,
+    dcutr:dcutr::Behaviour,
 }
 #[derive(Debug)]
 pub enum DhtCommand {
@@ -4917,9 +4917,9 @@ async fn handle_dcutr_event(
     event_tx: &mpsc::Sender<DhtEvent>,
 ) {
     let mut metrics_guard = metrics.lock().await;
-    if !metrics_guard.dcutr_enabled {
-        return;
-    }
+    // if !metrics_guard.dcutr_enabled {
+    //     return;
+    // }
 
     let dcutr::Event {
         remote_peer_id,
@@ -5596,13 +5596,14 @@ impl DhtService {
         let mdns_toggle = toggle::Toggle::from(mdns_opt);
 
         // DCUtR requires relay to be enabled
-        let dcutr_behaviour = if enable_autonat {
-            info!("DCUtR enabled (requires relay for hole-punching coordination)");
-            Some(dcutr::Behaviour::new(local_peer_id))
-        } else {
-            None
-        };
-        let dcutr_toggle = toggle::Toggle::from(dcutr_behaviour);
+        // let dcutr_behaviour = if enable_autonat {
+        //     info!("DCUtR enabled (requires relay for hole-punching coordination)");
+        //     Some(dcutr::Behaviour::new(local_peer_id))
+        // } else {
+        //     None
+        // };
+        let dcutr_toggle = dcutr::Behaviour::new(local_peer_id);
+
 
         // Relay server configuration
         let relay_server_behaviour = if enable_relay_server {
