@@ -3,6 +3,7 @@ use crate::encryption::EncryptedAesKeyBundle;
 use serde_bytes;
 use x25519_dalek::PublicKey;
 
+// const proxy_str = "/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWSahP5pFRCEfaziPEba7urXGeif6T1y8jmodzdFUvzBHj";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Ed2kError {
     InvalidLink(String),
@@ -4647,6 +4648,23 @@ async fn handle_kademlia_event(
         _ => {}
     }
 }
+
+fn is_private_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|proto| match proto {
+        Protocol::Ip4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+        }
+        Protocol::Ip6(ip) => {
+            // Check for private IPv6 ranges
+            ip.is_loopback()
+                || ((ip.segments()[0] & 0xfe00) == 0xfc00) // fc00::/7 ULA
+        }
+        _ => false,
+    })
+}
+
 async fn handle_identify_event(
     event: IdentifyEvent,
     swarm: &mut Swarm<DhtBehaviour>,
@@ -4665,97 +4683,142 @@ async fn handle_identify_event(
             if &peer_id == local_peer_id {
                 return;
             }
+            // Construct the proxy address string
+            let has_public_addr = info.listen_addrs.iter().any(|addr| {
+                !is_private_addr(addr)
+            });
 
-            let hop_proto = "/libp2p/circuit/relay/0.2.0/hop";
-            let supports_relay = info.protocols.iter().any(|p| p.as_ref() == hop_proto);
-
-            if supports_relay {
-                // Store this peer as relay-capable with its listen addresses
-                let reachable_addrs: Vec<Multiaddr> = info
-                    .listen_addrs
-                    .iter()
-                    .filter(|addr| ma_plausibly_reachable(addr))
-                    .cloned()
-                    .collect();
-
-                // Store supported protocols in PeerMetrics
-                {
-                    let mut metrics = {
-                        let selection = peer_selection.lock().await;
-                        selection.get_peer_metrics(&peer_id.to_string()).cloned()
-                    }
-                    .unwrap_or_else(|| PeerMetrics::new(peer_id.to_string(), "".to_string()));
-
-                    metrics.protocols = info.protocols.iter().map(|p| p.to_string()).collect();
-                    peer_selection.lock().await.update_peer_metrics(metrics);
-                }
-
-                if !reachable_addrs.is_empty() {
-                    let mut relay_peers = relay_capable_peers.lock().await;
-                    relay_peers.insert(peer_id, reachable_addrs.clone());
-                    info!(
-                        "✅ Added {} to relay-capable peers list ({} addresses)",
-                        peer_id,
-                        reachable_addrs.len()
-                    );
-                    for (i, addr) in reachable_addrs.iter().enumerate().take(3) {
-                        info!("   Relay address {}: {}", i + 1, addr);
+            if has_public_addr {
+                // Try dialing public addresses directly
+                for addr in &info.listen_addrs {
+                    if !is_private_addr(addr) {
+                        let dial_addr = addr.clone().with(Protocol::P2p(peer_id));
+                        if let Err(e) = swarm.dial(dial_addr.clone()) {
+                            eprintln!("Failed to dial public address {:?}: {:?}", dial_addr, e);
+                        } else {
+                            println!("Dialing public address: {:?}", dial_addr);
+                            return; // Successfully initiated dial
+                        }
                     }
                 }
             }
+            let proxy_str = "/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWSahP5pFRCEfaziPEba7urXGeif6T1y8jmodzdFUvzBHj";
+            let proxy_addr = format!(
+                "{}/p2p-circuit/p2p/{}",
+                proxy_str,
+                peer_id
+            );
 
-            let listen_addrs = info.listen_addrs.clone();
+            // Parse and dial the proxy address
+            if let Ok(addr) = proxy_addr.parse::<Multiaddr>() {
+                if let Err(e) = swarm.dial(addr.clone()) {
+                    error!("Failed to dial {}: {:?}", peer_id, e);
+                } else{
+                    info!("Dialing relay address: {:?}", addr);
+                }
+            }
+            // let hop_proto = "/libp2p/circuit/relay/0.2.0/hop";
+            // let supports_relay = info.protocols.iter().any(|p| p.as_ref() == hop_proto);
+            //
+            // if supports_relay {
+            //     // Store this peer as relay-capable with its listen addresses
+            //     let reachable_addrs: Vec<Multiaddr> = info
+            //         .listen_addrs
+            //         .iter()
+            //         .filter(|addr| ma_plausibly_reachable(addr))
+            //         .cloned()
+            //         .collect();
+            //
+            //     // Store supported protocols in PeerMetrics
+            //     {
+            //         let mut metrics = {
+            //             let selection = peer_selection.lock().await;
+            //             selection.get_peer_metrics(&peer_id.to_string()).cloned()
+            //         }
+            //         .unwrap_or_else(|| PeerMetrics::new(peer_id.to_string(), "".to_string()));
+            //
+            //         metrics.protocols = info.protocols.iter().map(|p| p.to_string()).collect();
+            //         peer_selection.lock().await.update_peer_metrics(metrics);
+            //     }
+            //
+            //     if !reachable_addrs.is_empty() {
+            //         let mut relay_peers = relay_capable_peers.lock().await;
+            //         relay_peers.insert(peer_id, reachable_addrs.clone());
+            //         info!(
+            //             "✅ Added {} to relay-capable peers list ({} addresses)",
+            //             peer_id,
+            //             reachable_addrs.len()
+            //         );
+            //         for (i, addr) in reachable_addrs.iter().enumerate().take(3) {
+            //             info!("   Relay address {}: {}", i + 1, addr);
+            //         }
+            //     }
+            // }
+
+            // let listen_addrs = info.listen_addrs.clone();
 
             // identify::Event::Received { peer_id, info, .. } => { ... }
             // Only log and process reachable addresses (filters out localhost/private IPs)
-            for addr in info.listen_addrs.iter() {
-                if ma_plausibly_reachable(addr) {
-                    info!("  📍 Peer {} listen addr: {}", peer_id, addr);
-                    swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, addr.clone());
-                } else {
-                    debug!(
-                        "⏭️ Ignoring unreachable listen addr from {}: {}",
-                        peer_id, addr
-                    );
-                }
+            // for addr in info.listen_addrs.iter() {
+                // if ma_plausibly_reachable(addr) {
+                //     info!("  📍 Peer {} listen addr: {}", peer_id, addr);
+                //     swarm
+                //         .behaviour_mut()
+                //         .kademlia
+                //         .add_address(&peer_id, addr.clone());
+                // } else {
+                //     debug!(
+                //         "⏭️ Ignoring unreachable listen addr from {}: {}",
+                //         peer_id, addr
+                //     );
+                // }
+                // let proxy_addr = "";
 
+                // let circuit_addr_str = format!("{}/p2p-circuit/p2p/{}", proxy_addr, target_peerID);
+                // let circuit_addr: Multiaddr = circuit_addr_str.parse()
+                //     .expect("Invalid circuit address");
+                // let
+                // swarm
+                //     .dial(
+                //         opts.relay_address
+                //             .with(Protocol::P2pCircuit)
+                //             .with(Protocol::P2p(opts.remote_peer_id.unwrap())),
+                //     )
                 // Relay Setting: from candidate's "public base", create /p2p-circuit
-                if enable_autorelay && is_relay_candidate(&peer_id, relay_candidates) {
-                    if let Some(base_str) = relay_candidates
-                        .iter()
-                        .find(|s| s.contains(&peer_id.to_string()))
-                    {
-                        if let Ok(base) = base_str.parse::<Multiaddr>() {
-                            // Skip unreachable relay addresses (localhost/private IPs)
-                            if !ma_plausibly_reachable(&base) {
-                                debug!("⏭️  Skipping unreachable relay base address: {}", base);
-                            } else if let Some(relay_addr) = build_relay_listen_addr(&base) {
-                                info!(
-                                    "📡 Attempting to listen via relay {} at {}",
-                                    peer_id, relay_addr
-                                );
-                                if let Err(e) = swarm.listen_on(relay_addr.clone()) {
-                                    warn!(
-                                        "Failed to listen on relay address {}: {}",
-                                        relay_addr, e
-                                    );
-                                } else {
-                                    info!("📡 Attempting to listen via relay peer {}", peer_id);
-                                }
-                            } else {
-                                debug!("⚠️ Could not derive relay listen addr from base: {}", base);
-                            }
-                        } else {
-                            debug!("⚠️ Invalid relay base multiaddr: {}", base_str);
-                        }
-                    } else {
-                        debug!("⚠️ No relay base in preferred_relays for {}", peer_id);
-                    }
-                }
-            }
+                // if enable_autorelay && is_relay_candidate(&peer_id, relay_candidates) {
+                //     if let Some(base_str) = relay_candidates
+                //         .iter()
+                //         .find(|s| s.contains(&peer_id.to_string()))
+                //     {
+                //         if let Ok(base) = base_str.parse::<Multiaddr>() {
+                //             // Skip unreachable relay addresses (localhost/private IPs)
+                //             if !ma_plausibly_reachable(&base) {
+                //                 debug!("⏭️  Skipping unreachable relay base address: {}", base);
+                //             } else if let Some(relay_addr) = build_relay_listen_addr(&base) {
+                //                 info!(
+                //                     "📡 Attempting to listen via relay {} at {}",
+                //                     peer_id, relay_addr
+                //                 );
+                //                 if let Err(e) = swarm.listen_on(relay_addr.clone()) {
+                //                     warn!(
+                //                         "Failed to listen on relay address {}: {}",
+                //                         relay_addr, e
+                //                     );
+                //                 } else {
+                //                     info!("📡 Attempting to listen via relay peer {}", peer_id);
+                //                 }
+                //             } else {
+                //                 debug!("⚠️ Could not derive relay listen addr from base: {}", base);
+                //             }
+                //         } else {
+                //             debug!("⚠️ Invalid relay base multiaddr: {}", base_str);
+                //         }
+                //     } else {
+                //         debug!("⚠️ No relay base in preferred_relays for {}", peer_id);
+                //     }
+                // }
+                //
+            // }
         }
         IdentifyEvent::Pushed { peer_id, info, .. } => {
             info!(
@@ -5714,6 +5777,15 @@ impl DhtService {
         // Listen on the specified port
         let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
         swarm.listen_on(listen_addr)?;
+        // register
+        let proxy_str = "/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWSahP5pFRCEfaziPEba7urXGeif6T1y8jmodzdFUvzBHj";
+        if let Ok(addr) = proxy_str.parse::<Multiaddr>() {
+            if let Err(e) = swarm.listen_on(addr.with(Protocol::P2pCircuit)) {
+                warn!("Failed to listen on {}: {:?}", proxy_str, e);
+            }
+        } else {
+            warn!("Invalid multiaddr: {}", proxy_str);
+        }
 
         // Clean up any unreachable addresses from Kademlia's routing table at startup
         // This removes stale localhost/private addresses that may have been persisted
