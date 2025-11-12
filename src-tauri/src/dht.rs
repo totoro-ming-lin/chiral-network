@@ -3732,64 +3732,64 @@ async fn run_dht_node(
                             }
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 // Check if this error is for an unreachable address before recording it
-                                let is_unreachable_addr = if let Some(pid) = peer_id {
-                                    if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
-                                        if !ma_plausibly_reachable(&bad_ma) {
-                                            swarm.behaviour_mut().kademlia.remove_address(&pid, &bad_ma);
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                // Only record errors for reachable addresses
-                                if !is_unreachable_addr {
-                                    if let Ok(mut m) = metrics.try_lock() {
-                                        m.last_error = Some(error.to_string());
-                                        m.last_error_at = Some(SystemTime::now());
-                                        if let Some(pid) = peer_id {
-                                            if bootstrap_peer_ids.contains(&pid) {
-                                                m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(pid) = peer_id {
-                                    // Only log error for addresses that should be reachable
-                                    if !is_unreachable_addr {
-                                        error!("❌ Outgoing connection error to {}: {}", pid, error);
-
-                                        let is_bootstrap = bootstrap_peer_ids.contains(&pid);
-                                        if error.to_string().contains("rsa") {
-                                            error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
-                                        } else if error.to_string().contains("Timeout") {
-                                            if is_bootstrap {
-                                                warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
-                                            } else {
-                                                warn!("   ℹ Hint: Peer may be unreachable (timeout).");
-                                            }
-                                        } else if error.to_string().contains("Connection refused") {
-                                            if is_bootstrap {
-                                                warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
-                                            } else {
-                                                warn!("   ℹ Hint: Peer is not accepting connections.");
-                                            }
-                                        } else if error.to_string().contains("Transport") {
-                                            warn!("   ℹ Hint: Transport protocol negotiation failed.");
-                                        }
-                                    } else {
-                                        debug!("⏭️ Skipped connection to unreachable address for {}: {}", pid, error);
-                                    }
-                                } else {
-                                    error!("❌ Outgoing connection error to unknown peer: {}", error);
-                                }
-                                let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
+                                // let is_unreachable_addr = if let Some(pid) = peer_id {
+                                //     if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
+                                //         if !ma_plausibly_reachable(&bad_ma) {
+                                //             swarm.behaviour_mut().kademlia.remove_address(&pid, &bad_ma);
+                                //             true
+                                //         } else {
+                                //             false
+                                //         }
+                                //     } else {
+                                //         false
+                                //     }
+                                // } else {
+                                //     false
+                                // };
+                                //
+                                // // Only record errors for reachable addresses
+                                // if !is_unreachable_addr {
+                                //     if let Ok(mut m) = metrics.try_lock() {
+                                //         m.last_error = Some(error.to_string());
+                                //         m.last_error_at = Some(SystemTime::now());
+                                //         if let Some(pid) = peer_id {
+                                //             if bootstrap_peer_ids.contains(&pid) {
+                                //                 m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
+                                //             }
+                                //         }
+                                //     }
+                                // }
+                                //
+                                // if let Some(pid) = peer_id {
+                                //     // Only log error for addresses that should be reachable
+                                //     if !is_unreachable_addr {
+                                //         error!("❌ Outgoing connection error to {}: {}", pid, error);
+                                //
+                                //         let is_bootstrap = bootstrap_peer_ids.contains(&pid);
+                                //         if error.to_string().contains("rsa") {
+                                //             error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
+                                //         } else if error.to_string().contains("Timeout") {
+                                //             if is_bootstrap {
+                                //                 warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
+                                //             } else {
+                                //                 warn!("   ℹ Hint: Peer may be unreachable (timeout).");
+                                //             }
+                                //         } else if error.to_string().contains("Connection refused") {
+                                //             if is_bootstrap {
+                                //                 warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
+                                //             } else {
+                                //                 warn!("   ℹ Hint: Peer is not accepting connections.");
+                                //             }
+                                //         } else if error.to_string().contains("Transport") {
+                                //             warn!("   ℹ Hint: Transport protocol negotiation failed.");
+                                //         }
+                                //     } else {
+                                //         debug!("⏭️ Skipped connection to unreachable address for {}: {}", pid, error);
+                                //     }
+                                // } else {
+                                //     error!("❌ Outgoing connection error to unknown peer: {}", error);
+                                // }
+                                // let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
                             }
                             SwarmEvent::Behaviour(DhtBehaviourEvent::ProxyRr(ev)) => {
                                 use libp2p::request_response::{Event as RREvent, Message};
@@ -4460,37 +4460,75 @@ async fn handle_kademlia_event(
 
                             // Try to connect using available addresses
                             let mut connected = false;
-                            for addr in &peer_info.addrs {
-                                if ma_plausibly_reachable(addr) {
-                                    info!(
-                                        "Attempting to connect to peer {} at {}",
-                                        peer_info.peer_id, addr
-                                    );
-                                    // Add address to Kademlia routing table
-                                    swarm
-                                        .behaviour_mut()
-                                        .kademlia
-                                        .add_address(&peer_info.peer_id, addr.clone());
+                            for peer_info in &peers {
+                                let mut connected = false;
+                                let has_public_addr = peer_info.addrs.iter().any(|addr| {
+                                    !is_private_addr(addr)
+                                });
 
-                                    // Attempt direct connection
-                                    match swarm.dial(addr.clone()) {
-                                        Ok(_) => {
-                                            info!(
-                                                "✅ Initiated connection to peer {} at {}",
-                                                peer_info.peer_id, addr
-                                            );
-                                            connected = true;
-                                            connection_attempts += 1;
-                                            break; // Successfully initiated connection, no need to try other addresses
-                                        }
-                                        Err(e) => {
-                                            debug!(
-                                                "Failed to dial peer {} at {}: {}",
-                                                peer_info.peer_id, addr, e
-                                            );
+                                if has_public_addr {
+                                    // Try dialing public addresses directly
+                                    for addr in &peer_info.addrs {
+                                        if !is_private_addr(addr) {
+                                            let dial_addr = addr.clone().with(Protocol::P2p(target_peer_id));
+                                            if let Err(e) = swarm.dial(dial_addr.clone()) {
+                                                warn!("Failed to dial public address {:?}: {:?}", dial_addr, e);
+                                                connected = true;
+                                            } else {
+                                                info!("Dialing public address: {:?}", dial_addr);
+                                            }
                                         }
                                     }
                                 }
+                                let proxy_str = "/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWSahP5pFRCEfaziPEba7urXGeif6T1y8jmodzdFUvzBHj";
+                                let proxy_addr = format!(
+                                    "{}/p2p-circuit/p2p/{}",
+                                    proxy_str,
+                                    target_peer_id
+                                );
+
+                                // Parse and dial the proxy address
+                                if let Ok(addr) = proxy_addr.parse::<Multiaddr>() {
+                                    if let Err(e) = swarm.dial(addr.clone()) {
+                                        error!("Failed to dial {}: {:?}", target_peer_id, e);
+                                    } else{
+                                        connected = true;
+                                    }
+                                    info!("Dialing relay address: {:?}", addr);
+                                }
+                                // }
+                                // for addr in &peer_info.addrs {
+                                //     if ma_plausibly_reachable(addr) {
+                                //         info!(
+                                //             "Attempting to connect to peer {} at {}",
+                                //             peer_info.peer_id, addr
+                                //         );
+                                //         // Add address to Kademlia routing table
+                                //         swarm
+                                //             .behaviour_mut()
+                                //             .kademlia
+                                //             .add_address(&peer_info.peer_id, addr.clone());
+                                //
+                                //         // Attempt direct connection
+                                //         match swarm.dial(addr.clone()) {
+                                //             Ok(_) => {
+                                //                 info!(
+                                //                     "✅ Initiated connection to peer {} at {}",
+                                //                     peer_info.peer_id, addr
+                                //                 );
+                                //                 connected = true;
+                                //                 connection_attempts += 1;
+                                //                 break; // Successfully initiated connection, no need to try other addresses
+                                //             }
+                                //             Err(e) => {
+                                //                 debug!(
+                                //                     "Failed to dial peer {} at {}: {}",
+                                //                     peer_info.peer_id, addr, e
+                                //                 );
+                                //             }
+                                //         }
+                                //     }
+                                // }
                             }
 
                             if !connected {
