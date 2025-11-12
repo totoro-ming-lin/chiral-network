@@ -4917,9 +4917,9 @@ async fn handle_dcutr_event(
     event_tx: &mpsc::Sender<DhtEvent>,
 ) {
     let mut metrics_guard = metrics.lock().await;
-    if !metrics_guard.dcutr_enabled {
-        return;
-    }
+    // if !metrics_guard.dcutr_enabled {
+    //     return;
+    // }
 
     let dcutr::Event {
         remote_peer_id,
