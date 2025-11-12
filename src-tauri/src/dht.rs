@@ -3693,6 +3693,9 @@ async fn run_dht_node(
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 // Check if this error is for an unreachable address before recording it
 
+                                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+
+
                                 // let is_unreachable_addr = if let Some(pid) = peer_id {
                                 //     if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
                                 //         if !ma_plausibly_reachable(&bad_ma) {
