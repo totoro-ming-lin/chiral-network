@@ -2166,15 +2166,18 @@ async fn run_dht_node(
                                 let replication_factor = 3; // Must match kad_cfg.set_replication_factor
 
                                 let quorum = if connected_peers_count >= replication_factor {
+
+                                    // keep at one for debugging, some connected peers do no participate in kademlia (random public ones)
+
                                     // Use N(3) for better reliability - requires majority, not all
                                     // This tolerates slow/offline peers while ensuring redundancy
-                                    if let Some(n) = std::num::NonZeroUsize::new(replication_factor) {
-                                        info!("Using Quorum::N({}) for file {} ({} peers available)", 
-                                            replication_factor, metadata.merkle_root, connected_peers_count);
-                                        kad::Quorum::N(n)
-                                    } else {
-                                        kad::Quorum::One
-                                    }
+                                    // if let Some(n) = std::num::NonZeroUsize::new(replication_factor) {
+                                    //     info!("Using Quorum::N({}) for file {} ({} peers available)",
+                                    //         replication_factor, metadata.merkle_root, connected_peers_count);
+                                    //     kad::Quorum::N(n)
+                                    // } else {
+                                    kad::Quorum::One
+                                    // }
                                 } else {
                                     info!("Using Quorum::One for file {} (only {} peers available)", 
                                         metadata.merkle_root, connected_peers_count);
