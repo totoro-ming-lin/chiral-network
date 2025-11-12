@@ -644,7 +644,7 @@ struct DhtBehaviour {
     autonat_server: toggle::Toggle<v2::server::Behaviour>,
     relay_client: relay::client::Behaviour,
     relay_server: toggle::Toggle<relay::Behaviour>,
-    dcutr: toggle::Toggle<dcutr::Behaviour>,
+    dcutr: dcutr::Behaviour,
 }
 #[derive(Debug)]
 pub enum DhtCommand {
@@ -5659,13 +5659,8 @@ impl DhtService {
         let mdns_toggle = toggle::Toggle::from(mdns_opt);
 
         // DCUtR requires relay to be enabled
-        let dcutr_behaviour = if enable_autonat {
-            info!("DCUtR enabled (requires relay for hole-punching coordination)");
-            Some(dcutr::Behaviour::new(local_peer_id))
-        } else {
-            None
-        };
-        let dcutr_toggle = toggle::Toggle::from(dcutr_behaviour);
+        let dcutr_behaviour = dcutr::Behaviour::new(local_peer_id);
+        let dcutr_toggle = dcutr_behaviour;
 
         // Relay server configuration
         let relay_server_behaviour = if enable_relay_server {
