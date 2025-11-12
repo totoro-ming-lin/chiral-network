@@ -5440,6 +5440,9 @@ impl DhtService {
     ) -> Result<Self, Box<dyn Error>> {
         // ---- Hotfix: finalize AutoRelay flag (bootstrap OFF + ENV OFF)
         let mut final_enable_autorelay = enable_autorelay;
+
+        // force enable autorelay to facilitate autonat/dcutr
+        final_enable_autorelay = true;
         info!("FINAL ENABLE AUTORELAY {}", enable_autorelay);
         // if is_bootstrap {
         //     final_enable_autorelay = false;
