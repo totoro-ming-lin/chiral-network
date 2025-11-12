@@ -3549,6 +3549,9 @@ async fn run_dht_node(
                              SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                 warn!("❌ DISCONNECTED from peer: {}", peer_id);
                                 warn!("   Cause: {:?}", cause);
+                                // if is_bootstrap {
+                                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                                // }
 
                                 let peers_count = {
                                     let mut peers = connected_peers.lock().await;
@@ -3557,108 +3560,108 @@ async fn run_dht_node(
                                 };
 
                                 // Remove proxy state
-                                proxy_mgr.lock().await.remove_all(&peer_id);
+                                // proxy_mgr.lock().await.remove_all(&peer_id);
 
                                 // Immediately remove disconnected peer from seeder heartbeat cache
-                                let pid_str = peer_id.to_string();
-                                let mut updated_records: Vec<(String, Vec<u8>)> = Vec::new();
-                                {
-                                    let mut cache = seeder_heartbeats_cache.lock().await;
-                                    let now = unix_timestamp();
-                                    let mut to_remove_keys: Vec<String> = Vec::new();
-                                    for (file_hash, entry) in cache.iter_mut() {
-                                        let before = entry.heartbeats.len();
-                                        // remove any heartbeats for this peer
-                                        entry.heartbeats.retain(|hb| hb.peer_id != pid_str);
-
-                                        // prune expired while we're here
-                                        entry.heartbeats = prune_heartbeats(entry.heartbeats.clone(), now);
-
-                                        if entry.heartbeats.len() != before {
-                                            // update metadata fields
-                                            let seeder_strings = heartbeats_to_peer_list(&entry.heartbeats);
-                                            entry.metadata["seeders"] = serde_json::Value::Array(
-                                                seeder_strings
-                                                    .iter()
-                                                    .cloned()
-                                                    .map(serde_json::Value::String)
-                                                    .collect(),
-                                            );
-                                            entry.metadata["seederHeartbeats"] =
-                                                serde_json::to_value(&entry.heartbeats)
-                                                    .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
-
-                                            // If no seeders left we can drop the cache entry (and optionally stop providing)
-                                            if entry.heartbeats.is_empty() {
-                                                to_remove_keys.push(file_hash.clone());
-                                            } else if let Ok(bytes) = serde_json::to_vec(&entry.metadata) {
-                                                updated_records.push((file_hash.clone(), bytes));
-                                            }
-                                        }
-                                    }
-                                    for k in to_remove_keys {
-                                        cache.remove(&k);
-                                    }
-                                } // release cache lock
+                                // let pid_str = peer_id.to_string();
+                                // let mut updated_records: Vec<(String, Vec<u8>)> = Vec::new();
+                                // {
+                                //     let mut cache = seeder_heartbeats_cache.lock().await;
+                                //     let now = unix_timestamp();
+                                //     let mut to_remove_keys: Vec<String> = Vec::new();
+                                //     for (file_hash, entry) in cache.iter_mut() {
+                                //         let before = entry.heartbeats.len();
+                                //         // remove any heartbeats for this peer
+                                //         entry.heartbeats.retain(|hb| hb.peer_id != pid_str);
+                                //
+                                //         // prune expired while we're here
+                                //         entry.heartbeats = prune_heartbeats(entry.heartbeats.clone(), now);
+                                //
+                                //         if entry.heartbeats.len() != before {
+                                //             // update metadata fields
+                                //             let seeder_strings = heartbeats_to_peer_list(&entry.heartbeats);
+                                //             entry.metadata["seeders"] = serde_json::Value::Array(
+                                //                 seeder_strings
+                                //                     .iter()
+                                //                     .cloned()
+                                //                     .map(serde_json::Value::String)
+                                //                     .collect(),
+                                //             );
+                                //             entry.metadata["seederHeartbeats"] =
+                                //                 serde_json::to_value(&entry.heartbeats)
+                                //                     .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+                                //
+                                //             // If no seeders left we can drop the cache entry (and optionally stop providing)
+                                //             if entry.heartbeats.is_empty() {
+                                //                 to_remove_keys.push(file_hash.clone());
+                                //             } else if let Ok(bytes) = serde_json::to_vec(&entry.metadata) {
+                                //                 updated_records.push((file_hash.clone(), bytes));
+                                //             }
+                                //         }
+                                //     }
+                                //     for k in to_remove_keys {
+                                //         cache.remove(&k);
+                                //     }
+                                // } // release cache lock
 
                                 // Push updated records to Kademlia for each updated file
-                                for (file_hash, bytes) in updated_records {
-                                    let key = kad::RecordKey::new(&file_hash.as_bytes());
-                                    let record = Record {
-                                        key: key.clone(),
-                                        value: bytes.clone(),
-                                        publisher: Some(peer_id.clone()),
-                                        expires: None,
-                                    };
-                                    if let Err(e) =
-                                        swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
-                                    {
-                                        warn!("Failed to refresh DHT record after disconnect for {}: {}", file_hash, e);
-                                    } else {
-                                        debug!("Refreshed DHT record for {} after peer {} disconnected", file_hash, peer_id);
-                                    }
-
-                                    // notify UI with updated metadata so frontend refreshes immediately
-                                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                        if let (Some(merkle_root), Some(file_name), Some(file_size), Some(created_at)) = (
-                                            json_val.get("merkle_root").and_then(|v| v.as_str()),
-                                            json_val.get("file_name").and_then(|v| v.as_str()),
-                                            json_val.get("file_size").and_then(|v| v.as_u64()),
-                                            json_val.get("created_at").and_then(|v| v.as_u64()),
-                                        ) {
-                                            let seeders = json_val
-                                                .get("seeders")
-                                                .and_then(|v| v.as_array())
-                                                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                                                .unwrap_or_default();
-
-                                            let metadata = FileMetadata {
-                                                merkle_root: merkle_root.to_string(),
-                                                file_name: file_name.to_string(),
-                                                file_size,
-                                                file_data: Vec::new(),
-                                                seeders,
-                                                created_at,
-                                                mime_type: json_val.get("mime_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                is_encrypted: json_val.get("is_encrypted").and_then(|v| v.as_bool()).unwrap_or(false),
-                                                encryption_method: json_val.get("encryption_method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                key_fingerprint: json_val.get("key_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                version: json_val.get("version").and_then(|v| v.as_u64()).map(|u| u as u32),
-                                                parent_hash: json_val.get("parent_hash").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                cids: json_val.get("cids").and_then(|v| serde_json::from_value::<Option<Vec<Cid>>>(v.clone()).ok()).unwrap_or(None),
-                                                encrypted_key_bundle: json_val.get("encryptedKeyBundle").and_then(|v| serde_json::from_value::<Option<crate::encryption::EncryptedAesKeyBundle>>(v.clone()).ok()).unwrap_or(None),
-                                                info_hash: json_val.get("infoHash").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
-                                                is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
-                                                price: json_val.get("price").and_then(|v| v.as_f64()),
-                                                uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                http_sources: json_val.get("http_sources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
-                                                ..Default::default()
-                                            };
-                                            let _ = event_tx.send(DhtEvent::FileDiscovered(metadata)).await;
-                                        }
-                                    }
-                                }
+                                // for (file_hash, bytes) in updated_records {
+                                //     let key = kad::RecordKey::new(&file_hash.as_bytes());
+                                //     let record = Record {
+                                //         key: key.clone(),
+                                //         value: bytes.clone(),
+                                //         publisher: Some(peer_id.clone()),
+                                //         expires: None,
+                                //     };
+                                //     if let Err(e) =
+                                //         swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
+                                //     {
+                                //         warn!("Failed to refresh DHT record after disconnect for {}: {}", file_hash, e);
+                                //     } else {
+                                //         debug!("Refreshed DHT record for {} after peer {} disconnected", file_hash, peer_id);
+                                //     }
+                                //
+                                //     // notify UI with updated metadata so frontend refreshes immediately
+                                //     if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                //         if let (Some(merkle_root), Some(file_name), Some(file_size), Some(created_at)) = (
+                                //             json_val.get("merkle_root").and_then(|v| v.as_str()),
+                                //             json_val.get("file_name").and_then(|v| v.as_str()),
+                                //             json_val.get("file_size").and_then(|v| v.as_u64()),
+                                //             json_val.get("created_at").and_then(|v| v.as_u64()),
+                                //         ) {
+                                //             let seeders = json_val
+                                //                 .get("seeders")
+                                //                 .and_then(|v| v.as_array())
+                                //                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                                //                 .unwrap_or_default();
+                                //
+                                //             let metadata = FileMetadata {
+                                //                 merkle_root: merkle_root.to_string(),
+                                //                 file_name: file_name.to_string(),
+                                //                 file_size,
+                                //                 file_data: Vec::new(),
+                                //                 seeders,
+                                //                 created_at,
+                                //                 mime_type: json_val.get("mime_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                //                 is_encrypted: json_val.get("is_encrypted").and_then(|v| v.as_bool()).unwrap_or(false),
+                                //                 encryption_method: json_val.get("encryption_method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                //                 key_fingerprint: json_val.get("key_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                //                 version: json_val.get("version").and_then(|v| v.as_u64()).map(|u| u as u32),
+                                //                 parent_hash: json_val.get("parent_hash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                //                 cids: json_val.get("cids").and_then(|v| serde_json::from_value::<Option<Vec<Cid>>>(v.clone()).ok()).unwrap_or(None),
+                                //                 encrypted_key_bundle: json_val.get("encryptedKeyBundle").and_then(|v| serde_json::from_value::<Option<crate::encryption::EncryptedAesKeyBundle>>(v.clone()).ok()).unwrap_or(None),
+                                //                 info_hash: json_val.get("infoHash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                //                 trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
+                                //                 is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
+                                //                 price: json_val.get("price").and_then(|v| v.as_f64()),
+                                //                 uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                //                 http_sources: json_val.get("http_sources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
+                                //                 ..Default::default()
+                                //             };
+                                //             let _ = event_tx.send(DhtEvent::FileDiscovered(metadata)).await;
+                                //         }
+                                //     }
+                                // }
                                 info!("   Remaining connected peers: {}", peers_count);
                                 let _ = event_tx
                                     .send(DhtEvent::PeerDisconnected {
@@ -3689,64 +3692,65 @@ async fn run_dht_node(
                             }
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 // Check if this error is for an unreachable address before recording it
-                                let is_unreachable_addr = if let Some(pid) = peer_id {
-                                    if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
-                                        if !ma_plausibly_reachable(&bad_ma) {
-                                            swarm.behaviour_mut().kademlia.remove_address(&pid, &bad_ma);
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
 
-                                // Only record errors for reachable addresses
-                                if !is_unreachable_addr {
-                                    if let Ok(mut m) = metrics.try_lock() {
-                                        m.last_error = Some(error.to_string());
-                                        m.last_error_at = Some(SystemTime::now());
-                                        if let Some(pid) = peer_id {
-                                            if bootstrap_peer_ids.contains(&pid) {
-                                                m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(pid) = peer_id {
-                                    // Only log error for addresses that should be reachable
-                                    if !is_unreachable_addr {
-                                        error!("❌ Outgoing connection error to {}: {}", pid, error);
-
-                                        let is_bootstrap = bootstrap_peer_ids.contains(&pid);
-                                        if error.to_string().contains("rsa") {
-                                            error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
-                                        } else if error.to_string().contains("Timeout") {
-                                            if is_bootstrap {
-                                                warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
-                                            } else {
-                                                warn!("   ℹ Hint: Peer may be unreachable (timeout).");
-                                            }
-                                        } else if error.to_string().contains("Connection refused") {
-                                            if is_bootstrap {
-                                                warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
-                                            } else {
-                                                warn!("   ℹ Hint: Peer is not accepting connections.");
-                                            }
-                                        } else if error.to_string().contains("Transport") {
-                                            warn!("   ℹ Hint: Transport protocol negotiation failed.");
-                                        }
-                                    } else {
-                                        debug!("⏭️ Skipped connection to unreachable address for {}: {}", pid, error);
-                                    }
-                                } else {
-                                    error!("❌ Outgoing connection error to unknown peer: {}", error);
-                                }
-                                let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
+                                // let is_unreachable_addr = if let Some(pid) = peer_id {
+                                //     if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
+                                //         if !ma_plausibly_reachable(&bad_ma) {
+                                //             swarm.behaviour_mut().kademlia.remove_address(&pid, &bad_ma);
+                                //             true
+                                //         } else {
+                                //             false
+                                //         }
+                                //     } else {
+                                //         false
+                                //     }
+                                // } else {
+                                //     false
+                                // };
+                                //
+                                // // Only record errors for reachable addresses
+                                // if !is_unreachable_addr {
+                                //     if let Ok(mut m) = metrics.try_lock() {
+                                //         m.last_error = Some(error.to_string());
+                                //         m.last_error_at = Some(SystemTime::now());
+                                //         if let Some(pid) = peer_id {
+                                //             if bootstrap_peer_ids.contains(&pid) {
+                                //                 m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
+                                //             }
+                                //         }
+                                //     }
+                                // }
+                                //
+                                // if let Some(pid) = peer_id {
+                                //     // Only log error for addresses that should be reachable
+                                //     if !is_unreachable_addr {
+                                //         error!("❌ Outgoing connection error to {}: {}", pid, error);
+                                //
+                                //         let is_bootstrap = bootstrap_peer_ids.contains(&pid);
+                                //         if error.to_string().contains("rsa") {
+                                //             error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
+                                //         } else if error.to_string().contains("Timeout") {
+                                //             if is_bootstrap {
+                                //                 warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
+                                //             } else {
+                                //                 warn!("   ℹ Hint: Peer may be unreachable (timeout).");
+                                //             }
+                                //         } else if error.to_string().contains("Connection refused") {
+                                //             if is_bootstrap {
+                                //                 warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
+                                //             } else {
+                                //                 warn!("   ℹ Hint: Peer is not accepting connections.");
+                                //             }
+                                //         } else if error.to_string().contains("Transport") {
+                                //             warn!("   ℹ Hint: Transport protocol negotiation failed.");
+                                //         }
+                                //     } else {
+                                //         debug!("⏭️ Skipped connection to unreachable address for {}: {}", pid, error);
+                                //     }
+                                // } else {
+                                //     error!("❌ Outgoing connection error to unknown peer: {}", error);
+                                // }
+                                // let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
                             }
                             SwarmEvent::Behaviour(DhtBehaviourEvent::ProxyRr(ev)) => {
                                 use libp2p::request_response::{Event as RREvent, Message};
