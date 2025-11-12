@@ -1076,7 +1076,8 @@ async fn start_dht_node(
     let auto_enabled = enable_autonat.unwrap_or(false);
     info!("AUTONAT {}", auto_enabled);
     let probe_interval = autonat_probe_interval_secs.map(Duration::from_secs);
-    let autonat_server_list = autonat_servers.unwrap_or(["/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string()].to_vec());
+    let autonat_server_list = ["/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWSahP5pFRCEfaziPEba7urXGeif6T1y8jmodzdFUvzBHj".to_string()].to_vec();
+    // info!("{}", autonat_server_list);
 
     // Get the proxy from the command line, if it was provided at launch
     let cli_proxy = state.socks5_proxy_cli.lock().await.clone();
