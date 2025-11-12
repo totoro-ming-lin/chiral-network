@@ -4520,14 +4520,14 @@ async fn handle_identify_event(
             }
 
         }
-        // IdentifyEvent::Pushed { peer_id, info, .. } => {
-        //     info!(
-        //         "Pushed identify update to {} (listen addrs: {})",
-        //         peer_id,
-        //         info.listen_addrs.len()
-        //     );
-        //     record_identify_push_metrics(&metrics, &info).await;
-        // }
+        IdentifyEvent::Pushed { peer_id, info, .. } => {
+            // info!(
+            //     "Pushed identify update to {} (listen addrs: {})",
+            //     peer_id,
+            //     info.listen_addrs.len()
+            // );
+            record_identify_push_metrics(&metrics, &info).await;
+        }
         IdentifyEvent::Sent { peer_id, .. } => {
             info!("Sent identify info to {}", peer_id);
         }
