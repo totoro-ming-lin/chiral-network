@@ -1102,7 +1102,7 @@ async fn start_dht_node(
     let auto_enabled = enable_autonat.unwrap_or(false);
     info!("AUTONAT {}", auto_enabled);
     let probe_interval = autonat_probe_interval_secs.map(Duration::from_secs);
-    let autonat_server_list = autonat_servers.unwrap_or(bootstrap_nodes);
+    let autonat_server_list = autonat_servers.unwrap_or(bootstrap_nodes.clone());
 
     // Get the proxy from the command line, if it was provided at launch
     let cli_proxy = state.socks5_proxy_cli.lock().await.clone();
