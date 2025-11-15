@@ -3523,7 +3523,6 @@ async fn run_dht_node(
                                 }
                             }
                             SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatClient(ev)) => {
-
                                 handle_autonat_client_event(&mut swarm, ev, &metrics, &event_tx).await;
                             }
                             SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatServer(ev)) => {

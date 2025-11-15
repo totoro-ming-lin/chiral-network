@@ -1,25 +1,15 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
 )]
 
 // Declare all modules here
-pub mod protocols;
-pub mod commands;
 pub mod analytics;
-pub mod net;
-pub mod peer_selection;
-pub mod pool;
-pub mod proxy_latency;
-pub mod stream_auth;
-pub mod webrtc_service;
-mod transfer_events;
-pub mod transaction_services;
 pub mod bandwidth;
 pub mod blockchain_listener;
+pub mod commands;
 pub mod dht;
 pub mod download_scheduler;
 pub mod download_source;
@@ -36,25 +26,34 @@ pub mod http_server;
 pub mod keystore;
 pub mod manager;
 pub mod multi_source_download;
+pub mod net;
+pub mod peer_selection;
+pub mod pool;
+pub mod protocols;
+pub mod proxy_latency;
+pub mod stream_auth;
+pub mod transaction_services;
+mod transfer_events;
+pub mod webrtc_service;
 
-mod logger;
 pub mod bittorrent_handler;
 pub mod download_restart;
+mod logger;
 
-use protocols::{ProtocolManager, ProtocolHandler};
+use protocols::{ProtocolHandler, ProtocolManager};
 
 use crate::commands::auth::{
     cleanup_expired_proxy_auth_tokens, generate_proxy_auth_token, revoke_proxy_auth_token,
     validate_proxy_auth_token,
 };
 
+use crate::bandwidth::BandwidthController;
 use crate::commands::bootstrap::get_bootstrap_nodes_command;
+use crate::commands::network::get_full_network_stats;
 use crate::commands::proxy::{
     disable_privacy_routing, enable_privacy_routing, list_proxies, proxy_connect, proxy_disconnect,
     proxy_echo, proxy_remove, ProxyNode,
 };
-use crate::commands::network::get_full_network_stats;
-use crate::bandwidth::BandwidthController;
 use crate::stream_auth::{
     AuthMessage, HmacKeyExchangeConfirmation, HmacKeyExchangeRequest, HmacKeyExchangeResponse,
     StreamAuthService,
@@ -113,9 +112,9 @@ use webrtc_service::{WebRTCFileRequest, WebRTCService};
 use crate::manager::ChunkManager; // Import the ChunkManager
                                   // For key encoding
 use blockstore::block::Block;
-use x25519_dalek::{PublicKey, StaticSecret}; // For key handling
-use suppaftp::FtpStream;
 use std::io::Write;
+use suppaftp::FtpStream;
+use x25519_dalek::{PublicKey, StaticSecret}; // For key handling
 
 // Settings structure for backend use
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,27 +143,30 @@ fn load_settings_from_file(app_handle: &tauri::AppHandle) -> BackendSettings {
         .path()
         .app_data_dir()
         .expect("Failed to get app data directory");
-    
+
     let settings_file = app_data_dir.join("settings.json");
     info!("Loading settings from: {}", settings_file.display());
-    
+
     if settings_file.exists() {
         match std::fs::read_to_string(&settings_file) {
             Ok(contents) => {
                 match serde_json::from_str::<serde_json::Value>(&contents) {
                     Ok(json) => {
                         // Extract only the fields we need
-                        let storage_path = json.get("storagePath")
+                        let storage_path = json
+                            .get("storagePath")
                             .and_then(|v| v.as_str())
                             .unwrap_or("~/ChiralNetwork/Storage")
                             .to_string();
-                        let enable_file_logging = json.get("enableFileLogging")
+                        let enable_file_logging = json
+                            .get("enableFileLogging")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let max_log_size_mb = json.get("maxLogSizeMB")
+                        let max_log_size_mb = json
+                            .get("maxLogSizeMB")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(10);
-                        
+
                         return BackendSettings {
                             storage_path,
                             enable_file_logging,
@@ -181,7 +183,7 @@ fn load_settings_from_file(app_handle: &tauri::AppHandle) -> BackendSettings {
             }
         }
     }
-    
+
     BackendSettings::default()
 }
 
@@ -189,7 +191,9 @@ fn load_settings_from_file(app_handle: &tauri::AppHandle) -> BackendSettings {
 fn expand_tilde(path: &str) -> PathBuf {
     if path.starts_with("~/") || path == "~" {
         if let Some(base_dirs) = directories::BaseDirs::new() {
-            return base_dirs.home_dir().join(path.strip_prefix("~/").unwrap_or(""));
+            return base_dirs
+                .home_dir()
+                .join(path.strip_prefix("~/").unwrap_or(""));
         }
     }
     PathBuf::from(path)
@@ -415,7 +419,8 @@ async fn import_chiral_account(
 async fn start_geth_node(
     state: State<'_, AppState>,
     data_dir: String,
-    rpc_url: Option<String>,) -> Result<(), String> {
+    rpc_url: Option<String>,
+) -> Result<(), String> {
     let mut geth = state.geth.lock().await;
     let miner_address = state.miner_address.lock().await;
     let rpc_url = rpc_url.unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
@@ -443,8 +448,14 @@ async fn seed(file_path: String, state: State<'_, AppState>) -> Result<String, S
 /// Tauri command to create and seed a BitTorrent file.
 /// It takes a local file path, creates a torrent, starts seeding, and returns a magnet link.
 #[tauri::command]
-async fn create_and_seed_torrent(file_path: String, state: State<'_, AppState>) -> Result<String, String> {
-    println!("Received create_and_seed_torrent command for: {}", file_path);
+async fn create_and_seed_torrent(
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    println!(
+        "Received create_and_seed_torrent command for: {}",
+        file_path
+    );
     // Use the BitTorrent handler directly to create and seed the torrent
     state.bittorrent_handler.seed(&file_path).await
 }
@@ -529,7 +540,8 @@ async fn get_user_balance(state: State<'_, AppState>) -> Result<String, String> 
 async fn can_afford_download(state: State<'_, AppState>, price: f64) -> Result<bool, String> {
     let account = get_active_account(&state).await?;
     let balance_str = get_balance(&account).await?;
-    let balance = balance_str.parse::<f64>()
+    let balance = balance_str
+        .parse::<f64>()
         .map_err(|e| format!("Failed to parse balance: {}", e))?;
     Ok(balance >= price)
 }
@@ -606,7 +618,10 @@ async fn record_download_payment(
     app.emit("seeder_payment_received", payment_msg.clone())
         .map_err(|e| format!("Failed to emit payment notification: {}", e))?;
 
-    println!("✅ Payment notification emitted locally for seeder: {}", seeder_wallet_address);
+    println!(
+        "✅ Payment notification emitted locally for seeder: {}",
+        seeder_wallet_address
+    );
 
     // Send P2P payment notification to the seeder's peer
     let dht = {
@@ -626,9 +641,15 @@ async fn record_download_payment(
         });
 
         // Send via DHT to the seeder's peer ID
-        match dht.send_message_to_peer(&seeder_peer_id, wrapped_message).await {
+        match dht
+            .send_message_to_peer(&seeder_peer_id, wrapped_message)
+            .await
+        {
             Ok(_) => {
-                println!("✅ P2P payment notification sent to peer: {}", seeder_peer_id);
+                println!(
+                    "✅ P2P payment notification sent to peer: {}",
+                    seeder_peer_id
+                );
             }
             Err(e) => {
                 // Don't fail the whole operation if P2P message fails
@@ -652,7 +673,10 @@ async fn record_seeder_payment(
     _transaction_id: u64,
 ) -> Result<(), String> {
     // Log the seeder payment receipt for analytics/audit purposes
-    println!("💰 Seeder payment received: {} Chiral from {}", _amount, _downloader_address);
+    println!(
+        "💰 Seeder payment received: {} Chiral from {}",
+        _amount, _downloader_address
+    );
     Ok(())
 }
 
@@ -1018,7 +1042,8 @@ lazy_static! {
 async fn get_blocks_mined(address: String) -> Result<u64, String> {
     // Check cache (directly return within 500ms)
     {
-        let cache = BLOCKS_CACHE.lock()
+        let cache = BLOCKS_CACHE
+            .lock()
             .map_err(|e| format!("Failed to acquire blocks cache lock: {}", e))?;
         if let Some((cached_addr, cached_blocks, cached_time)) = cache.as_ref() {
             if cached_addr == &address && cached_time.elapsed() < Duration::from_millis(500) {
@@ -1032,7 +1057,8 @@ async fn get_blocks_mined(address: String) -> Result<u64, String> {
 
     // Update Cache
     {
-        let mut cache = BLOCKS_CACHE.lock()
+        let mut cache = BLOCKS_CACHE
+            .lock()
             .map_err(|e| format!("Failed to acquire blocks cache lock for update: {}", e))?;
         *cache = Some((address, blocks, Instant::now()));
     }
@@ -1076,7 +1102,7 @@ async fn start_dht_node(
     let auto_enabled = enable_autonat.unwrap_or(false);
     info!("AUTONAT {}", auto_enabled);
     let probe_interval = autonat_probe_interval_secs.map(Duration::from_secs);
-    let autonat_server_list = autonat_servers.unwrap_or(["/ip4/136.116.190.115/tcp/4002/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN".to_string()].to_vec());
+    let autonat_server_list = autonat_servers.unwrap_or(bootstrap_nodes);
 
     // Get the proxy from the command line, if it was provided at launch
     let cli_proxy = state.socks5_proxy_cli.lock().await.clone();
@@ -1312,7 +1338,12 @@ async fn start_dht_node(
                         });
                         let _ = app_handle.emit("relay_reputation_event", payload);
                     }
-                    DhtEvent::BitswapChunkDownloaded { file_hash, chunk_index, total_chunks, chunk_size } => {
+                    DhtEvent::BitswapChunkDownloaded {
+                        file_hash,
+                        chunk_index,
+                        total_chunks,
+                        chunk_size,
+                    } => {
                         let payload = serde_json::json!({
                             "fileHash": file_hash,
                             "chunkIndex": chunk_index,
@@ -1320,11 +1351,16 @@ async fn start_dht_node(
                             "chunkSize": chunk_size,
                         });
                         let _ = app_handle.emit("bitswap_chunk_downloaded", payload);
-                    },
+                    }
                     DhtEvent::PaymentNotificationReceived { from_peer, payload } => {
-                        println!("💰 Payment notification received from peer {}: {:?}", from_peer, payload);
+                        println!(
+                            "💰 Payment notification received from peer {}: {:?}",
+                            from_peer, payload
+                        );
                         // Convert payload to match the expected format for seeder_payment_received
-                        if let Ok(notification) = serde_json::from_value::<serde_json::Value>(payload.clone()) {
+                        if let Ok(notification) =
+                            serde_json::from_value::<serde_json::Value>(payload.clone())
+                        {
                             let formatted_payload = serde_json::json!({
                                 "file_hash": notification.get("file_hash").and_then(|v| v.as_str()).unwrap_or(""),
                                 "file_name": notification.get("file_name").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1338,7 +1374,7 @@ async fn start_dht_node(
                             let _ = app_handle.emit("seeder_payment_received", formatted_payload);
                             println!("✅ Payment notification forwarded to frontend");
                         }
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -1676,12 +1712,20 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                 DhtEvent::FileDownloaded { file_hash } => {
                     format!("file_downloaded:{}", file_hash)
                 }
-                DhtEvent::BitswapChunkDownloaded { file_hash, chunk_index, total_chunks, chunk_size } => {
-                    format!("bitswap_chunk_downloaded:{}:{}:{}:{}", file_hash, chunk_index, total_chunks, chunk_size)
-                },
+                DhtEvent::BitswapChunkDownloaded {
+                    file_hash,
+                    chunk_index,
+                    total_chunks,
+                    chunk_size,
+                } => {
+                    format!(
+                        "bitswap_chunk_downloaded:{}:{}:{}:{}",
+                        file_hash, chunk_index, total_chunks, chunk_size
+                    )
+                }
                 DhtEvent::PaymentNotificationReceived { from_peer, payload } => {
                     format!("payment_notification_received:{}:{:?}", from_peer, payload)
-                },
+                }
                 DhtEvent::ReputationEvent {
                     peer_id,
                     event_type,
@@ -1843,7 +1887,9 @@ fn smooth_power(raw_power: f32) -> f32 {
         raw_power
     } else {
         let total_weight: f32 = (1..=history.len()).map(|i| i as f32).sum();
-        let weighted_sum: f32 = history.iter().enumerate()
+        let weighted_sum: f32 = history
+            .iter()
+            .enumerate()
             .map(|(i, (_, power))| power * (i + 1) as f32)
             .sum();
         weighted_sum / total_weight
@@ -1924,7 +1970,8 @@ fn get_windows_power_via_powershell() -> Option<f32> {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 let power_str = output_str.trim();
                 if let Ok(power) = power_str.parse::<f32>() {
-                    if power > 0.0 && power < 500.0 { // Reasonable power range for CPU
+                    if power > 0.0 && power < 500.0 {
+                        // Reasonable power range for CPU
                         return Some(power);
                     }
                 }
@@ -1992,7 +2039,8 @@ fn get_windows_power_via_wmi() -> Option<f32> {
                 let power_str = output_str.trim();
                 if !power_str.is_empty() && power_str != "null" {
                     if let Ok(power) = power_str.parse::<f32>() {
-                        if power > 0.0 && power < 200.0 { // Reasonable power range
+                        if power > 0.0 && power < 200.0 {
+                            // Reasonable power range
                             return Some(power);
                         }
                     }
@@ -2054,7 +2102,8 @@ fn get_windows_power_via_perf_counters() -> Option<f32> {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 let power_str = output_str.trim();
                 if let Ok(power) = power_str.parse::<f32>() {
-                    if power > 0.0 && power < 500.0 { // Reasonable power range
+                    if power > 0.0 && power < 500.0 {
+                        // Reasonable power range
                         return Some(power);
                     }
                 }
@@ -2155,7 +2204,8 @@ fn get_windows_power_via_system_info() -> Option<f32> {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 let power_str = output_str.trim();
                 if let Ok(power) = power_str.parse::<f32>() {
-                    if power > 20.0 && power < 1000.0 { // Reasonable power range for full system
+                    if power > 20.0 && power < 1000.0 {
+                        // Reasonable power range for full system
                         return Some(power);
                     }
                 }
@@ -2199,7 +2249,8 @@ fn get_linux_power() -> Option<(f32, PowerMethod)> {
 
                             let power_watts = (energy_diff as f64 / 1_000_000.0) / time_diff; // Convert µJ to J, then to W
 
-                            if power_watts > 0.0 && power_watts < 1000.0 { // Reasonable power range
+                            if power_watts > 0.0 && power_watts < 1000.0 {
+                                // Reasonable power range
                                 LAST_POWER = power_watts as f32;
                                 LAST_ENERGY = Some((energy_uj, now));
                                 return Some((power_watts as f32, PowerMethod::Systemstat));
@@ -2220,23 +2271,23 @@ fn get_linux_power() -> Option<(f32, PowerMethod)> {
 #[cfg(target_os = "macos")]
 fn get_mac_power() -> Option<(f32, PowerMethod)> {
     use std::time::Instant;
-    
+
     // Static variables to track power readings over time
     static mut LAST_CPU_USAGE: Option<(f32, Instant)> = None;
     static mut LAST_POWER: f32 = 0.0;
-    
+
     // Try to get power from SMC (System Management Controller)
     // SMC provides direct hardware power readings on Mac systems
     if let Some(power) = get_mac_power_from_smc() {
         return Some((power, PowerMethod::Systemstat));
     }
-    
+
     // Fallback: Estimate power based on CPU usage
     // This is less accurate but works when SMC access is unavailable
     if let Some(power) = get_mac_power_from_cpu_usage() {
         return Some((power, PowerMethod::Sysinfo));
     }
-    
+
     None
 }
 
@@ -2244,30 +2295,30 @@ fn get_mac_power() -> Option<(f32, PowerMethod)> {
 fn get_mac_power_from_smc() -> Option<f32> {
     // Try to read power consumption from SMC
     // The SMC provides real-time power metrics on Mac hardware
-    
+
     // Note: SMC access on macOS requires specific hardware keys
     // This implementation may need adjustment based on actual Mac hardware
     // For now, we'll skip SMC implementation and rely on CPU estimation
-    
+
     // The smc crate has complex API requirements and version conflicts
     // that make it difficult to use reliably across different Mac models
-    
+
     None
 }
 
 #[cfg(target_os = "macos")]
 fn get_mac_power_from_cpu_usage() -> Option<f32> {
     use std::process::Command;
-    
+
     // Use system commands to estimate power consumption
     // Method 1: Get CPU usage and estimate from TDP
-    
+
     // Get CPU usage percentage
     let cpu_usage_output = Command::new("sh")
         .arg("-c")
         .arg("ps -A -o %cpu | awk '{s+=$1} END {print s}'")
         .output();
-    
+
     if let Ok(output) = cpu_usage_output {
         if output.status.success() {
             if let Ok(usage_str) = String::from_utf8(output.stdout) {
@@ -2277,13 +2328,16 @@ fn get_mac_power_from_cpu_usage() -> Option<f32> {
                         .arg("-n")
                         .arg("machdep.cpu.brand_string")
                         .output();
-                    
+
                     let mut estimated_tdp = 15.0; // Default for MacBook
-                    
+
                     if let Ok(sysctl_out) = sysctl_output {
                         if let Ok(cpu_brand) = String::from_utf8(sysctl_out.stdout) {
                             // Estimate TDP based on CPU model
-                            if cpu_brand.contains("M1") || cpu_brand.contains("M2") || cpu_brand.contains("M3") {
+                            if cpu_brand.contains("M1")
+                                || cpu_brand.contains("M2")
+                                || cpu_brand.contains("M3")
+                            {
                                 // Apple Silicon - very efficient
                                 estimated_tdp = 20.0; // M-series chips are low power
                             } else if cpu_brand.contains("Intel") {
@@ -2300,13 +2354,11 @@ fn get_mac_power_from_cpu_usage() -> Option<f32> {
                             }
                         }
                     }
-                    
+
                     // Get number of cores to adjust estimation
-                    let core_count_output = Command::new("sysctl")
-                        .arg("-n")
-                        .arg("hw.ncpu")
-                        .output();
-                    
+                    let core_count_output =
+                        Command::new("sysctl").arg("-n").arg("hw.ncpu").output();
+
                     let mut num_cores = 4.0;
                     if let Ok(core_out) = core_count_output {
                         if let Ok(cores_str) = String::from_utf8(core_out.stdout) {
@@ -2315,19 +2367,19 @@ fn get_mac_power_from_cpu_usage() -> Option<f32> {
                             }
                         }
                     }
-                    
+
                     // Calculate power consumption
                     // cpu_usage is total across all cores, so normalize by core count
                     let normalized_usage = cpu_usage / num_cores;
                     let cpu_power = estimated_tdp * (normalized_usage / 100.0);
-                    
+
                     // Add base system power (display, memory, etc.)
                     let base_power = 5.0; // Base system power for Mac
                     let total_power = cpu_power + base_power;
-                    
+
                     // Ensure minimum power draw
                     let final_power = total_power.max(estimated_tdp * 0.2); // At least 20% of TDP
-                    
+
                     if final_power > 0.0 && final_power < 200.0 {
                         return Some(final_power);
                     }
@@ -2335,7 +2387,7 @@ fn get_mac_power_from_cpu_usage() -> Option<f32> {
             }
         }
     }
-    
+
     None
 }
 
@@ -2827,16 +2879,18 @@ fn get_default_storage_path(app: tauri::AppHandle) -> Result<String, String> {
 #[tauri::command]
 async fn ensure_directory_exists(path: String) -> Result<(), String> {
     let path_obj = Path::new(&path);
-    
+
     // Get parent directory (in case path is a file path)
     let dir_to_create = if path_obj.extension().is_some() {
         // This looks like a file path, get the parent directory
-        path_obj.parent().ok_or_else(|| "Invalid path".to_string())?
+        path_obj
+            .parent()
+            .ok_or_else(|| "Invalid path".to_string())?
     } else {
         // This is a directory path
         path_obj
     };
-    
+
     tokio::fs::create_dir_all(dir_to_create)
         .await
         .map_err(|e| format!("Failed to create directory: {}", e))
@@ -2936,7 +2990,10 @@ async fn upload_file_to_network(
     file_path: String,
     price: Option<f64>,
 ) -> Result<(), String> {
-    println!("🔍 BACKEND: upload_file_to_network called with price: {:?}", price);
+    println!(
+        "🔍 BACKEND: upload_file_to_network called with price: {:?}",
+        price
+    );
 
     // Get the active account address
     let account = get_active_account(&state).await?;
@@ -2958,9 +3015,9 @@ async fn upload_file_to_network(
         // Upload the file
         let c = file_path.clone();
         let file_name = Path::new(&c)
-            .file_name()             // returns Option<&OsStr>
+            .file_name() // returns Option<&OsStr>
             .and_then(|s| s.to_str()) // convert OsStr -> &str
-            .unwrap_or(&file_path);   // fallback to whole path if not found
+            .unwrap_or(&file_path); // fallback to whole path if not found
 
         ft.upload_file_with_account(
             file_path.clone(),
@@ -3006,7 +3063,7 @@ async fn upload_file_to_network(
                 uploader_address: Some(account.clone()),
                 ..Default::default()
             };
-          // Prepare a timestamp for metadata
+            // Prepare a timestamp for metadata
             let created_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or(std::time::Duration::from_secs(0))
@@ -3020,12 +3077,12 @@ async fn upload_file_to_network(
                     file_data.len() as u64,
                     file_data.clone(),
                     created_at,
-                    None,  // mime_type
-                    None,  // encrypted_key_bundle
-                    false, // is_encrypted
-                    None,  // encryption_method
-                    None,  // key_fingerprint
-                    price, // Add price parameter
+                    None,                  // mime_type
+                    None,                  // encrypted_key_bundle
+                    false,                 // is_encrypted
+                    None,                  // encryption_method
+                    None,                  // key_fingerprint
+                    price,                 // Add price parameter
                     Some(account.clone()), // Add uploader_address parameter
                 )
                 .await
@@ -3127,13 +3184,13 @@ async fn download_blocks_from_network(
 async fn download_file_from_network(
     state: State<'_, AppState>,
     file_hash: String,
-    output_path: String,  // Remove the underscore - we'll use this now
+    output_path: String, // Remove the underscore - we'll use this now
 ) -> Result<String, String> {
     use std::path::Path;
 
     // ✅ VALIDATE OUTPUT PATH BEFORE STARTING DOWNLOAD
     let path = Path::new(&output_path);
-    
+
     // Check if parent directory exists
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -3434,8 +3491,8 @@ async fn save_temp_file_for_upload(
 /// Get file size in bytes
 #[tauri::command]
 async fn get_file_size(file_path: String) -> Result<u64, String> {
-    let metadata = fs::metadata(&file_path)
-        .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+    let metadata =
+        fs::metadata(&file_path).map_err(|e| format!("Failed to get file metadata: {}", e))?;
     Ok(metadata.len())
 }
 
@@ -4842,24 +4899,21 @@ async fn reset_analytics(state: State<'_, AppState>) -> Result<(), String> {
 // Logger configuration commands
 /// Saves application settings to a JSON file in the app data directory
 #[tauri::command]
-async fn save_app_settings(
-    app: tauri::AppHandle,
-    settings_json: String,
-) -> Result<(), String> {
+async fn save_app_settings(app: tauri::AppHandle, settings_json: String) -> Result<(), String> {
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data directory: {}", e))?;
-    
+
     // Ensure the directory exists
     std::fs::create_dir_all(&app_data_dir)
         .map_err(|e| format!("Failed to create app data directory: {}", e))?;
-    
+
     let settings_file = app_data_dir.join("settings.json");
-    
+
     std::fs::write(&settings_file, settings_json)
         .map_err(|e| format!("Failed to write settings file: {}", e))?;
-    
+
     info!("Settings saved to: {}", settings_file.display());
     Ok(())
 }
@@ -4867,12 +4921,12 @@ async fn save_app_settings(
 /// Updates the file logger configuration at runtime.
 /// This allows enabling/disabling file logging and changing log rotation settings
 /// without restarting the application.
-/// 
+///
 /// All existing `info!()`, `debug!()`, `error!()` etc. calls throughout the codebase
 /// will automatically be captured and written to the log files when enabled.
-/// 
+///
 /// Logs are always written to the AppData directory, not the user's storage directory.
-/// 
+///
 /// Note: The tracing subscriber is initialized at startup, so changes to enable/disable
 /// logging will only affect whether logs are written to disk. Console logging remains active.
 #[tauri::command]
@@ -4887,16 +4941,20 @@ async fn update_log_config(
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data directory: {}", e))?;
-    
+
     let logs_dir = app_data_dir.join("logs");
     let config = logger::LogConfig::new(&logs_dir, max_log_size_mb, enabled);
-    
+
     let logger_lock = state.file_logger.lock().await;
     if let Some(ref writer) = *logger_lock {
         writer.update_config(config).map_err(|e| e.to_string())?;
-        
+
         if enabled {
-            info!("File logging enabled: {} (max size: {} MB)", logs_dir.display(), max_log_size_mb);
+            info!(
+                "File logging enabled: {} (max size: {} MB)",
+                logs_dir.display(),
+                max_log_size_mb
+            );
             // Force a write to create the log file if it doesn't exist
             info!("Logger configuration updated");
         } else {
@@ -4905,7 +4963,7 @@ async fn update_log_config(
     } else {
         return Err("File logger not initialized. Please restart the application.".to_string());
     }
-    
+
     Ok(())
 }
 
@@ -4916,7 +4974,7 @@ fn get_logs_directory(app: tauri::AppHandle) -> Result<String, String> {
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data directory: {}", e))?;
-    
+
     let logs_dir = app_data_dir.join("logs");
     Ok(logs_dir.to_string_lossy().to_string())
 }
@@ -4954,10 +5012,7 @@ async fn reset_network_services(state: State<'_, AppState>) -> Result<(), String
 ///
 /// Returns the actual bound address (useful if port 0 was used for auto-assignment)
 #[tauri::command]
-async fn start_http_server(
-    state: State<'_, AppState>,
-    port: u16,
-) -> Result<String, String> {
+async fn start_http_server(state: State<'_, AppState>, port: u16) -> Result<String, String> {
     // Check if server is already running
     {
         let addr_lock = state.http_server_addr.lock().await;
@@ -5005,9 +5060,7 @@ async fn stop_http_server(state: State<'_, AppState>) -> Result<(), String> {
 
 /// Get HTTP server status
 #[tauri::command]
-async fn get_http_server_status(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+async fn get_http_server_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let addr_lock = state.http_server_addr.lock().await;
 
     match &*addr_lock {
@@ -5088,7 +5141,10 @@ async fn start_download_restart(
 ) -> Result<String, String> {
     let dr_guard = state.download_restart.lock().await;
     if let Some(ref service) = *dr_guard {
-        service.start_download(request).await.map_err(|e| e.to_string())
+        service
+            .start_download(request)
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err("Download restart service not initialized".to_string())
     }
@@ -5101,7 +5157,10 @@ async fn pause_download_restart(
 ) -> Result<(), String> {
     let dr_guard = state.download_restart.lock().await;
     if let Some(ref service) = *dr_guard {
-        service.pause_download(&download_id).await.map_err(|e| e.to_string())
+        service
+            .pause_download(&download_id)
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err("Download restart service not initialized".to_string())
     }
@@ -5114,7 +5173,10 @@ async fn resume_download_restart(
 ) -> Result<(), String> {
     let dr_guard = state.download_restart.lock().await;
     if let Some(ref service) = *dr_guard {
-        service.resume_download(&download_id).await.map_err(|e| e.to_string())
+        service
+            .resume_download(&download_id)
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err("Download restart service not initialized".to_string())
     }
@@ -5127,7 +5189,10 @@ async fn get_download_status_restart(
 ) -> Result<download_restart::DownloadStatus, String> {
     let dr_guard = state.download_restart.lock().await;
     if let Some(ref service) = *dr_guard {
-        service.get_status(&download_id).await.map_err(|e| e.to_string())
+        service
+            .get_status(&download_id)
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Err("Download restart service not initialized".to_string())
     }
@@ -5137,7 +5202,7 @@ async fn get_download_status_restart(
 fn main() {
     // Don't initialize tracing subscriber here - we'll do it in setup() after loading settings
     // so we can configure file logging properly
-    
+
     // Parse command line arguments
     use clap::Parser;
     let args = headless::CliArgs::parse();
@@ -5146,7 +5211,7 @@ fn main() {
     if args.headless {
         use tracing_subscriber::{fmt, prelude::*, EnvFilter};
         let mut filter = EnvFilter::from_default_env();
-        
+
         // Add directives with safe fallback
         if let Ok(directive) = "chiral_network=info".parse() {
             filter = filter.add_directive(directive);
@@ -5163,12 +5228,12 @@ fn main() {
         if let Ok(directive) = "libp2p_mdns=warn".parse() {
             filter = filter.add_directive(directive);
         }
-        
+
         tracing_subscriber::registry()
             .with(fmt::layer())
             .with(filter)
             .init();
-            
+
         println!("Running in headless mode...");
 
         // Create a tokio runtime for async operations
@@ -5249,32 +5314,36 @@ fn main() {
             // Protocol Manager with BitTorrent support
             protocol_manager: {
                 let mut manager = ProtocolManager::new();
-                
+
                 // Create default download directory
-                let download_dir = directories::ProjectDirs::from("com", "chiral-network", "chiral-network")
-                    .map(|dirs| dirs.data_dir().join("downloads"))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join("downloads"));
-                
+                let download_dir =
+                    directories::ProjectDirs::from("com", "chiral-network", "chiral-network")
+                        .map(|dirs| dirs.data_dir().join("downloads"))
+                        .unwrap_or_else(|| std::env::current_dir().unwrap().join("downloads"));
+
                 // Ensure download directory exists
                 if let Err(e) = std::fs::create_dir_all(&download_dir) {
                     eprintln!("Failed to create download directory: {}", e);
                 }
-                
+
                 // Register BitTorrent handler
-                let bittorrent_handler = Arc::new(bittorrent_handler::BitTorrentHandler::new(download_dir.clone()));
+                let bittorrent_handler = Arc::new(bittorrent_handler::BitTorrentHandler::new(
+                    download_dir.clone(),
+                ));
                 manager.register(bittorrent_handler);
-                
+
                 Arc::new(manager)
             },
 
-          // File logger - will be initialized in setup phase after loading settings
+            // File logger - will be initialized in setup phase after loading settings
             file_logger: Arc::new(Mutex::new(None)),
-          
+
             // BitTorrent handler for creating and seeding torrents
             bittorrent_handler: {
-                let download_dir = directories::ProjectDirs::from("com", "chiral-network", "chiral-network")
-                    .map(|dirs| dirs.data_dir().join("downloads"))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join("downloads"));
+                let download_dir =
+                    directories::ProjectDirs::from("com", "chiral-network", "chiral-network")
+                        .map(|dirs| dirs.data_dir().join("downloads"))
+                        .unwrap_or_else(|| std::env::current_dir().unwrap().join("downloads"));
                 Arc::new(bittorrent_handler::BitTorrentHandler::new(download_dir))
             },
 
@@ -5473,12 +5542,14 @@ fn main() {
             // Load settings from disk
             println!("Loading settings from app data directory...");
             let settings = load_settings_from_file(&app.handle());
-            println!("Settings loaded: enable_file_logging={}, max_log_size_mb={}", 
-                  settings.enable_file_logging, settings.max_log_size_mb);
-            
+            println!(
+                "Settings loaded: enable_file_logging={}, max_log_size_mb={}",
+                settings.enable_file_logging, settings.max_log_size_mb
+            );
+
             // Initialize tracing subscriber with console output and optionally file output
             use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-            
+
             let env_filter = {
                 #[cfg(debug_assertions)]
                 {
@@ -5496,20 +5567,29 @@ fn main() {
                         .add_directive("libp2p=error".parse().unwrap())
                 }
             };
-            
+
             // Always create file logger (even if disabled) so it can be enabled/disabled later
-            let app_data_dir = app.path().app_data_dir()
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
                 .expect("Failed to get app data directory");
             let logs_dir = app_data_dir.join("logs");
-            
+
             println!("Initializing file logger at: {}", logs_dir.display());
-            
-            let log_config = logger::LogConfig::new(&logs_dir, settings.max_log_size_mb, settings.enable_file_logging);
-            
+
+            let log_config = logger::LogConfig::new(
+                &logs_dir,
+                settings.max_log_size_mb,
+                settings.enable_file_logging,
+            );
+
             let file_logger_writer = match logger::RotatingFileWriter::new(log_config) {
                 Ok(writer) => {
                     let thread_safe_writer = logger::ThreadSafeWriter::new(writer);
-                    println!("File logger initialized successfully (enabled: {})", settings.enable_file_logging);
+                    println!(
+                        "File logger initialized successfully (enabled: {})",
+                        settings.enable_file_logging
+                    );
                     Some(thread_safe_writer)
                 }
                 Err(e) => {
@@ -5517,7 +5597,7 @@ fn main() {
                     None
                 }
             };
-            
+
             // Initialize tracing subscriber with both console and file output
             // File output will only write if enabled in config
             if let Some(ref file_writer) = file_logger_writer {
@@ -5532,17 +5612,19 @@ fn main() {
                     .with(env_filter)
                     .init();
             }
-            
+
             info!("Chiral Network starting up...");
-            info!("Settings loaded: enable_file_logging={}, max_log_size_mb={}", 
-                  settings.enable_file_logging, settings.max_log_size_mb);
-            
+            info!(
+                "Settings loaded: enable_file_logging={}, max_log_size_mb={}",
+                settings.enable_file_logging, settings.max_log_size_mb
+            );
+
             // Store the file logger in app state so it can be updated later
             if let Some(file_writer) = file_logger_writer {
                 if let Some(state) = app.try_state::<AppState>() {
                     let mut file_logger = state.file_logger.blocking_lock();
                     *file_logger = Some(file_writer.clone());
-                    
+
                     // Log the current log file path if logging is enabled
                     if settings.enable_file_logging {
                         if let Some(path) = file_writer.current_log_file_path() {
@@ -5551,7 +5633,7 @@ fn main() {
                     }
                 }
             }
-            
+
             // Clean up any orphaned geth processes on startup
             #[cfg(unix)]
             {
@@ -5592,7 +5674,8 @@ fn main() {
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &hide_i, &quit_i])?;
 
-            let icon = app.default_window_icon()
+            let icon = app
+                .default_window_icon()
                 .ok_or("Failed to get default window icon")?
                 .clone();
 
@@ -5682,7 +5765,9 @@ fn main() {
 
                         tracing::info!("Auto-starting HTTP server on port 8080...");
 
-                        match http_server::start_server(state.http_server_state.clone(), bind_addr).await {
+                        match http_server::start_server(state.http_server_state.clone(), bind_addr)
+                            .await
+                        {
                             Ok(bound_addr) => {
                                 let mut addr_lock = state.http_server_addr.lock().await;
                                 *addr_lock = Some(bound_addr);
@@ -5703,9 +5788,9 @@ fn main() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(state) = app_handle.try_state::<AppState>() {
-                        let download_restart_service = Arc::new(download_restart::DownloadRestartService::new(
-                            app_handle.clone()
-                        ));
+                        let download_restart_service = Arc::new(
+                            download_restart::DownloadRestartService::new(app_handle.clone()),
+                        );
                         if let Ok(mut dr_guard) = state.download_restart.try_lock() {
                             *dr_guard = Some(download_restart_service);
                             tracing::info!("Download restart service initialized");
@@ -6090,7 +6175,7 @@ async fn stop_proof_of_storage_watcher(state: State<'_, AppState>) -> Result<(),
         // Abort the task to ensure it stops immediately.
         handle.abort();
         // Awaiting the aborted handle can confirm it's terminated.
-    match tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await {
             Ok(_) => tracing::info!("Proof watcher task successfully joined."),
             Err(_) => tracing::warn!("Proof watcher abort timed out"),
         }
@@ -6222,7 +6307,6 @@ async fn get_multiaddresses(state: State<'_, AppState>) -> Result<Vec<String>, S
     }
 }
 
-
 #[tauri::command]
 async fn clear_seed_list() -> Result<(), String> {
     // Since you're using localStorage fallback, this command just needs to exist
@@ -6230,7 +6314,6 @@ async fn clear_seed_list() -> Result<(), String> {
     // This command is here for consistency if you add file-based storage later
     Ok(())
 }
-
 
 #[tauri::command]
 fn check_directory_exists(path: String) -> Result<bool, String> {
