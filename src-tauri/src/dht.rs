@@ -125,7 +125,7 @@ use futures_util::StreamExt;
 use libp2p::{
     kad::{BootstrapError, BootstrapOk, BootstrapResult},
     multiaddr::Protocol,
-    swarm,
+    noise, quic, swarm, tcp, yamux,
 };
 pub use multihash_codetable::{Code, MultihashDigest};
 use relay::client::Event as RelayClientEvent;
@@ -5721,21 +5721,21 @@ impl DhtService {
         };
         let relay_server_toggle = toggle::Toggle::from(relay_server_behaviour);
 
-        let mut behaviour = Some(DhtBehaviour {
-            kademlia,
-            identify,
-            mdns: mdns_toggle,
-            bitswap,
-            ping: Ping::new(ping::Config::new()),
-            proxy_rr,
-            webrtc_signaling_rr,
-            key_request,
-            autonat_client: autonat_client_toggle,
-            autonat_server: autonat_server_toggle,
-            relay_client: relay_client_behaviour,
-            relay_server: relay_server_toggle,
-            dcutr: dcutr_toggle,
-        });
+        // let mut behaviour = Some(DhtBehaviour {
+        //     kademlia,
+        //     identify,
+        //     mdns: mdns_toggle,
+        //     bitswap,
+        //     ping: Ping::new(ping::Config::new()),
+        //     proxy_rr,
+        //     webrtc_signaling_rr,
+        //     key_request,
+        //     autonat_client: autonat_client_toggle,
+        //     autonat_server: autonat_server_toggle,
+        //     relay_client: relay_client_behaviour,
+        //     relay_server: relay_server_toggle,
+        //     dcutr: dcutr_toggle,
+        // });
 
         let bootstrap_set: HashSet<String> = bootstrap_nodes.iter().cloned().collect();
         let mut autonat_targets: HashSet<String> = if enable_autonat && !autonat_servers.is_empty()
@@ -5798,28 +5798,62 @@ impl DhtService {
         };
 
         // Use the new relay-aware transport builder
-        let transport = build_transport_with_relay(&local_key, relay_transport, proxy_address)?;
+        // let noise_cfg = noise::Config::new(keypair)?;
+        // let transport = build_transport_with_relay(&local_key, relay_transport, proxy_address)?;
 
         // Extract behaviour or return error if already taken
-        let behaviour_instance = behaviour
-            .take()
-            .ok_or_else(|| Box::<dyn Error>::from("behaviour already taken"))?;
+        // let behaviour_instance = behaviour
+        // .take()
+        // .ok_or_else(|| Box::<dyn Error>::from("behaviour already taken"))?;
 
         // Create the swarm
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
-            .with_other_transport(|_| Ok(transport))
-            .map_err(|e| format!("Failed to create libp2p transport: {}", e))?
-            .with_behaviour(move |_| behaviour_instance)?
+            // .with_other_transport(|| Ok(transport))
+            // .map_err(|e| format!("Failed to create libp2p transport: {}", e))?
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                yamux::Config::default,
+            )?
+            .with_quic()
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(move |_, relay_client_behaviour: relay::client::Behaviour| {
+                DhtBehaviour {
+                    kademlia,
+                    identify,
+                    mdns: mdns_toggle,
+                    bitswap,
+                    ping: Ping::new(ping::Config::new()),
+                    proxy_rr,
+                    webrtc_signaling_rr,
+                    key_request,
+                    autonat_client: autonat_client_toggle,
+                    autonat_server: autonat_server_toggle,
+                    relay_client: relay_client_behaviour,
+                    relay_server: relay_server_toggle,
+                    dcutr: dcutr_toggle,
+                }
+            })?
             .with_swarm_config(
                 |c| c.with_idle_connection_timeout(Duration::from_secs(300)), // 5 minutes
             )
             .build();
 
         // Listen on the specified port
-        let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
-        swarm.listen_on(listen_addr)?;
+        // let listen_addr_quic: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
 
+        if is_bootstrap {
+            let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
+            swarm.listen_on(listen_addr)?;
+        } else {
+            swarm
+                .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
+                .unwrap();
+            swarm
+                .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+                .unwrap();
+        }
         // Clean up any unreachable addresses from Kademlia's routing table at startup
         // This removes stale localhost/private addresses that may have been persisted
         // {
