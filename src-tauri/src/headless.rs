@@ -178,7 +178,7 @@ pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error
         None, // cache_size_mb: use default
         final_enable_autorelay,
         args.relay.clone(),
-        args.is_bootstrap, // enable_relay_server on bootstrap
+        false,
         None,
     )
     .await?;

@@ -3710,21 +3710,28 @@ async fn run_dht_node(
                                 if let Ok(mut m) = metrics.try_lock() {
                                     m.record_listen_addr(&address);
                                 }
-
-                                // For relay circuit addresses, always advertise them
-                                if address.iter().any(|component| matches!(component, Protocol::P2pCircuit)) {
-                                    swarm.add_external_address(address.clone());
-                                    info!("✅ Advertising relay address: {}", address);
-                                } else {
-                                    // For regular addresses, only advertise if they're plausibly reachable
-                                    // This prevents advertising localhost/private IPs to the network
-                                    if ma_plausibly_reachable(&address) {
+                                  if let Some(Protocol::Ip4(v4)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                    // Reject loopback addresses - they're not reachable from remote peers
+                                    if !v4.is_loopback() && !v4.is_private(){
                                         swarm.add_external_address(address.clone());
                                         info!("✅ Advertising reachable address: {}", address);
-                                    } else {
-                                        debug!("⏭️  Not advertising unreachable address: {}", address);
                                     }
+                                    // Allow public addresses, reject private
                                 }
+                                // For relay circuit addresses, always advertise them
+                                // if address.iter().any(|component| matches!(component, Protocol::P2pCircuit)) {
+
+                                //     info!("✅ Advertising relay address: {}", address);
+                                // } else {
+                                //     // For regular addresses, only advertise if they're plausibly reachable
+                                //     // This prevents advertising localhost/private IPs to the network
+                                //     if ma_plausibly_reachable(&address) {
+                                //         swarm.add_external_address(address.clone());
+                                //         info!("✅ Advertising reachable address: {}", address);
+                                //     } else {
+                                //         debug!("⏭️  Not advertising unreachable address: {}", address);
+                                //     }
+                                // }
                             }
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                                 if let Some(peer_id) = peer_id {
