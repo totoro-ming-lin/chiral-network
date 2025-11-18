@@ -1,17 +1,20 @@
-use crate::dht::{DhtService, FileMetadata, WebRTCOfferRequest};
-use crate::download_source::{DownloadSource, Ed2kSourceInfo as DownloadEd2kSourceInfo, FtpSourceInfo as DownloadFtpSourceInfo};
+use crate::dht::{models::FileMetadata, DhtService, WebRTCOfferRequest};
+use crate::download_source::{
+    DownloadSource, Ed2kSourceInfo as DownloadEd2kSourceInfo,
+    FtpSourceInfo as DownloadFtpSourceInfo,
+};
 use crate::ed2k_client::{Ed2kClient, Ed2kConfig, ED2K_CHUNK_SIZE};
-use crate::ftp_downloader::{FtpDownloader, FtpCredentials};
+use crate::ftp_downloader::{FtpCredentials, FtpDownloader};
 use crate::webrtc_service::{WebRTCFileRequest, WebRTCService};
-use suppaftp::FtpStream;
-use url::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use suppaftp::FtpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use tracing::{error, info, warn};
+use url::Url;
 
 const DEFAULT_CHUNK_SIZE: usize = 256 * 1024; // 256KB chunks
 const MAX_CHUNKS_PER_PEER: usize = 10; // Maximum chunks to assign to a single peer
@@ -337,7 +340,10 @@ impl MultiSourceDownloadService {
             .await
             .map_err(|e| format!("Peer discovery failed: {}", e))?;
 
-        info!("Found {} available P2P peers for file", available_peers.len());
+        info!(
+            "Found {} available P2P peers for file",
+            available_peers.len()
+        );
 
         // Convert P2P peers to DownloadSource instances
         for peer_id in available_peers {
@@ -353,15 +359,15 @@ impl MultiSourceDownloadService {
         // 2. Discover FTP sources from metadata
         if let Some(ftp_sources) = &metadata.ftp_sources {
             info!("Found {} FTP sources for file", ftp_sources.len());
-            
+
             for ftp_info in ftp_sources {
                 // Convert DHT FtpSourceInfo to DownloadSource FtpSourceInfo
                 available_sources.push(DownloadSource::Ftp(DownloadFtpSourceInfo {
                     url: ftp_info.url.clone(),
                     username: ftp_info.username.clone(),
                     encrypted_password: ftp_info.password.clone(),
-                    passive_mode: true,  // Default to passive mode
-                    use_ftps: false,     // Default to regular FTP
+                    passive_mode: true, // Default to passive mode
+                    use_ftps: false,    // Default to regular FTP
                     timeout_secs: Some(30),
                 }));
             }
@@ -370,7 +376,7 @@ impl MultiSourceDownloadService {
         // 3. Discover ed2k sources from metadata
         if let Some(ed2k_sources) = &metadata.ed2k_sources {
             info!("Found {} ed2k sources for file", ed2k_sources.len());
-            
+
             for ed2k_info in ed2k_sources {
                 // Convert DHT Ed2kSourceInfo to DownloadSource Ed2kSourceInfo
                 available_sources.push(DownloadSource::Ed2k(DownloadEd2kSourceInfo {
@@ -486,20 +492,29 @@ impl MultiSourceDownloadService {
     }
 
     /// Select optimal sources based on priority scoring
-    fn select_optimal_sources(&self, available_sources: &[DownloadSource], max_sources: usize) -> Vec<DownloadSource> {
+    fn select_optimal_sources(
+        &self,
+        available_sources: &[DownloadSource],
+        max_sources: usize,
+    ) -> Vec<DownloadSource> {
         let mut sources = available_sources.to_vec();
-        
+
         // Sort by priority score (higher is better)
         sources.sort_by(|a, b| b.priority_score().cmp(&a.priority_score()));
-        
+
         // Take the top sources
         sources.truncate(max_sources);
-        
+
         info!("Selected sources by priority:");
         for (i, source) in sources.iter().enumerate() {
-            info!("  {}: {} (priority: {})", i + 1, source.display_name(), source.priority_score());
+            info!(
+                "  {}: {} (priority: {})",
+                i + 1,
+                source.display_name(),
+                source.priority_score()
+            );
         }
-        
+
         sources
     }
 
@@ -525,16 +540,20 @@ impl MultiSourceDownloadService {
         for (source, chunk_ids) in chunk_assignments {
             match &source {
                 DownloadSource::P2p(p2p_info) => {
-                    self.start_p2p_connection(file_hash, p2p_info.peer_id.clone(), chunk_ids).await?;
+                    self.start_p2p_connection(file_hash, p2p_info.peer_id.clone(), chunk_ids)
+                        .await?;
                 }
                 DownloadSource::Ftp(ftp_info) => {
-                    self.start_ftp_connection(file_hash, ftp_info.clone(), chunk_ids).await?;
+                    self.start_ftp_connection(file_hash, ftp_info.clone(), chunk_ids)
+                        .await?;
                 }
                 DownloadSource::Http(http_info) => {
-                    self.start_http_download(file_hash, http_info.clone(), chunk_ids).await?;
+                    self.start_http_download(file_hash, http_info.clone(), chunk_ids)
+                        .await?;
                 }
                 DownloadSource::Ed2k(ed2k_info) => {
-                    self.start_ed2k_connection(file_hash, ed2k_info.clone(), chunk_ids).await?;
+                    self.start_ed2k_connection(file_hash, ed2k_info.clone(), chunk_ids)
+                        .await?;
                 }
             }
         }
@@ -736,12 +755,12 @@ impl MultiSourceDownloadService {
         }
 
         // Parse FTP URL to get connection info
-        let url = Url::parse(&ftp_info.url)
-            .map_err(|e| format!("Invalid FTP URL: {}", e))?;
+        let url = Url::parse(&ftp_info.url).map_err(|e| format!("Invalid FTP URL: {}", e))?;
 
         // Create credentials from FTP source info
         let credentials = if let Some(username) = &ftp_info.username {
-            let password = ftp_info.encrypted_password
+            let password = ftp_info
+                .encrypted_password
                 .as_deref()
                 .unwrap_or("anonymous@chiral.network");
             Some(FtpCredentials::new(username.clone(), password.to_string()))
@@ -750,7 +769,11 @@ impl MultiSourceDownloadService {
         };
 
         // Attempt to establish FTP connection
-        match self.ftp_downloader.connect_and_login(&url, credentials).await {
+        match self
+            .ftp_downloader
+            .connect_and_login(&url, credentials)
+            .await
+        {
             Ok(ftp_stream) => {
                 info!("Successfully connected to FTP server: {}", ftp_info.url);
 
@@ -761,27 +784,39 @@ impl MultiSourceDownloadService {
                 }
 
                 // Mark source as connected and start chunk downloads
-                self.on_source_connected(file_hash, &ftp_url_id, chunk_ids.clone()).await;
-                self.start_ftp_chunk_downloads(file_hash, ftp_info, chunk_ids).await;
+                self.on_source_connected(file_hash, &ftp_url_id, chunk_ids.clone())
+                    .await;
+                self.start_ftp_chunk_downloads(file_hash, ftp_info, chunk_ids)
+                    .await;
 
                 Ok(())
             }
             Err(e) => {
                 // Provide more specific error messages based on common FTP errors
                 let error_msg = if e.contains("Connection refused") {
-                    format!("FTP server refused connection: {} (server may be down)", ftp_info.url)
+                    format!(
+                        "FTP server refused connection: {} (server may be down)",
+                        ftp_info.url
+                    )
                 } else if e.contains("timeout") || e.contains("Timeout") {
-                    format!("FTP connection timeout: {} (server may be slow or unreachable)", ftp_info.url)
+                    format!(
+                        "FTP connection timeout: {} (server may be slow or unreachable)",
+                        ftp_info.url
+                    )
                 } else if e.contains("login") || e.contains("authentication") || e.contains("530") {
-                    format!("FTP authentication failed: {} (invalid credentials)", ftp_info.url)
+                    format!(
+                        "FTP authentication failed: {} (invalid credentials)",
+                        ftp_info.url
+                    )
                 } else if e.contains("550") {
                     format!("FTP file not found or permission denied: {}", ftp_info.url)
                 } else {
                     format!("FTP connection failed: {} - {}", ftp_info.url, e)
                 };
-                
+
                 warn!("{}", error_msg);
-                self.on_source_failed(file_hash, &ftp_url_id, error_msg.clone()).await;
+                self.on_source_failed(file_hash, &ftp_url_id, error_msg.clone())
+                    .await;
                 Err(error_msg)
             }
         }
@@ -795,7 +830,7 @@ impl MultiSourceDownloadService {
         chunk_ids: Vec<u32>,
     ) {
         let ftp_url_id = ftp_info.url.clone();
-        
+
         // Get chunk information for the assigned chunks
         let chunks_to_download = {
             let downloads = self.active_downloads.read().await;
@@ -803,7 +838,11 @@ impl MultiSourceDownloadService {
                 chunk_ids
                     .iter()
                     .filter_map(|&chunk_id| {
-                        download.chunks.iter().find(|chunk| chunk.chunk_id == chunk_id).cloned()
+                        download
+                            .chunks
+                            .iter()
+                            .find(|chunk| chunk.chunk_id == chunk_id)
+                            .cloned()
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -830,7 +869,8 @@ impl MultiSourceDownloadService {
         let remote_path = match self.parse_ftp_remote_path(&ftp_info.url) {
             Ok(path) => path,
             Err(e) => {
-                self.on_source_failed(file_hash, &ftp_url_id, format!("Invalid FTP path: {}", e)).await;
+                self.on_source_failed(file_hash, &ftp_url_id, format!("Invalid FTP path: {}", e))
+                    .await;
                 return;
             }
         };
@@ -868,7 +908,7 @@ impl MultiSourceDownloadService {
 
                     // Calculate byte range for this chunk
                     let (start_byte, size) = (chunk.offset, chunk.size as u64);
-                    
+
                     info!(
                         "Downloading FTP chunk {} ({}:{}) from {}",
                         chunk.chunk_id, start_byte, size, remote_path
@@ -878,7 +918,9 @@ impl MultiSourceDownloadService {
                     let download_result = {
                         let mut connections_guard = connections.lock().await;
                         if let Some(ftp_stream) = connections_guard.get_mut(&ftp_url) {
-                            downloader.download_range(ftp_stream, &remote_path, start_byte, size).await
+                            downloader
+                                .download_range(ftp_stream, &remote_path, start_byte, size)
+                                .await
                         } else {
                             Err("FTP connection not found".to_string())
                         }
@@ -894,7 +936,7 @@ impl MultiSourceDownloadService {
                                     chunk.size,
                                     data.len()
                                 );
-                                
+
                                 // For now, we'll accept partial data if it's the last chunk
                                 let is_last_chunk = {
                                     let downloads_guard = downloads.read().await;
@@ -906,7 +948,11 @@ impl MultiSourceDownloadService {
                                 };
 
                                 if !is_last_chunk {
-                                    let error_msg = format!("Chunk size mismatch: expected {}, got {}", chunk.size, data.len());
+                                    let error_msg = format!(
+                                        "Chunk size mismatch: expected {}, got {}",
+                                        chunk.size,
+                                        data.len()
+                                    );
                                     let _ = event_tx.send(MultiSourceEvent::ChunkFailed {
                                         file_hash: file_hash.clone(),
                                         chunk_id: chunk.chunk_id,
@@ -930,11 +976,16 @@ impl MultiSourceDownloadService {
                                         source_id: ftp_url.clone(),
                                         completed_at: Instant::now(),
                                     };
-                                    download.completed_chunks.insert(chunk.chunk_id, completed_chunk);
+                                    download
+                                        .completed_chunks
+                                        .insert(chunk.chunk_id, completed_chunk);
 
                                     // Update last activity
-                                    if let Some(assignment) = download.source_assignments.get_mut(&ftp_url) {
-                                        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                                    if let Some(assignment) =
+                                        download.source_assignments.get_mut(&ftp_url)
+                                    {
+                                        let now = match SystemTime::now().duration_since(UNIX_EPOCH)
+                                        {
                                             Ok(d) => Some(d.as_secs()),
                                             Err(_) => None,
                                         };
@@ -945,8 +996,7 @@ impl MultiSourceDownloadService {
 
                             info!(
                                 "Successfully downloaded FTP chunk {} ({} bytes)",
-                                chunk.chunk_id,
-                                chunk.size
+                                chunk.chunk_id, chunk.size
                             );
 
                             // Emit chunk completed event
@@ -957,10 +1007,7 @@ impl MultiSourceDownloadService {
                             });
                         }
                         Err(e) => {
-                            warn!(
-                                "Failed to download FTP chunk {}: {}",
-                                chunk.chunk_id, e
-                            );
+                            warn!("Failed to download FTP chunk {}: {}", chunk.chunk_id, e);
 
                             // Add chunk back to failed queue
                             {
@@ -994,9 +1041,10 @@ impl MultiSourceDownloadService {
                 let downloads_guard = downloads.read().await;
                 if let Some(download) = downloads_guard.get(&file_hash_clone) {
                     if let Some(assignment) = download.source_assignments.get(&ftp_url_clone) {
-                        assignment.chunks.iter().all(|&chunk_id| {
-                            download.completed_chunks.contains_key(&chunk_id)
-                        })
+                        assignment
+                            .chunks
+                            .iter()
+                            .all(|&chunk_id| download.completed_chunks.contains_key(&chunk_id))
                     } else {
                         false
                     }
@@ -1010,7 +1058,9 @@ impl MultiSourceDownloadService {
                 {
                     let mut downloads_guard = downloads.write().await;
                     if let Some(download) = downloads_guard.get_mut(&file_hash_clone) {
-                        if let Some(assignment) = download.source_assignments.get_mut(&ftp_url_clone) {
+                        if let Some(assignment) =
+                            download.source_assignments.get_mut(&ftp_url_clone)
+                        {
                             assignment.status = SourceStatus::Completed;
                         }
                     }
@@ -1061,7 +1111,10 @@ impl MultiSourceDownloadService {
         // Attempt to establish Ed2k connection
         match ed2k_client.connect().await {
             Ok(()) => {
-                info!("Successfully connected to Ed2k server: {}", ed2k_info.server_url);
+                info!(
+                    "Successfully connected to Ed2k server: {}",
+                    ed2k_info.server_url
+                );
 
                 // Store connection for reuse
                 {
@@ -1070,15 +1123,19 @@ impl MultiSourceDownloadService {
                 }
 
                 // Mark source as connected and start chunk downloads
-                self.on_source_connected(file_hash, &server_url_id, chunk_ids.clone()).await;
-                self.start_ed2k_chunk_downloads(file_hash, ed2k_info, chunk_ids).await;
+                self.on_source_connected(file_hash, &server_url_id, chunk_ids.clone())
+                    .await;
+                self.start_ed2k_chunk_downloads(file_hash, ed2k_info, chunk_ids)
+                    .await;
 
                 Ok(())
             }
             Err(e) => {
-                let error_msg = format!("Ed2k connection failed: {} - {:?}", ed2k_info.server_url, e);
+                let error_msg =
+                    format!("Ed2k connection failed: {} - {:?}", ed2k_info.server_url, e);
                 warn!("{}", error_msg);
-                self.on_source_failed(file_hash, &server_url_id, error_msg.clone()).await;
+                self.on_source_failed(file_hash, &server_url_id, error_msg.clone())
+                    .await;
                 Err(error_msg)
             }
         }
@@ -1100,7 +1157,11 @@ impl MultiSourceDownloadService {
                 chunk_ids
                     .iter()
                     .filter_map(|&chunk_id| {
-                        download.chunks.iter().find(|chunk| chunk.chunk_id == chunk_id).cloned()
+                        download
+                            .chunks
+                            .iter()
+                            .find(|chunk| chunk.chunk_id == chunk_id)
+                            .cloned()
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -1114,7 +1175,8 @@ impl MultiSourceDownloadService {
         }
 
         let file_hash_clone = file_hash.to_string();
-        let ed2k_connections: Arc<Mutex<HashMap<String, Ed2kClient>>> = Arc::clone(&self.ed2k_connections);
+        let ed2k_connections: Arc<Mutex<HashMap<String, Ed2kClient>>> =
+            Arc::clone(&self.ed2k_connections);
         let active_downloads = Arc::clone(&self.active_downloads);
 
         // Spawn task to download chunks concurrently (limit to 2 concurrent downloads per server)
@@ -1124,7 +1186,8 @@ impl MultiSourceDownloadService {
 
             for chunk in chunks_to_download {
                 let permit = semaphore.clone().acquire_owned().await;
-                let ed2k_connections_clone: Arc<Mutex<HashMap<String, Ed2kClient>>> = Arc::clone(&ed2k_connections);
+                let ed2k_connections_clone: Arc<Mutex<HashMap<String, Ed2kClient>>> =
+                    Arc::clone(&ed2k_connections);
                 let active_downloads_clone = Arc::clone(&active_downloads);
                 let file_hash_inner = file_hash_clone.clone();
                 let server_url_clone = server_url_id.clone();
@@ -1148,13 +1211,17 @@ impl MultiSourceDownloadService {
                         // In a real implementation, this should come from the file metadata
                         let expected_chunk_hash = format!("{:032x}", chunk.chunk_id);
 
-                        match client.download_chunk(&ed2k_file_hash, ed2k_chunk_index, &expected_chunk_hash).await {
+                        match client
+                            .download_chunk(&ed2k_file_hash, ed2k_chunk_index, &expected_chunk_hash)
+                            .await
+                        {
                             Ok(data) => {
                                 // Verify chunk size matches expected size
                                 if data.len() != chunk.size {
                                     let is_last_chunk = chunk.chunk_id == {
                                         let downloads = active_downloads_clone.read().await;
-                                        downloads.get(&file_hash_inner)
+                                        downloads
+                                            .get(&file_hash_inner)
                                             .map(|d| (d.chunks.len() - 1) as u32)
                                             .unwrap_or(0)
                                     };
@@ -1162,12 +1229,15 @@ impl MultiSourceDownloadService {
                                     if !is_last_chunk {
                                         error!(
                                             "Ed2k chunk {} size mismatch: expected {}, got {}",
-                                            chunk.chunk_id, chunk.size, data.len()
+                                            chunk.chunk_id,
+                                            chunk.size,
+                                            data.len()
                                         );
 
                                         // Mark chunk as failed and retry
                                         let mut downloads = active_downloads_clone.write().await;
-                                        if let Some(download) = downloads.get_mut(&file_hash_inner) {
+                                        if let Some(download) = downloads.get_mut(&file_hash_inner)
+                                        {
                                             download.failed_chunks.push_back(chunk.chunk_id);
                                         }
 
@@ -1188,7 +1258,9 @@ impl MultiSourceDownloadService {
                                         completed_at: Instant::now(),
                                     };
 
-                                    download.completed_chunks.insert(chunk.chunk_id, completed_chunk);
+                                    download
+                                        .completed_chunks
+                                        .insert(chunk.chunk_id, completed_chunk);
 
                                     info!(
                                         "Ed2k chunk {} downloaded successfully from {}",
@@ -1197,10 +1269,7 @@ impl MultiSourceDownloadService {
                                 }
                             }
                             Err(e) => {
-                                error!(
-                                    "Failed to download Ed2k chunk {}: {:?}",
-                                    chunk.chunk_id, e
-                                );
+                                error!("Failed to download Ed2k chunk {}: {:?}", chunk.chunk_id, e);
 
                                 // Mark chunk as failed and add to retry queue
                                 let mut downloads = active_downloads_clone.write().await;
@@ -1226,7 +1295,10 @@ impl MultiSourceDownloadService {
                 let _ = handle.await;
             }
 
-            info!("Ed2k source {} completed all assigned chunks", server_url_id);
+            info!(
+                "Ed2k source {} completed all assigned chunks",
+                server_url_id
+            );
         });
     }
 
@@ -1238,9 +1310,14 @@ impl MultiSourceDownloadService {
         chunk_ids: Vec<u32>,
     ) -> Result<(), String> {
         info!("HTTP download not yet implemented");
-        
+
         // Mark as failed for now
-        self.on_source_failed(file_hash, "http_placeholder", "HTTP download not implemented".to_string()).await;
+        self.on_source_failed(
+            file_hash,
+            "http_placeholder",
+            "HTTP download not implemented".to_string(),
+        )
+        .await;
         Err("HTTP download not implemented".to_string())
     }
 
@@ -1248,14 +1325,13 @@ impl MultiSourceDownloadService {
 
     /// Parse remote path from FTP URL
     fn parse_ftp_remote_path(&self, url: &str) -> Result<String, String> {
-        let parsed_url = Url::parse(url)
-            .map_err(|e| format!("Invalid FTP URL: {}", e))?;
-        
+        let parsed_url = Url::parse(url).map_err(|e| format!("Invalid FTP URL: {}", e))?;
+
         let path = parsed_url.path();
         if path.is_empty() || path == "/" {
             return Err("No file path specified in FTP URL".to_string());
         }
-        
+
         Ok(path.to_string())
     }
 
@@ -1269,10 +1345,10 @@ impl MultiSourceDownloadService {
     // ============================================================================
 
     /// Map our chunk ID to ed2k chunk ID and offset within that ed2k chunk
-    /// 
+    ///
     /// Our chunks are 256KB, ed2k chunks are 9.28 MB (9,728,000 bytes)
     /// One ed2k chunk contains approximately 38 of our chunks (9,728,000 / 256,000 = 38)
-    /// 
+    ///
     /// Returns: (ed2k_chunk_id, offset_within_ed2k_chunk)
     fn map_our_chunk_to_ed2k_chunk(&self, our_chunk: &ChunkInfo) -> (u32, u64) {
         let ed2k_chunk_id = (our_chunk.offset / ED2K_CHUNK_SIZE as u64) as u32;
@@ -1281,9 +1357,9 @@ impl MultiSourceDownloadService {
     }
 
     /// Map ed2k chunk ID to range of our chunk IDs
-    /// 
+    ///
     /// Returns the range of our chunk IDs that fall within the specified ed2k chunk
-    /// 
+    ///
     /// Returns: (start_chunk_id, end_chunk_id_inclusive)
     fn map_ed2k_chunk_to_our_chunks(
         &self,
@@ -1304,9 +1380,9 @@ impl MultiSourceDownloadService {
     }
 
     /// Group our chunk IDs by the ed2k chunk they belong to
-    /// 
+    ///
     /// This is useful for Person 5 to download entire ed2k chunks and then split them
-    /// 
+    ///
     /// Returns: HashMap<ed2k_chunk_id, Vec<our_chunk_ids>>
     fn group_chunks_by_ed2k_chunk(
         &self,
@@ -1329,15 +1405,12 @@ impl MultiSourceDownloadService {
     }
 
     /// Calculate chunk size considering ed2k sources
-    /// 
+    ///
     /// If ed2k sources are present, returns the ed2k chunk size (9.28 MB)
     /// Otherwise, returns the default chunk size (256 KB)
-    /// 
+    ///
     /// This is used to understand the relationship between our chunks and ed2k chunks
-    fn calculate_ed2k_aware_chunk_size(
-        &self,
-        metadata: &FileMetadata,
-    ) -> usize {
+    fn calculate_ed2k_aware_chunk_size(&self, metadata: &FileMetadata) -> usize {
         if metadata.ed2k_sources.is_some() && !metadata.ed2k_sources.as_ref().unwrap().is_empty() {
             // ed2k sources present - return ed2k chunk size for reference
             ED2K_CHUNK_SIZE
@@ -1381,7 +1454,10 @@ impl MultiSourceDownloadService {
 
     /// Handle source connection failure
     async fn on_source_failed(&self, file_hash: &str, source_id: &str, error: String) {
-        warn!("Source {} failed for file {}: {}", source_id, file_hash, error);
+        warn!(
+            "Source {} failed for file {}: {}",
+            source_id, file_hash, error
+        );
 
         // Update source status and reassign chunks
         let reassign_chunks = {
@@ -1428,12 +1504,14 @@ impl MultiSourceDownloadService {
     ) -> Result<(), String> {
         // This method is now replaced by start_p2p_connection
         // Keeping for backwards compatibility but delegating to new method
-        self.start_p2p_connection(file_hash, peer_id, chunk_ids).await
+        self.start_p2p_connection(file_hash, peer_id, chunk_ids)
+            .await
     }
 
     async fn on_peer_connected(&self, file_hash: &str, peer_id: &str, chunk_ids: Vec<u32>) {
         // Delegate to unified source connection handler
-        self.on_source_connected(file_hash, peer_id, chunk_ids).await
+        self.on_source_connected(file_hash, peer_id, chunk_ids)
+            .await
     }
 
     async fn on_peer_failed(&self, file_hash: &str, peer_id: &str, error: String) {
@@ -1503,7 +1581,10 @@ impl MultiSourceDownloadService {
                 match &assignment.source {
                     DownloadSource::P2p(_) => {
                         // Close P2P/WebRTC connections
-                        let _ = self.webrtc_service.close_connection(source_id.clone()).await;
+                        let _ = self
+                            .webrtc_service
+                            .close_connection(source_id.clone())
+                            .await;
                     }
                     DownloadSource::Ftp(_) => {
                         // Close FTP connections
@@ -1840,9 +1921,12 @@ impl MultiSourceDownloadService {
 
         let active_ftp_downloads = {
             let downloads = self.active_downloads.read().await;
-            downloads.values()
+            downloads
+                .values()
                 .map(|download| {
-                    download.source_assignments.values()
+                    download
+                        .source_assignments
+                        .values()
                         .filter(|assignment| matches!(assignment.source, DownloadSource::Ftp(_)))
                         .count()
                 })
@@ -1863,7 +1947,7 @@ impl MultiSourceDownloadService {
         // Close all active FTP connections
         let mut connections = self.ftp_connections.lock().await;
         let connection_urls: Vec<String> = connections.keys().cloned().collect();
-        
+
         for url in connection_urls {
             if let Some(mut ftp_stream) = connections.remove(&url) {
                 if let Err(e) = self.ftp_downloader.disconnect(&mut ftp_stream).await {
@@ -1978,7 +2062,7 @@ mod tests {
 
     #[test]
     fn test_ftp_source_assignment() {
-        use crate::download_source::{FtpSourceInfo as DownloadFtpSourceInfo, DownloadSource};
+        use crate::download_source::{DownloadSource, FtpSourceInfo as DownloadFtpSourceInfo};
 
         let ftp_info = DownloadFtpSourceInfo {
             url: "ftp://ftp.example.com/file.bin".to_string(),
@@ -2001,7 +2085,9 @@ mod tests {
 
     #[test]
     fn test_ftp_priority_score() {
-        use crate::download_source::{FtpSourceInfo as DownloadFtpSourceInfo, DownloadSource, P2pSourceInfo, HttpSourceInfo};
+        use crate::download_source::{
+            DownloadSource, FtpSourceInfo as DownloadFtpSourceInfo, HttpSourceInfo, P2pSourceInfo,
+        };
 
         let ftp_source = DownloadSource::Ftp(DownloadFtpSourceInfo {
             url: "ftp://example.com/file".to_string(),

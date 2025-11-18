@@ -58,7 +58,7 @@ use crate::stream_auth::{
     AuthMessage, HmacKeyExchangeConfirmation, HmacKeyExchangeRequest, HmacKeyExchangeResponse,
     StreamAuthService,
 };
-use dht::{DhtEvent, DhtMetricsSnapshot, DhtService, FileMetadata};
+use dht::{models::DhtMetricsSnapshot, models::FileMetadata, DhtEvent, DhtService};
 use directories::ProjectDirs;
 use ethereum::{
     create_new_account,
@@ -3617,7 +3617,7 @@ async fn upload_file_chunk(
             .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs();
 
-        let metadata = dht::FileMetadata {
+        let metadata = dht::models::FileMetadata {
             merkle_root: merkle_root, // Store Merkle root for verification
             file_name: session.file_name.clone(),
             file_size: session.file_size,

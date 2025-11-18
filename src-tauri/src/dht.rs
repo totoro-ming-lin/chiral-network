@@ -1,26 +1,12 @@
+pub mod models;
+// pub mod protocol;
+use self::models::*;
+
+// use self::protocol::*;
 use crate::download_source::HttpSourceInfo;
 use crate::encryption::EncryptedAesKeyBundle;
 use serde_bytes;
 use x25519_dalek::PublicKey;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum Ed2kError {
-    InvalidLink(String),
-    MissingPart(&'static str),
-    InvalidFileSize(String),
-}
-
-impl std::fmt::Display for Ed2kError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Ed2kError::InvalidLink(s) => write!(f, "Invalid ed2k link format: {}", s),
-            Ed2kError::MissingPart(s) => write!(f, "Missing required part in link: {}", s),
-            Ed2kError::InvalidFileSize(s) => write!(f, "Invalid file size: {}", s),
-        }
-    }
-}
-impl std::error::Error for Ed2kError {}
-
 // ------ Key Request Protocol Implementation ------
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRequestProtocol;
@@ -198,439 +184,6 @@ const FILE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15); // More frequ
 const FILE_HEARTBEAT_TTL: Duration = Duration::from_secs(90); // Longer TTL with grace period
 pub struct PendingKeywordIndex;
 
-/// Extracts a set of unique, searchable keywords from a filename.
-fn extract_keywords(file_name: &str) -> Vec<String> {
-    // 1. Sanitize: remove the file extension and convert to lowercase.
-    let name_without_ext = std::path::Path::new(file_name)
-        .file_stem()
-        .unwrap_or_default()
-        .to_str()
-        .unwrap_or_default()
-        .to_lowercase();
-
-    // 2. Split the name into words based on common non-alphanumeric delimiters.
-    let keywords: std::collections::HashSet<String> = name_without_ext
-        .split(|c: char| !c.is_alphanumeric())
-        // 3. Filter out empty strings and common short words (e.g., "a", "of").
-        .filter(|s| !s.is_empty() && s.len() > 2)
-        .map(String::from)
-        .collect(); // Using a HashSet automatically handles duplicates.
-
-    // 4. Return the unique keywords as a Vec.
-    keywords.into_iter().collect()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct FileMetadata {
-    // !IMPORTANT: Please make use of serde(default) and ..Default::default() for backwards/forwards compatability
-    /// The Merkle root of the original file chunks, used as the primary identifier for integrity.
-    pub merkle_root: String,
-    pub file_name: String,
-    pub file_size: u64,
-    #[serde(skip)]
-    pub file_data: Vec<u8>, // holds the actual file data
-    #[serde(default)]
-    pub seeders: Vec<String>,
-    #[serde(default)]
-    pub created_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    /// Whether the file is encrypted
-    #[serde(default)]
-    pub is_encrypted: bool,
-    /// The encryption method used (e.g., "AES-256-GCM")
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption_method: Option<String>,
-    /// Fingerprint of the encryption key for identification.
-    /// This is now deprecated in favor of the merkle_root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_fingerprint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// The root CID(s) for retrieving the file from Bitswap. Usually one.
-    pub cids: Option<Vec<Cid>>,
-    /// For encrypted files, this contains the encrypted AES key and other info.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_key_bundle: Option<crate::encryption::EncryptedAesKeyBundle>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ftp_sources: Option<Vec<FtpSourceInfo>>,
-    // ed2k HTTP sources for downloading the file
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ed2k_sources: Option<Vec<Ed2kSourceInfo>>,
-    /// HTTP sources for downloading the file (HTTP Range request endpoints)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_sources: Option<Vec<HttpSourceInfo>>,
-    #[serde(default)]
-    pub is_root: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download_path: Option<String>,
-    /// Price in Chiral tokens set by the uploader
-    #[serde(default)]
-    pub price: Option<f64>,
-    /// Ethereum address of the uploader (for payment)
-    #[serde(default)]
-    pub uploader_address: Option<String>,
-    /// The SHA-1 info hash for BitTorrent compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub info_hash: Option<String>,
-    /// A list of BitTorrent tracker URLs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trackers: Option<Vec<String>>,
-}
-
-/// FTP source information for a file
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FtpSourceInfo {
-    /// Full FTP URL (e.g., "ftp://ftp.example.com/path/to/file.bin")
-    pub url: String,
-    /// Optional username (None means anonymous)
-    pub username: Option<String>,
-    /// Optional password (stored temporarily, not persisted to DHT for security)
-    /// This should be provided at download time, not stored in DHT
-    #[serde(skip_serializing, skip_deserializing)]
-    pub password: Option<String>,
-    /// Whether this FTP server supports resume (REST command)
-    pub supports_resume: bool,
-    /// Last known file size on this FTP server
-    pub file_size: u64,
-    /// Server availability (updated based on connection attempts)
-    pub last_checked: Option<u64>, // Unix timestamp
-    pub is_available: bool,
-}
-
-impl FtpSourceInfo {
-    /// Creates a copy of the struct suitable for DHT storage, stripping the password.
-    pub fn for_dht_storage(&self) -> Self {
-        Self {
-            url: self.url.clone(),
-            username: self.username.clone(),
-            password: None, // Always None for DHT storage
-            supports_resume: self.supports_resume,
-            file_size: self.file_size,
-            last_checked: self.last_checked,
-            is_available: self.is_available,
-        }
-    }
-}
-
-/// ed2k (eDonkey2000) source information for a file
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ed2kSourceInfo {
-    /// ed2k server URL (e.g., "ed2k://|server|1.2.3.4|4661|/")
-    pub server_url: String,
-
-    /// ed2k file hash (MD4 hash in hex)
-    pub file_hash: String,
-
-    /// File size in bytes
-    pub file_size: u64,
-
-    /// Optional file name
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_name: Option<String>,
-
-    /// List of known sources (IP:Port pairs)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sources: Option<Vec<String>>,
-
-    /// Optional timeout in seconds
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u64>,
-}
-
-// ed2k Link Parsing
-impl Ed2kSourceInfo {
-    /// Parse ed2k:// link
-    /// Format (File): ed2k://|file|filename.ext|size|hash|/
-    /// Format (Server): ed2k://|server|ip|port|/
-    pub fn from_ed2k_link(link: &str) -> Result<Self, Ed2kError> {
-        let Some(parts_str) = link.strip_prefix("ed2k://|") else {
-            return Err(Ed2kError::InvalidLink(link.to_string()));
-        };
-
-        // Remove trailing characters like '/'
-        // Trim both trailing '/' and '|' to correctly handle split
-        let clean_parts_str = parts_str.trim_end_matches(&['/', '|']);
-        let parts: Vec<&str> = clean_parts_str.split('|').collect();
-
-        if parts.is_empty() {
-            return Err(Ed2kError::InvalidLink(link.to_string()));
-        }
-
-        match parts[0] {
-            "file" => {
-                // ed2k://|file|filename.ext|size|hash|/
-                if parts.len() < 4 {
-                    return Err(Ed2kError::MissingPart(
-                        "File link requires name, size, and hash",
-                    ));
-                }
-
-                let file_name = parts[1].to_string();
-                let file_size_str = parts[2];
-                let file_hash = parts[3].to_string();
-
-                let file_size = file_size_str
-                    .parse::<u64>()
-                    .map_err(|_| Ed2kError::InvalidFileSize(file_size_str.to_string()))?;
-
-                Ok(Self {
-                    // Per spec contradiction: File link has no server. Set to empty.
-                    // This will be populated by the application logic later.
-                    server_url: String::new(),
-                    file_hash,
-                    file_size,
-                    file_name: Some(file_name),
-                    sources: None,
-                    timeout: None,
-                })
-            }
-            "server" => {
-                // ed2k://|server|ip|port|/
-                if parts.len() < 3 {
-                    return Err(Ed2kError::MissingPart("Server link requires ip and port"));
-                }
-
-                let ip = parts[1];
-                let port = parts[2];
-                // Reconstruct the server_url from the parts
-                let server_url = format!("ed2k://|server|{}|{}|/", ip, port);
-
-                Ok(Self {
-                    server_url,
-                    // Per spec contradiction: Struct requires file info. Set to defaults.
-                    file_hash: String::new(),
-                    file_size: 0,
-                    file_name: None,
-                    sources: None,
-                    timeout: None,
-                })
-            }
-            _ => Err(Ed2kError::InvalidLink(format!(
-                "Unknown link type: {}",
-                parts[0]
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SeederHeartbeat {
-    peer_id: String,
-    expires_at: u64,
-    last_heartbeat: u64,
-}
-
-#[derive(Debug, Clone)]
-struct FileHeartbeatCacheEntry {
-    heartbeats: Vec<SeederHeartbeat>,
-    metadata: serde_json::Value,
-}
-
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs()
-}
-
-fn merge_heartbeats(
-    mut a: Vec<SeederHeartbeat>,
-    mut b: Vec<SeederHeartbeat>,
-) -> Vec<SeederHeartbeat> {
-    let mut merged = Vec::new();
-    let mut seen_peers = std::collections::HashSet::new();
-    let now = unix_timestamp();
-
-    // Create sets to track which peers appear in both vectors
-    let a_peers: HashSet<String> = a.iter().map(|hb| hb.peer_id.clone()).collect();
-    let b_peers: HashSet<String> = b.iter().map(|hb| hb.peer_id.clone()).collect();
-    let common_peers: HashSet<_> = a_peers.intersection(&b_peers).cloned().collect();
-
-    // Filter and collect entries in one pass instead of using retain
-    let filtered_a: Vec<_> = a
-        .into_iter()
-        .filter(|hb| {
-            common_peers.contains(&hb.peer_id) || hb.expires_at > now.saturating_sub(30)
-            // 30s grace period
-        })
-        .collect();
-
-    let filtered_b: Vec<_> = b
-        .into_iter()
-        .filter(|hb| {
-            common_peers.contains(&hb.peer_id) || hb.expires_at > now.saturating_sub(30)
-            // 30s grace period
-        })
-        .collect();
-
-    // Now work with the filtered vectors
-    a = filtered_a;
-    b = filtered_b;
-
-    // Sort both vectors by peer_id for deterministic merging
-    a.sort_by(|x, y| x.peer_id.cmp(&y.peer_id));
-    b.sort_by(|x, y| x.peer_id.cmp(&y.peer_id));
-
-    let mut a_iter = a.into_iter();
-    let mut b_iter = b.into_iter();
-
-    let mut next_a = a_iter.next();
-    let mut next_b = b_iter.next();
-
-    while let (Some(a_entry), Some(b_entry)) = (&next_a, &next_b) {
-        match a_entry.peer_id.cmp(&b_entry.peer_id) {
-            std::cmp::Ordering::Equal => {
-                // For equal peer IDs, create a merged entry that:
-                // 1. Takes the most recent heartbeat timestamp
-                // 2. Uses the latest expiry time
-                // 3. Extends the expiry if it's an active seeder (recent heartbeat)
-                let latest_heartbeat =
-                    std::cmp::max(a_entry.last_heartbeat, b_entry.last_heartbeat);
-                let latest_expiry = std::cmp::max(a_entry.expires_at, b_entry.expires_at);
-
-                // If this is an active seeder (recent heartbeat), extend its expiry
-                let new_expiry =
-                    if now.saturating_sub(latest_heartbeat) < FILE_HEARTBEAT_INTERVAL.as_secs() {
-                        now.saturating_add(FILE_HEARTBEAT_TTL.as_secs())
-                    } else {
-                        latest_expiry
-                    };
-
-                let entry = SeederHeartbeat {
-                    peer_id: a_entry.peer_id.clone(),
-                    expires_at: new_expiry,
-                    last_heartbeat: latest_heartbeat,
-                };
-
-                if !seen_peers.contains(&entry.peer_id) {
-                    seen_peers.insert(entry.peer_id.clone());
-                    merged.push(entry);
-                }
-
-                next_a = a_iter.next();
-                next_b = b_iter.next();
-            }
-            std::cmp::Ordering::Less => {
-                if !seen_peers.contains(&a_entry.peer_id) {
-                    seen_peers.insert(a_entry.peer_id.clone());
-                    merged.push(a_entry.clone());
-                }
-                next_a = a_iter.next();
-            }
-            std::cmp::Ordering::Greater => {
-                if !seen_peers.contains(&b_entry.peer_id) {
-                    seen_peers.insert(b_entry.peer_id.clone());
-                    merged.push(b_entry.clone());
-                }
-                next_b = b_iter.next();
-            }
-        }
-    }
-
-    // Add remaining entries from a
-    while let Some(entry) = next_a {
-        if !seen_peers.contains(&entry.peer_id) {
-            seen_peers.insert(entry.peer_id.clone());
-            merged.push(entry);
-        }
-        next_a = a_iter.next();
-    }
-
-    // Add remaining entries from b
-    while let Some(entry) = next_b {
-        if !seen_peers.contains(&entry.peer_id) {
-            seen_peers.insert(entry.peer_id.clone());
-            merged.push(entry);
-        }
-        next_b = b_iter.next();
-    }
-
-    merged
-}
-
-fn prune_heartbeats(mut entries: Vec<SeederHeartbeat>, now: u64) -> Vec<SeederHeartbeat> {
-    // Add a more generous grace period to prevent premature pruning
-    // Use 30 seconds which is between the heartbeat interval (15s) and TTL (90s)
-    let prune_threshold = now.saturating_sub(30); // 30 second grace period
-    entries.retain(|hb| hb.expires_at > prune_threshold);
-    entries.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-    entries
-}
-
-fn upsert_heartbeat(entries: &mut Vec<SeederHeartbeat>, peer_id: &str, now: u64) {
-    let expires_at = now.saturating_add(FILE_HEARTBEAT_TTL.as_secs());
-
-    // First remove any expired entries
-    entries.retain(|hb| hb.expires_at > now);
-
-    // Then update or add the new heartbeat
-    if let Some(entry) = entries.iter_mut().find(|hb| hb.peer_id == peer_id) {
-        entry.expires_at = expires_at;
-        entry.last_heartbeat = now;
-    } else {
-        entries.push(SeederHeartbeat {
-            peer_id: peer_id.to_string(),
-            expires_at,
-            last_heartbeat: now,
-        });
-    }
-
-    // Sort by peer_id for consistent ordering
-    entries.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-}
-
-fn heartbeats_to_peer_list(entries: &[SeederHeartbeat]) -> Vec<String> {
-    entries.iter().map(|hb| hb.peer_id.clone()).collect()
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NatReachabilityState {
-    Unknown,
-    Public,
-    Private,
-}
-
-impl Default for NatReachabilityState {
-    fn default() -> Self {
-        NatReachabilityState::Unknown
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NatConfidence {
-    Low,
-    Medium,
-    High,
-}
-
-impl Default for NatConfidence {
-    fn default() -> Self {
-        NatConfidence::Low
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NatHistoryItem {
-    pub state: NatReachabilityState,
-    pub confidence: NatConfidence,
-    pub timestamp: u64,
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ReachabilityRecord {
-    state: NatReachabilityState,
-    confidence: NatConfidence,
-    timestamp: SystemTime,
-    summary: Option<String>,
-}
 /// thread-safe, mutable block store
 
 #[derive(NetworkBehaviour)]
@@ -980,78 +533,6 @@ struct PendingProviderQuery {
     id: u64,
     sender: oneshot::Sender<Result<Vec<String>, String>>,
 }
-
-#[derive(Debug, Clone, Default)]
-struct DhtMetrics {
-    last_bootstrap: Option<SystemTime>,
-    last_success: Option<SystemTime>,
-    last_error_at: Option<SystemTime>,
-    last_error: Option<String>,
-    bootstrap_failures: u64,
-    listen_addrs: Vec<String>,
-    reachability_state: NatReachabilityState,
-    reachability_confidence: NatConfidence,
-    last_reachability_change: Option<SystemTime>,
-    last_probe_at: Option<SystemTime>,
-    last_reachability_error: Option<String>,
-    observed_addrs: Vec<String>,
-    reachability_history: VecDeque<ReachabilityRecord>,
-    success_streak: u32,
-    failure_streak: u32,
-    autonat_enabled: bool,
-    // AutoRelay metrics
-    autorelay_enabled: bool,
-    active_relay_peer_id: Option<String>,
-    relay_reservation_status: Option<String>,
-    last_reservation_success: Option<SystemTime>,
-    last_reservation_failure: Option<SystemTime>,
-    reservation_renewals: u64,
-    reservation_evictions: u64,
-    // DCUtR metrics
-    dcutr_enabled: bool,
-    dcutr_hole_punch_attempts: u64,
-    dcutr_hole_punch_successes: u64,
-    dcutr_hole_punch_failures: u64,
-    last_dcutr_success: Option<SystemTime>,
-    last_dcutr_failure: Option<SystemTime>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DhtMetricsSnapshot {
-    pub peer_count: usize,
-    pub last_bootstrap: Option<u64>,
-    pub last_peer_event: Option<u64>,
-    pub last_error: Option<String>,
-    pub last_error_at: Option<u64>,
-    pub bootstrap_failures: u64,
-    pub listen_addrs: Vec<String>,
-    pub relay_listen_addrs: Vec<String>,
-    pub reachability: NatReachabilityState,
-    pub reachability_confidence: NatConfidence,
-    pub last_reachability_change: Option<u64>,
-    pub last_probe_at: Option<u64>,
-    pub last_reachability_error: Option<String>,
-    pub observed_addrs: Vec<String>,
-    pub reachability_history: Vec<NatHistoryItem>,
-    pub autonat_enabled: bool,
-    // AutoRelay metrics
-    pub autorelay_enabled: bool,
-    pub active_relay_peer_id: Option<String>,
-    pub relay_reservation_status: Option<String>,
-    pub last_reservation_success: Option<u64>,
-    pub last_reservation_failure: Option<u64>,
-    pub reservation_renewals: u64,
-    pub reservation_evictions: u64,
-    // DCUtR metrics
-    pub dcutr_enabled: bool,
-    pub dcutr_hole_punch_attempts: u64,
-    pub dcutr_hole_punch_successes: u64,
-    pub dcutr_hole_punch_failures: u64,
-    pub last_dcutr_success: Option<u64>,
-    pub last_dcutr_failure: Option<u64>,
-}
-
 // ------Proxy Protocol Implementation------
 #[derive(Clone, Debug, Default)]
 struct ProxyCodec;
@@ -1275,158 +756,6 @@ impl Transport for Socks5Transport {
         }
         .boxed())
     }
-}
-
-// Helper function to convert Multiaddr to SocketAddr
-fn addr_to_socket_addr(addr: &libp2p::Multiaddr) -> Option<SocketAddr> {
-    use libp2p::multiaddr::Protocol;
-
-    let mut iter = addr.iter();
-    match (iter.next(), iter.next()) {
-        (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) => {
-            Some(SocketAddr::new(ip.into(), port))
-        }
-        (Some(Protocol::Ip6(ip)), Some(Protocol::Tcp(port))) => {
-            Some(SocketAddr::new(ip.into(), port))
-        }
-        _ => None,
-    }
-}
-
-pub fn build_relay_listen_addr(base: &Multiaddr) -> Option<Multiaddr> {
-    let mut out = base.clone();
-    let has_p2p = out.iter().any(|p| matches!(p, Protocol::P2p(_)));
-    if !has_p2p {
-        return None;
-    }
-    out.push(Protocol::P2pCircuit);
-    Some(out)
-}
-
-fn is_relay_candidate(peer_id: &PeerId, relay_candidates: &HashSet<String>) -> bool {
-    if relay_candidates.is_empty() {
-        return false;
-    }
-
-    let peer_str = peer_id.to_string();
-    relay_candidates.iter().any(|candidate| {
-        // Check if the candidate multiaddr contains this peer ID
-        candidate.contains(&peer_str)
-    })
-}
-
-fn peer_id_from_multiaddr_str(s: &str) -> Option<PeerId> {
-    if let Ok(ma) = s.parse::<Multiaddr>() {
-        let mut last_p2p: Option<PeerId> = None;
-        for p in ma.iter() {
-            if let Protocol::P2p(mh) = p {
-                if let Ok(pid) = PeerId::from_multihash(mh.into()) {
-                    last_p2p = Some(pid);
-                }
-            }
-        }
-        return last_p2p;
-    }
-
-    if let Ok(pid) = s.parse::<PeerId>() {
-        return Some(pid);
-    }
-    None
-}
-
-fn should_try_relay(
-    pid: &PeerId,
-    relay_candidates: &HashSet<String>,
-    blacklist: &HashSet<PeerId>,
-    cooldown: &HashMap<PeerId, Instant>,
-) -> bool {
-    // 1) Check if the peer ID is in the preferred/bootstrap candidates
-    if relay_candidates.is_empty() {
-        return false;
-    }
-    let peer_str = pid.to_string();
-    let in_candidates = relay_candidates.iter().any(|cand| cand.contains(&peer_str));
-    if !in_candidates {
-        return false;
-    }
-    // 2) Check permanent blacklist
-    if blacklist.contains(pid) {
-        tracing::debug!("skip blacklisted relay candidate {}", pid);
-        return false;
-    }
-    // 3) Check cooldown
-    if let Some(until) = cooldown.get(pid) {
-        if Instant::now() < *until {
-            tracing::debug!("skip cooldown relay candidate {} until {:?}", pid, until);
-            return false;
-        }
-    }
-    true
-}
-
-/// candidates(HashSet<String>) → (PeerId, Multiaddr)
-fn filter_relay_candidates(
-    relay_candidates: &HashSet<String>,
-    blacklist: &HashSet<PeerId>,
-    cooldown: &HashMap<PeerId, Instant>,
-) -> Vec<(PeerId, Multiaddr)> {
-    let now = Instant::now();
-    let mut out = Vec::new();
-    for cand in relay_candidates {
-        if let Ok(ma) = cand.parse::<Multiaddr>() {
-            // Skip unreachable addresses (localhost/private IPs)
-            if !ma_plausibly_reachable(&ma) {
-                tracing::debug!("Skipping unreachable relay candidate: {}", ma);
-                continue;
-            }
-
-            // PeerId extraction
-            let mut pid_opt: Option<PeerId> = None;
-            for p in ma.iter() {
-                if let Protocol::P2p(mh) = p {
-                    if let Ok(pid) = PeerId::from_multihash(mh.into()) {
-                        pid_opt = Some(pid);
-                    }
-                }
-            }
-            if let Some(pid) = pid_opt {
-                if !blacklist.contains(&pid) {
-                    if let Some(until) = cooldown.get(&pid) {
-                        if Instant::now() < *until {
-                            tracing::debug!(
-                                "skip cooldown relay candidate {} until {:?}",
-                                pid,
-                                until
-                            );
-                            continue;
-                        }
-                    }
-                    out.push((pid, ma.clone()));
-                } else {
-                    tracing::debug!("skip blacklisted relay candidate {}", pid);
-                }
-            }
-        }
-    }
-    out
-}
-
-fn extract_relay_peer(address: &Multiaddr) -> Option<PeerId> {
-    use libp2p::multiaddr::Protocol;
-
-    let mut last_p2p: Option<PeerId> = None;
-    for protocol in address.iter() {
-        match protocol {
-            Protocol::P2p(peer_id) => {
-                last_p2p = Some(peer_id.clone());
-            }
-            Protocol::P2pCircuit => {
-                return last_p2p.clone();
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 enum RelayTransportOutput {
@@ -1877,123 +1206,123 @@ async fn run_dht_node(
         }
     }
 
-    for (pid, mut base_addr) in filtered_relays {
-        use libp2p::multiaddr::Protocol;
-        last_tried_relay = Some(pid);
-        base_addr.push(Protocol::P2pCircuit);
-        tracing::info!("📡 Attempting to listen via relay {} at {}", pid, base_addr);
-        if let Err(e) = swarm.listen_on(base_addr.clone()) {
-            tracing::warn!("listen_on via relay {} failed: {}", pid, e);
-            // Temporary failure: 10min cooldown
-            relay_cooldown.insert(pid, Instant::now() + Duration::from_secs(600));
-        }
-    }
+    // for (pid, mut base_addr) in filtered_relays {
+    //     use libp2p::multiaddr::Protocol;
+    //     last_tried_relay = Some(pid);
+    //     base_addr.push(Protocol::P2pCircuit);
+    //     tracing::info!("📡 Attempting to listen via relay {} at {}", pid, base_addr);
+    //     if let Err(e) = swarm.listen_on(base_addr.clone()) {
+    //         tracing::warn!("listen_on via relay {} failed: {}", pid, e);
+    //         // Temporary failure: 10min cooldown
+    //         relay_cooldown.insert(pid, Instant::now() + Duration::from_secs(600));
+    //     }
+    // }
 
     'outer: loop {
         tokio::select! {
                     // periodic maintenance tick - prune expired seeder heartbeats and update DHT
                     // Fast heartbeat tick — refresh DHT records for files this node is actively seeding
-                    _ = heartbeat_maintenance_interval.tick() => {
-                        let now = unix_timestamp();
-                        let my_id = peer_id.to_string();
-                        let mut updated_records: Vec<(String, Vec<u8>)> = Vec::new();
+                    // _ = heartbeat_maintenance_interval.tick() => {
+                    //     let now = unix_timestamp();
+                    //     let my_id = peer_id.to_string();
+                    //     let mut updated_records: Vec<(String, Vec<u8>)> = Vec::new();
 
-                        {
-                            let mut cache = seeder_heartbeats_cache.lock().await;
-                            for (file_hash, entry) in cache.iter_mut() {
-                                // Prune expired entries first
-                                entry.heartbeats = prune_heartbeats(entry.heartbeats.clone(), now);
+                    //     {
+                    //         let mut cache = seeder_heartbeats_cache.lock().await;
+                    //         for (file_hash, entry) in cache.iter_mut() {
+                    //             // Prune expired entries first
+                    //             entry.heartbeats = prune_heartbeats(entry.heartbeats.clone(), now);
 
-                                // Only refresh records if this node is listed as a seeder
-                                if entry.heartbeats.iter().any(|hb| hb.peer_id == my_id) {
-                                    // ensure our own heartbeat is up-to-date in cache
-                                    for hb in entry.heartbeats.iter_mut() {
-                                        if hb.peer_id == my_id {
-                                            hb.last_heartbeat = now;
-                                            hb.expires_at = now.saturating_add(FILE_HEARTBEAT_TTL.as_secs());
-                                        }
-                                    }
+                    //             // Only refresh records if this node is listed as a seeder
+                    //             if entry.heartbeats.iter().any(|hb| hb.peer_id == my_id) {
+                    //                 // ensure our own heartbeat is up-to-date in cache
+                    //                 for hb in entry.heartbeats.iter_mut() {
+                    //                     if hb.peer_id == my_id {
+                    //                         hb.last_heartbeat = now;
+                    //                         hb.expires_at = now.saturating_add(FILE_HEARTBEAT_TTL.as_secs());
+                    //                     }
+                    //                 }
 
-                                    // update metadata fields
-                                    let seeder_strings = heartbeats_to_peer_list(&entry.heartbeats);
-                                    entry.metadata["seeders"] = serde_json::Value::Array(
-                                        seeder_strings
-                                            .iter()
-                                            .cloned()
-                                            .map(serde_json::Value::String)
-                                            .collect(),
-                                    );
-                                    entry.metadata["seederHeartbeats"] =
-                                        serde_json::to_value(&entry.heartbeats)
-                                            .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+                    //                 // update metadata fields
+                    //                 let seeder_strings = heartbeats_to_peer_list(&entry.heartbeats);
+                    //                 entry.metadata["seeders"] = serde_json::Value::Array(
+                    //                     seeder_strings
+                    //                         .iter()
+                    //                         .cloned()
+                    //                         .map(serde_json::Value::String)
+                    //                         .collect(),
+                    //                 );
+                    //                 entry.metadata["seederHeartbeats"] =
+                    //                     serde_json::to_value(&entry.heartbeats)
+                    //                         .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
 
-                                    if let Ok(bytes) = serde_json::to_vec(&entry.metadata) {
-                                        updated_records.push((file_hash.clone(), bytes));
-                                    }
-                                }
-                            }
-                        } // release cache lock
+                    //                 if let Ok(bytes) = serde_json::to_vec(&entry.metadata) {
+                    //                     updated_records.push((file_hash.clone(), bytes));
+                    //                 }
+                    //             }
+                    //         }
+                    //     } // release cache lock
 
-                        // Perform DHT updates for seeder heartbeats (non-blocking best-effort)
-                                // Push updated records to Kademlia for each updated file
-                                for (file_hash, bytes) in updated_records {
-                                    let key = kad::RecordKey::new(&file_hash.as_bytes());
-                                    let record = Record {
-                                        key: key.clone(),
-                                        value: bytes.clone(),
-                                        publisher: Some(peer_id.clone()),
-                                        expires: None,
-                                    };
-                                    if let Err(e) =
-                                        swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
-                                    {
-                                        warn!("Failed to refresh DHT record after disconnect for {}: {}", file_hash, e);
-                                    } else {
-                                        debug!("Refreshed DHT record for {} after peer {} disconnected", file_hash, peer_id);
-                                    }
+                    //     // Perform DHT updates for seeder heartbeats (non-blocking best-effort)
+                    //             // Push updated records to Kademlia for each updated file
+                    //             for (file_hash, bytes) in updated_records {
+                    //                 let key = kad::RecordKey::new(&file_hash.as_bytes());
+                    //                 let record = Record {
+                    //                     key: key.clone(),
+                    //                     value: bytes.clone(),
+                    //                     publisher: Some(peer_id.clone()),
+                    //                     expires: None,
+                    //                 };
+                    //                 if let Err(e) =
+                    //                     swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One)
+                    //                 {
+                    //                     warn!("Failed to refresh DHT record after disconnect for {}: {}", file_hash, e);
+                    //                 } else {
+                    //                     debug!("Refreshed DHT record for {} after peer {} disconnected", file_hash, peer_id);
+                    //                 }
 
-                                    // notify UI with updated metadata so frontend refreshes immediately
-                                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                        if let (Some(merkle_root), Some(file_name), Some(file_size), Some(created_at)) = (
-                                            json_val.get("merkle_root").and_then(|v| v.as_str()),
-                                            json_val.get("file_name").and_then(|v| v.as_str()),
-                                            json_val.get("file_size").and_then(|v| v.as_u64()),
-                                            json_val.get("created_at").and_then(|v| v.as_u64()),
-                                        ) {
-                                            let seeders = json_val
-                                                .get("seeders")
-                                                .and_then(|v| v.as_array())
-                                                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                                                .unwrap_or_default();
+                    //                 // notify UI with updated metadata so frontend refreshes immediately
+                    //                 if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    //                     if let (Some(merkle_root), Some(file_name), Some(file_size), Some(created_at)) = (
+                    //                         json_val.get("merkle_root").and_then(|v| v.as_str()),
+                    //                         json_val.get("file_name").and_then(|v| v.as_str()),
+                    //                         json_val.get("file_size").and_then(|v| v.as_u64()),
+                    //                         json_val.get("created_at").and_then(|v| v.as_u64()),
+                    //                     ) {
+                    //                         let seeders = json_val
+                    //                             .get("seeders")
+                    //                             .and_then(|v| v.as_array())
+                    //                             .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    //                             .unwrap_or_default();
 
-                                            let metadata = FileMetadata {
-                                                merkle_root: merkle_root.to_string(),
-                                                file_name: file_name.to_string(),
-                                                file_size,
-                                                file_data: Vec::new(),
-                                                seeders,
-                                                created_at,
-                                                mime_type: json_val.get("mime_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                is_encrypted: json_val.get("is_encrypted").and_then(|v| v.as_bool()).unwrap_or(false),
-                                                encryption_method: json_val.get("encryption_method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                key_fingerprint: json_val.get("key_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    //                         let metadata = FileMetadata {
+                    //                             merkle_root: merkle_root.to_string(),
+                    //                             file_name: file_name.to_string(),
+                    //                             file_size,
+                    //                             file_data: Vec::new(),
+                    //                             seeders,
+                    //                             created_at,
+                    //                             mime_type: json_val.get("mime_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    //                             is_encrypted: json_val.get("is_encrypted").and_then(|v| v.as_bool()).unwrap_or(false),
+                    //                             encryption_method: json_val.get("encryption_method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    //                             key_fingerprint: json_val.get("key_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string()),
 
-                                                parent_hash: json_val.get("parent_hash").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                cids: json_val.get("cids").and_then(|v| serde_json::from_value::<Option<Vec<Cid>>>(v.clone()).ok()).unwrap_or(None),
-                                                encrypted_key_bundle: json_val.get("encryptedKeyBundle").and_then(|v| serde_json::from_value::<Option<crate::encryption::EncryptedAesKeyBundle>>(v.clone()).ok()).unwrap_or(None),
-                                                info_hash: json_val.get("infoHash").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
-                                                is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
-                                                price: json_val.get("price").and_then(|v| v.as_f64()),
-                                                uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                                http_sources: json_val.get("http_sources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
-                                                ..Default::default()
-                                            };
-                                            let _ = event_tx.send(DhtEvent::FileDiscovered(metadata)).await;
-                                        }
-                                    }
-                                }
-                    }
+                    //                             parent_hash: json_val.get("parent_hash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    //                             cids: json_val.get("cids").and_then(|v| serde_json::from_value::<Option<Vec<Cid>>>(v.clone()).ok()).unwrap_or(None),
+                    //                             encrypted_key_bundle: json_val.get("encryptedKeyBundle").and_then(|v| serde_json::from_value::<Option<crate::encryption::EncryptedAesKeyBundle>>(v.clone()).ok()).unwrap_or(None),
+                    //                             info_hash: json_val.get("infoHash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    //                             trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
+                    //                             is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
+                    //                             price: json_val.get("price").and_then(|v| v.as_f64()),
+                    //                             uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    //                             http_sources: json_val.get("http_sources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
+                    //                             ..Default::default()
+                    //                         };
+                    //                         let _ = event_tx.send(DhtEvent::FileDiscovered(metadata)).await;
+                    //                     }
+                    //                 }
+                    //             }
+                    // }
 
                     cmd = cmd_rx.recv() => {
                         match cmd {
@@ -2406,7 +1735,6 @@ async fn run_dht_node(
                                 info!("INSERTING INTO ROOT QUERY MAPPING");
                                 root_query_mapping.lock().await.insert(root_query_id, file_metadata);
                             }
-
                             Some(DhtCommand::StopPublish(file_hash)) => {
                                 let key = kad::RecordKey::new(&file_hash);
                                 let removed = swarm.behaviour_mut().kademlia.remove_record(&key);
@@ -2917,8 +2245,6 @@ async fn run_dht_node(
                                 let _ = swarm.disconnect_peer_id(peer_id.clone());
                                 proxy_mgr.lock().await.remove_all(&peer_id);
                             }
-
-
                             Some(DhtCommand::GetPeerCount(tx)) => {
                                 let count = connected_peers.lock().await.len();
                                 let _ = tx.send(count);
@@ -3030,12 +2356,12 @@ async fn run_dht_node(
                                 )
                                 .await;
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::Mdns(mdns_event)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::Mdns(mdns_event)) if !is_bootstrap => {
                                 if !is_bootstrap{
                                     handle_mdns_event(mdns_event, &mut swarm, &event_tx, &peer_id).await;
                                 }
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::RelayClient(relay_event)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::RelayClient(relay_event)) if !is_bootstrap => {
                                 match relay_event {
                                     RelayClientEvent::ReservationReqAccepted { relay_peer_id, .. } => {
                                         info!("✅ Relay reservation accepted from {}", relay_peer_id);
@@ -3097,7 +2423,7 @@ async fn run_dht_node(
                                     }
                                 }
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::RelayServer(relay_server_event)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::RelayServer(relay_server_event)) if !is_bootstrap => {
                                 use relay::Event as RelayEvent;
                                 match relay_server_event {
                                     RelayEvent::ReservationReqAccepted { src_peer_id, .. } => {
@@ -3230,7 +2556,7 @@ async fn run_dht_node(
                                     _ => {}
                                 }
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::Bitswap(bitswap)) => match bitswap {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::Bitswap(bitswap)) if !is_bootstrap => match bitswap {
                                 beetswap::Event::GetQueryResponse { query_id, data } => {
                                     info!("📥 Received Bitswap block (query_id: {:?}, size: {} bytes)", query_id, data.len());
 
@@ -3526,20 +2852,20 @@ async fn run_dht_node(
                                     }
                                 }
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatClient(ev)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatClient(ev)) if !is_bootstrap => {
                                 handle_autonat_client_event(&mut swarm, ev, &metrics, &event_tx).await;
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatServer(ev)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::AutonatServer(ev)) if !is_bootstrap => {
                                 debug!(?ev, "AutoNAT server event");
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::Dcutr(ev)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::Dcutr(ev)) if !is_bootstrap => {
                                 handle_dcutr_event(ev, &metrics, &event_tx).await;
                             }
-                            SwarmEvent::ExternalAddrConfirmed { address, .. } => {
+                            SwarmEvent::ExternalAddrConfirmed { address, .. } if !is_bootstrap => {
                                 handle_external_addr_confirmed(&mut swarm, &address, &metrics, &event_tx, &proxy_mgr)
                                     .await;
                             }
-                            SwarmEvent::ExternalAddrExpired { address, .. } => {
+                            SwarmEvent::ExternalAddrExpired { address, .. } if !is_bootstrap => {
                                 handle_external_addr_expired(&address, &metrics, &event_tx, &proxy_mgr)
                                     .await;
                             }
@@ -3560,10 +2886,10 @@ async fn run_dht_node(
                                 // Add peer to Kademlia routing table (only if reachable)
                                 // swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
                                 // if ma_plausibly_reachable(&remote_addr) {
-                                    swarm
-                                        .behaviour_mut()
-                                        .kademlia
-                                        .add_address(&peer_id, remote_addr.clone());
+                                swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .add_address(&peer_id, remote_addr.clone());
                                 // } else {
                                 //     debug!(
                                 //         "⏭️ Not adding unreachable address to Kademlia for {}: {}",
@@ -3589,7 +2915,7 @@ async fn run_dht_node(
                                     })
                                     .await;
                             }
-                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                 warn!("❌ DISCONNECTED from peer: {}", peer_id);
                                 warn!("   Cause: {:?}", cause);
 
@@ -3709,7 +3035,7 @@ async fn run_dht_node(
                                     })
                                     .await;
                             }
-                            SwarmEvent::NewListenAddr { address, .. } => {
+                            SwarmEvent::NewListenAddr { address, .. } if !is_bootstrap => {
                                 // Always record in metrics for monitoring/debugging
                                 if let Ok(mut m) = metrics.try_lock() {
                                     m.record_listen_addr(&address);
@@ -3815,7 +3141,7 @@ async fn run_dht_node(
                                 // }
                                 let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::ProxyRr(ev)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::ProxyRr(ev)) if !is_bootstrap => {
                                 use libp2p::request_response::{Event as RREvent, Message};
                                 match ev {
                                     RREvent::Message { peer, message } => match message {
@@ -3917,7 +3243,7 @@ async fn run_dht_node(
                                     RREvent::ResponseSent { .. } => {}
                                 }
                             }
-                            SwarmEvent::Behaviour(DhtBehaviourEvent::WebrtcSignalingRr(ev)) => {
+                            SwarmEvent::Behaviour(DhtBehaviourEvent::WebrtcSignalingRr(ev)) if !is_bootstrap => {
                                 use libp2p::request_response::{Event as RREvent, Message};
                                 match ev {
                                     RREvent::Message { peer, message } => match message {
@@ -3974,15 +3300,18 @@ async fn run_dht_node(
                                     RREvent::ResponseSent { .. } => {}
                                 }
                             }
-                            SwarmEvent::IncomingConnectionError { error, .. } => {
-                                if let Ok(mut m) = metrics.try_lock() {
-                                    m.last_error = Some(error.to_string());
-                                    m.last_error_at = Some(SystemTime::now());
-                                    m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
+                            SwarmEvent::IncomingConnectionError { error, .. } if !is_bootstrap => {
+                                if !is_bootstrap{
+                                    if let Ok(mut m) = metrics.try_lock() {
+                                        m.last_error = Some(error.to_string());
+                                        m.last_error_at = Some(SystemTime::now());
+                                        m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
+                                    }
                                 }
                                 error!("❌ Incoming connection error: {}", error);
                             }
-                            SwarmEvent::ListenerClosed { reason, .. } => {
+                            SwarmEvent::ListenerClosed { reason, .. } if !is_bootstrap => {
+                                if !is_bootstrap{
                                 if reason.is_ok() {
                                     trace!("ListenerClosed Ok; ignoring");
                                 } else {
@@ -3999,7 +3328,7 @@ async fn run_dht_node(
                                             }
                                         }
                                     }
-                                }
+                                }}
                             }
                             _ => {}
                         }
@@ -4015,6 +3344,337 @@ async fn run_dht_node(
     if let Some(ack) = shutdown_ack {
         let _ = ack.send(());
     }
+}
+
+// Helper function to convert Multiaddr to SocketAddr
+fn addr_to_socket_addr(addr: &libp2p::Multiaddr) -> Option<SocketAddr> {
+    use libp2p::multiaddr::Protocol;
+
+    let mut iter = addr.iter();
+    match (iter.next(), iter.next()) {
+        (Some(Protocol::Ip4(ip)), Some(Protocol::Tcp(port))) => {
+            Some(SocketAddr::new(ip.into(), port))
+        }
+        (Some(Protocol::Ip6(ip)), Some(Protocol::Tcp(port))) => {
+            Some(SocketAddr::new(ip.into(), port))
+        }
+        _ => None,
+    }
+}
+
+pub fn build_relay_listen_addr(base: &Multiaddr) -> Option<Multiaddr> {
+    let mut out = base.clone();
+    let has_p2p = out.iter().any(|p| matches!(p, Protocol::P2p(_)));
+    if !has_p2p {
+        return None;
+    }
+    out.push(Protocol::P2pCircuit);
+    Some(out)
+}
+
+fn is_relay_candidate(peer_id: &PeerId, relay_candidates: &HashSet<String>) -> bool {
+    if relay_candidates.is_empty() {
+        return false;
+    }
+
+    let peer_str = peer_id.to_string();
+    relay_candidates.iter().any(|candidate| {
+        // Check if the candidate multiaddr contains this peer ID
+        candidate.contains(&peer_str)
+    })
+}
+
+fn peer_id_from_multiaddr_str(s: &str) -> Option<PeerId> {
+    if let Ok(ma) = s.parse::<Multiaddr>() {
+        let mut last_p2p: Option<PeerId> = None;
+        for p in ma.iter() {
+            if let Protocol::P2p(mh) = p {
+                if let Ok(pid) = PeerId::from_multihash(mh.into()) {
+                    last_p2p = Some(pid);
+                }
+            }
+        }
+        return last_p2p;
+    }
+
+    if let Ok(pid) = s.parse::<PeerId>() {
+        return Some(pid);
+    }
+    None
+}
+
+fn should_try_relay(
+    pid: &PeerId,
+    relay_candidates: &HashSet<String>,
+    blacklist: &HashSet<PeerId>,
+    cooldown: &HashMap<PeerId, Instant>,
+) -> bool {
+    // 1) Check if the peer ID is in the preferred/bootstrap candidates
+    if relay_candidates.is_empty() {
+        return false;
+    }
+    let peer_str = pid.to_string();
+    let in_candidates = relay_candidates.iter().any(|cand| cand.contains(&peer_str));
+    if !in_candidates {
+        return false;
+    }
+    // 2) Check permanent blacklist
+    if blacklist.contains(pid) {
+        tracing::debug!("skip blacklisted relay candidate {}", pid);
+        return false;
+    }
+    // 3) Check cooldown
+    if let Some(until) = cooldown.get(pid) {
+        if Instant::now() < *until {
+            tracing::debug!("skip cooldown relay candidate {} until {:?}", pid, until);
+            return false;
+        }
+    }
+    true
+}
+
+/// candidates(HashSet<String>) → (PeerId, Multiaddr)
+fn filter_relay_candidates(
+    relay_candidates: &HashSet<String>,
+    blacklist: &HashSet<PeerId>,
+    cooldown: &HashMap<PeerId, Instant>,
+) -> Vec<(PeerId, Multiaddr)> {
+    let now = Instant::now();
+    let mut out = Vec::new();
+    for cand in relay_candidates {
+        if let Ok(ma) = cand.parse::<Multiaddr>() {
+            // Skip unreachable addresses (localhost/private IPs)
+            if !ma_plausibly_reachable(&ma) {
+                tracing::debug!("Skipping unreachable relay candidate: {}", ma);
+                continue;
+            }
+
+            // PeerId extraction
+            let mut pid_opt: Option<PeerId> = None;
+            for p in ma.iter() {
+                if let Protocol::P2p(mh) = p {
+                    if let Ok(pid) = PeerId::from_multihash(mh.into()) {
+                        pid_opt = Some(pid);
+                    }
+                }
+            }
+            if let Some(pid) = pid_opt {
+                if !blacklist.contains(&pid) {
+                    if let Some(until) = cooldown.get(&pid) {
+                        if Instant::now() < *until {
+                            tracing::debug!(
+                                "skip cooldown relay candidate {} until {:?}",
+                                pid,
+                                until
+                            );
+                            continue;
+                        }
+                    }
+                    out.push((pid, ma.clone()));
+                } else {
+                    tracing::debug!("skip blacklisted relay candidate {}", pid);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn extract_relay_peer(address: &Multiaddr) -> Option<PeerId> {
+    use libp2p::multiaddr::Protocol;
+
+    let mut last_p2p: Option<PeerId> = None;
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::P2p(peer_id) => {
+                last_p2p = Some(peer_id.clone());
+            }
+            Protocol::P2pCircuit => {
+                return last_p2p.clone();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extracts a set of unique, searchable keywords from a filename.
+fn extract_keywords(file_name: &str) -> Vec<String> {
+    // 1. Sanitize: remove the file extension and convert to lowercase.
+    let name_without_ext = std::path::Path::new(file_name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or_default()
+        .to_lowercase();
+
+    // 2. Split the name into words based on common non-alphanumeric delimiters.
+    let keywords: std::collections::HashSet<String> = name_without_ext
+        .split(|c: char| !c.is_alphanumeric())
+        // 3. Filter out empty strings and common short words (e.g., "a", "of").
+        .filter(|s| !s.is_empty() && s.len() > 2)
+        .map(String::from)
+        .collect(); // Using a HashSet automatically handles duplicates.
+
+    // 4. Return the unique keywords as a Vec.
+    keywords.into_iter().collect()
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
+fn merge_heartbeats(
+    mut a: Vec<SeederHeartbeat>,
+    mut b: Vec<SeederHeartbeat>,
+) -> Vec<SeederHeartbeat> {
+    let mut merged = Vec::new();
+    let mut seen_peers = std::collections::HashSet::new();
+    let now = unix_timestamp();
+
+    // Create sets to track which peers appear in both vectors
+    let a_peers: HashSet<String> = a.iter().map(|hb| hb.peer_id.clone()).collect();
+    let b_peers: HashSet<String> = b.iter().map(|hb| hb.peer_id.clone()).collect();
+    let common_peers: HashSet<_> = a_peers.intersection(&b_peers).cloned().collect();
+
+    // Filter and collect entries in one pass instead of using retain
+    let filtered_a: Vec<_> = a
+        .into_iter()
+        .filter(|hb| {
+            common_peers.contains(&hb.peer_id) || hb.expires_at > now.saturating_sub(30)
+            // 30s grace period
+        })
+        .collect();
+
+    let filtered_b: Vec<_> = b
+        .into_iter()
+        .filter(|hb| {
+            common_peers.contains(&hb.peer_id) || hb.expires_at > now.saturating_sub(30)
+            // 30s grace period
+        })
+        .collect();
+
+    // Now work with the filtered vectors
+    a = filtered_a;
+    b = filtered_b;
+
+    // Sort both vectors by peer_id for deterministic merging
+    a.sort_by(|x, y| x.peer_id.cmp(&y.peer_id));
+    b.sort_by(|x, y| x.peer_id.cmp(&y.peer_id));
+
+    let mut a_iter = a.into_iter();
+    let mut b_iter = b.into_iter();
+
+    let mut next_a = a_iter.next();
+    let mut next_b = b_iter.next();
+
+    while let (Some(a_entry), Some(b_entry)) = (&next_a, &next_b) {
+        match a_entry.peer_id.cmp(&b_entry.peer_id) {
+            std::cmp::Ordering::Equal => {
+                // For equal peer IDs, create a merged entry that:
+                // 1. Takes the most recent heartbeat timestamp
+                // 2. Uses the latest expiry time
+                // 3. Extends the expiry if it's an active seeder (recent heartbeat)
+                let latest_heartbeat =
+                    std::cmp::max(a_entry.last_heartbeat, b_entry.last_heartbeat);
+                let latest_expiry = std::cmp::max(a_entry.expires_at, b_entry.expires_at);
+
+                // If this is an active seeder (recent heartbeat), extend its expiry
+                let new_expiry =
+                    if now.saturating_sub(latest_heartbeat) < FILE_HEARTBEAT_INTERVAL.as_secs() {
+                        now.saturating_add(FILE_HEARTBEAT_TTL.as_secs())
+                    } else {
+                        latest_expiry
+                    };
+
+                let entry = SeederHeartbeat {
+                    peer_id: a_entry.peer_id.clone(),
+                    expires_at: new_expiry,
+                    last_heartbeat: latest_heartbeat,
+                };
+
+                if !seen_peers.contains(&entry.peer_id) {
+                    seen_peers.insert(entry.peer_id.clone());
+                    merged.push(entry);
+                }
+
+                next_a = a_iter.next();
+                next_b = b_iter.next();
+            }
+            std::cmp::Ordering::Less => {
+                if !seen_peers.contains(&a_entry.peer_id) {
+                    seen_peers.insert(a_entry.peer_id.clone());
+                    merged.push(a_entry.clone());
+                }
+                next_a = a_iter.next();
+            }
+            std::cmp::Ordering::Greater => {
+                if !seen_peers.contains(&b_entry.peer_id) {
+                    seen_peers.insert(b_entry.peer_id.clone());
+                    merged.push(b_entry.clone());
+                }
+                next_b = b_iter.next();
+            }
+        }
+    }
+
+    // Add remaining entries from a
+    while let Some(entry) = next_a {
+        if !seen_peers.contains(&entry.peer_id) {
+            seen_peers.insert(entry.peer_id.clone());
+            merged.push(entry);
+        }
+        next_a = a_iter.next();
+    }
+
+    // Add remaining entries from b
+    while let Some(entry) = next_b {
+        if !seen_peers.contains(&entry.peer_id) {
+            seen_peers.insert(entry.peer_id.clone());
+            merged.push(entry);
+        }
+        next_b = b_iter.next();
+    }
+
+    merged
+}
+
+fn prune_heartbeats(mut entries: Vec<SeederHeartbeat>, now: u64) -> Vec<SeederHeartbeat> {
+    // Add a more generous grace period to prevent premature pruning
+    // Use 30 seconds which is between the heartbeat interval (15s) and TTL (90s)
+    let prune_threshold = now.saturating_sub(30); // 30 second grace period
+    entries.retain(|hb| hb.expires_at > prune_threshold);
+    entries.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+    entries
+}
+
+fn upsert_heartbeat(entries: &mut Vec<SeederHeartbeat>, peer_id: &str, now: u64) {
+    let expires_at = now.saturating_add(FILE_HEARTBEAT_TTL.as_secs());
+
+    // First remove any expired entries
+    entries.retain(|hb| hb.expires_at > now);
+
+    // Then update or add the new heartbeat
+    if let Some(entry) = entries.iter_mut().find(|hb| hb.peer_id == peer_id) {
+        entry.expires_at = expires_at;
+        entry.last_heartbeat = now;
+    } else {
+        entries.push(SeederHeartbeat {
+            peer_id: peer_id.to_string(),
+            expires_at,
+            last_heartbeat: now,
+        });
+    }
+
+    // Sort by peer_id for consistent ordering
+    entries.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+}
+
+fn heartbeats_to_peer_list(entries: &[SeederHeartbeat]) -> Vec<String> {
+    entries.iter().map(|hb| hb.peer_id.clone()).collect()
 }
 
 fn extract_bootstrap_peer_ids(bootstrap_nodes: &[String]) -> HashSet<PeerId> {
@@ -7167,136 +6827,6 @@ async fn synchronous_search_by_infohash(
     // A proper implementation would require refactoring the event loop to handle multi-stage queries.
     warn!("synchronous_search_by_infohash is a placeholder due to event loop complexity.");
     Err("Synchronous info_hash search not fully implemented.".to_string())
-}
-
-impl DhtService {
-    pub async fn search_by_infohash(
-        &self,
-        info_hash: String,
-    ) -> Result<Option<FileMetadata>, String> {
-        let (sender, receiver) = oneshot::channel();
-        self.cmd_tx
-            .send(DhtCommand::SearchByInfohash { info_hash, sender })
-            .await
-            .map_err(|e| e.to_string())?;
-        receiver.await.map_err(|e| e.to_string())
-    }
-}
-
-/// Process received Bitswap chunk data and assemble complete files
-async fn process_bitswap_chunk(
-    query_id: &beetswap::QueryId,
-    data: &[u8],
-    event_tx: &mpsc::Sender<DhtEvent>,
-    received_chunks: &Arc<Mutex<HashMap<String, HashMap<u32, FileChunk>>>>,
-    file_transfer_service: &Arc<FileTransferService>,
-) {
-    // Try to parse the data as a FileChunk
-    match serde_json::from_slice::<FileChunk>(data) {
-        Ok(chunk) => {
-            info!(
-                "Received chunk {}/{} for file {} ({} bytes)",
-                chunk.chunk_index + 1,
-                chunk.total_chunks,
-                chunk.file_hash,
-                chunk.data.len()
-            );
-
-            // Store the chunk
-            {
-                let mut chunks_map = received_chunks.lock().await;
-                let file_chunks = chunks_map
-                    .entry(chunk.file_hash.clone())
-                    .or_insert_with(HashMap::new);
-                file_chunks.insert(chunk.chunk_index, chunk.clone());
-            }
-
-            // Check if we have all chunks for this file
-            let has_all_chunks = {
-                let chunks_map = received_chunks.lock().await;
-                if let Some(file_chunks) = chunks_map.get(&chunk.file_hash) {
-                    file_chunks.len() == chunk.total_chunks as usize
-                } else {
-                    false
-                }
-            };
-
-            if has_all_chunks {
-                // Assemble the file from all chunks
-                assemble_file_from_chunks(
-                    &chunk.file_hash,
-                    received_chunks,
-                    file_transfer_service,
-                    event_tx,
-                )
-                .await;
-            }
-
-            let _ = event_tx
-                .send(DhtEvent::BitswapDataReceived {
-                    query_id: format!("{:?}", query_id),
-                    data: data.to_vec(),
-                })
-                .await;
-        }
-        Err(e) => {
-            warn!("Failed to parse Bitswap data as FileChunk: {}", e);
-            // Emit raw data event for debugging
-            let _ = event_tx
-                .send(DhtEvent::BitswapDataReceived {
-                    query_id: format!("{:?}", query_id),
-                    data: data.to_vec(),
-                })
-                .await;
-        }
-    }
-}
-
-/// Assemble a complete file from received chunks
-async fn assemble_file_from_chunks(
-    file_hash: &str,
-    received_chunks: &Arc<Mutex<HashMap<String, HashMap<u32, FileChunk>>>>,
-    file_transfer_service: &Arc<FileTransferService>,
-    event_tx: &mpsc::Sender<DhtEvent>,
-) {
-    // Get all chunks for this file
-    let chunks = {
-        let mut chunks_map = received_chunks.lock().await;
-        chunks_map.remove(file_hash)
-    };
-
-    if let Some(mut file_chunks) = chunks {
-        // Sort chunks by index
-        let mut sorted_chunks: Vec<FileChunk> =
-            file_chunks.drain().map(|(_, chunk)| chunk).collect();
-        sorted_chunks.sort_by_key(|c| c.chunk_index);
-
-        // Get the count before consuming the vector
-        let chunk_count = sorted_chunks.len();
-
-        // Concatenate chunk data
-        let mut file_data = Vec::new();
-        for chunk in sorted_chunks {
-            file_data.extend_from_slice(&chunk.data);
-        }
-
-        // Store the assembled file
-        let file_name = format!("downloaded_{}", file_hash);
-        file_transfer_service
-            .store_file_data(file_hash.to_string(), file_name, file_data)
-            .await;
-
-        info!(
-            "Successfully assembled file {} from {} chunks",
-            file_hash, chunk_count
-        );
-
-        let _ = event_tx
-            .send(DhtEvent::FileDownloaded {
-                file_hash: file_hash.to_string(),
-            })
-            .await;
-    }
 }
 
 fn not_loopback(ip: &Multiaddr) -> bool {

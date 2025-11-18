@@ -1,6 +1,6 @@
 // Headless mode for running as a bootstrap node on servers
 use crate::commands::bootstrap::get_bootstrap_nodes;
-use crate::dht::{DhtMetricsSnapshot, DhtService, FileMetadata};
+use crate::dht::{models::DhtMetricsSnapshot, models::FileMetadata, DhtService};
 use crate::ethereum::GethProcess;
 use crate::file_transfer::FileTransferService;
 use clap::Parser;

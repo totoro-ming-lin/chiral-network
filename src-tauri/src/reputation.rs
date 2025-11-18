@@ -463,7 +463,7 @@ impl ReputationDhtService {
             serde_json::to_vec(event).map_err(|e| format!("Serialization error: {}", e))?;
 
         // Store in DHT (using existing file metadata structure as template)
-        let metadata = crate::dht::FileMetadata {
+        let metadata = crate::dht::models::FileMetadata {
             merkle_root: key.clone(),
             file_name: format!("reputation_{}.json", event.id),
             file_size: serialized.len() as u64,
@@ -530,7 +530,7 @@ impl ReputationDhtService {
         let serialized =
             serde_json::to_vec(verdict).map_err(|e| format!("Serialization error: {}", e))?;
 
-        let metadata = crate::dht::FileMetadata {
+        let metadata = crate::dht::models::FileMetadata {
             merkle_root: key.clone(),
             file_name: format!("tx_verdict_{}_{}.json", verdict.issuer_id, verdict.tx_hash),
             file_size: serialized.len() as u64,
@@ -589,7 +589,7 @@ impl ReputationDhtService {
         let serialized =
             serde_json::to_vec(epoch).map_err(|e| format!("Serialization error: {}", e))?;
 
-        let metadata = crate::dht::FileMetadata {
+        let metadata = crate::dht::models::FileMetadata {
             merkle_root: epoch.merkle_root.clone(),
             file_name: format!("merkle_root_{}.json", epoch.epoch_id),
             file_size: serialized.len() as u64,
