@@ -2781,8 +2781,9 @@ async fn run_dht_node(
                                     libp2p::ping::Event { peer, result: Ok(rtt), .. } => {
                                         let is_connected = connected_peers.lock().await.contains(&peer);
                                         let rtt_ms = rtt.as_millis() as u64;
-                                        debug!("Ping from peer {}: {} ms (connected: {})", peer, rtt_ms, is_connected);
+                                        info!("Ping from peer {}: {} ms (connected: {})", peer, rtt_ms, is_connected);
 
+                                        ping_failures.remove(&peer);
                                         // Update peer selection metrics with latency
                                         {
                                             let mut selection = peer_selection.lock().await;
@@ -2799,7 +2800,6 @@ async fn run_dht_node(
                                                 })
                                                 .await;
 
-                                                ping_failures.remove(&peer);
                                         } else {
                                             // Ignore
                                         }
@@ -2865,17 +2865,17 @@ async fn run_dht_node(
 
                                 // Add peer to Kademlia routing table (only if reachable)
                                 // swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
-                                // if ma_plausibly_reachable(&remote_addr) {
-                                swarm
-                                    .behaviour_mut()
-                                    .kademlia
-                                    .add_address(&peer_id, remote_addr.clone());
-                                // } else {
-                                //     debug!(
-                                //         "⏭️ Not adding unreachable address to Kademlia for {}: {}",
-                                //         peer_id, remote_addr
-                                //     );
-                                // }
+                                if ma_plausibly_reachable(&remote_addr) {
+                                    swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .add_address(&peer_id, remote_addr.clone());
+                                } else {
+                                    debug!(
+                                        "⏭️ Not adding unreachable address to Kademlia for {}: {}",
+                                        peer_id, remote_addr
+                                    );
+                                }
 
                                 let peers_count = {
                                     let mut peers = connected_peers.lock().await;
@@ -2896,8 +2896,8 @@ async fn run_dht_node(
                                     .await;
                             }
                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                                // warn!("❌ DISCONNECTED from peer: {}", peer_id);
-                                // warn!("   Cause: {:?}", cause);
+                                warn!("❌ DISCONNECTED from peer: {}", peer_id);
+                                warn!("   Cause: {:?}", cause);
                                 swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
 
                                 let peers_count = {
@@ -3021,7 +3021,7 @@ async fn run_dht_node(
                                 if let Ok(mut m) = metrics.try_lock() {
                                     m.record_listen_addr(&address);
                                 }
-                                  if let Some(Protocol::Ip4(v4)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
+                                if let Some(Protocol::Ip4(v4)) = address.iter().find(|p| matches!(p, Protocol::Ip4(_))) {
                                     // Reject loopback addresses - they're not reachable from remote peers
                                     if !v4.is_loopback() && !v4.is_private(){
                                         swarm.add_external_address(address.clone());
