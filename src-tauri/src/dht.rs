@@ -2880,6 +2880,7 @@ async fn run_dht_node(
                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                 warn!("❌ DISCONNECTED from peer: {}", peer_id);
                                 warn!("   Cause: {:?}", cause);
+                                swarm.behaviour_mut().kademlia.remove_peer(peer_id);
 
                                 let peers_count = {
                                     let mut peers = connected_peers.lock().await;
