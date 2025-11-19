@@ -57,6 +57,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub disable_autonat: bool,
 
+    #[arg(long)]
+    pub enable_relay: bool,
+
     /// Interval in seconds between AutoNAT probes
     #[arg(long, default_value = "30")]
     pub autonat_probe_interval: u64,
@@ -178,7 +181,7 @@ pub async fn run_headless(args: CliArgs) -> Result<(), Box<dyn std::error::Error
         None, // cache_size_mb: use default
         final_enable_autorelay,
         args.relay.clone(),
-        false,
+        args.enable_relay,
         None,
     )
     .await?;
