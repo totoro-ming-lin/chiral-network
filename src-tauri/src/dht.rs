@@ -2865,17 +2865,17 @@ async fn run_dht_node(
 
                                 // Add peer to Kademlia routing table (only if reachable)
                                 // swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
-                                if ma_plausibly_reachable(&remote_addr) {
+                                // if ma_plausibly_reachable(&remote_addr) {
                                     swarm
                                         .behaviour_mut()
                                         .kademlia
                                         .add_address(&peer_id, remote_addr.clone());
-                                } else {
-                                    debug!(
-                                        "⏭️ Not adding unreachable address to Kademlia for {}: {}",
-                                        peer_id, remote_addr
-                                    );
-                                }
+                                // } else {
+                                    // debug!(
+                                        // "⏭️ Not adding unreachable address to Kademlia for {}: {}",
+                                        // peer_id, remote_addr
+                                    // );
+                                // }
 
                                 let peers_count = {
                                     let mut peers = connected_peers.lock().await;
