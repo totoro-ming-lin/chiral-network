@@ -1188,10 +1188,7 @@ async fn run_dht_node(
         tokio::select! {
                     // periodic maintenance tick - prune expired seeder heartbeats and update DHT
                     // Fast heartbeat tick — refresh DHT records for files this node is actively seeding
-                    _ = heartbeat_maintenance_interval.tick() => {
-                        if is_bootstrap{
-                            return;
-                        }
+                    _ = heartbeat_maintenance_interval.tick(), if !is_bootstrap => {
                         let now = unix_timestamp();
                         let my_id = peer_id.to_string();
                         let mut updated_records: Vec<(String, Vec<u8>)> = Vec::new();
