@@ -1,6 +1,8 @@
 pub mod models;
 // pub mod protocol;
 use self::models::*;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 // use self::protocol::*;
 use crate::download_source::HttpSourceInfo;
@@ -1177,46 +1179,6 @@ async fn run_dht_node(
         }
         out
     }
-
-    let mut filtered_relays: Vec<(PeerId, Multiaddr)> = Vec::new();
-    // for cand in &relay_candidates {
-    //     if let Ok(base) = cand.parse::<Multiaddr>() {
-    //         if let Some(pid) = parse_peer_id_from_ma(&base) {
-    //             if relay_blacklist.contains(&pid) {
-    //                 tracing::debug!("skip blacklisted relay candidate {}", pid);
-    //                 continue;
-    //             }
-    //             if let Some(until) = relay_cooldown.get(&pid) {
-    //                 if Instant::now() < *until {
-    //                     tracing::debug!("skip cooldown relay candidate {} until {:?}", pid, until);
-    //                     continue;
-    //                 }
-    //             }
-    //             filtered_relays.push((pid, base));
-    //         }
-    //     }
-    // }
-
-    // if filtered_relays.is_empty() {
-    //     tracing::warn!("No usable relay candidates after blacklist/cooldown filtering");
-    // } else {
-    //     tracing::info!("Using {} filtered relay candidates", filtered_relays.len());
-    //     for (i, (pid, addr)) in filtered_relays.iter().take(5).enumerate() {
-    //         tracing::info!("   Filtered {}: {} via {}", i + 1, pid, addr);
-    //     }
-    // }
-
-    // for (pid, mut base_addr) in filtered_relays {
-    //     use libp2p::multiaddr::Protocol;
-    //     last_tried_relay = Some(pid);
-    //     base_addr.push(Protocol::P2pCircuit);
-    //     tracing::info!("📡 Attempting to listen via relay {} at {}", pid, base_addr);
-    //     if let Err(e) = swarm.listen_on(base_addr.clone()) {
-    //         tracing::warn!("listen_on via relay {} failed: {}", pid, e);
-    //         // Temporary failure: 10min cooldown
-    //         relay_cooldown.insert(pid, Instant::now() + Duration::from_secs(600));
-    //     }
-    // }
 
     'outer: loop {
         tokio::select! {
@@ -3064,64 +3026,86 @@ async fn run_dht_node(
                                 // }
                             }
                             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+
+                            if let Ok(mut m) = metrics.try_lock() {
+                                m.last_error = Some(error.to_string());
+                                m.last_error_at = Some(SystemTime::now());
+                                m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
+                            }
+                            if let Some(peer_id) = peer_id {
+                                error!("❌ Outgoing connection error to {}: {}", peer_id, error);
+                                // Check if this is a bootstrap connection error
+                                if error.to_string().contains("rsa") {
+                                    error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
+                                } else if error.to_string().contains("Timeout") {
+                                    warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
+                                } else if error.to_string().contains("Connection refused") {
+                                    warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
+                                } else if error.to_string().contains("Transport") {
+                                    warn!("   ℹ Hint: Transport protocol negotiation failed.");
+                                }
+                                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
+                            } else {
+                                error!("❌ Outgoing connection error to unknown peer: {}", error);
+                            }
                                 // Check if this error is for an unreachable address before recording it
-                                let is_unreachable_addr = if let Some(pid) = peer_id {
-                                    if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
-                                        if !ma_plausibly_reachable(&bad_ma) {
-                                            swarm.behaviour_mut().kademlia.remove_address(&pid, &bad_ma);
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
+                                // let is_unreachable_addr = if let Some(pid) = peer_id {
+                                //     if let Some(bad_ma) = extract_multiaddr_from_error_str(&error.to_string()) {
+                                //         if !ma_plausibly_reachable(&bad_ma) {
+                                //             swarm.behaviour_mut().kademlia.remove_address(&pid, &bad_ma);
+                                //             true
+                                //         } else {
+                                //             false
+                                //         }
+                                //     } else {
+                                //         false
+                                //     }
+                                // } else {
+                                //     false
+                                // };
 
-                                // Only record errors for reachable addresses
-                                if !is_unreachable_addr {
-                                    if let Ok(mut m) = metrics.try_lock() {
-                                        m.last_error = Some(error.to_string());
-                                        m.last_error_at = Some(SystemTime::now());
-                                        if let Some(pid) = peer_id {
-                                            if bootstrap_peer_ids.contains(&pid) {
-                                                m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
-                                            }
-                                        }
-                                    }
-                                }
+                                // // Only record errors for reachable addresses
+                                // if !is_unreachable_addr {
+                                //     if let Ok(mut m) = metrics.try_lock() {
+                                //         m.last_error = Some(error.to_string());
+                                //         m.last_error_at = Some(SystemTime::now());
+                                //         if let Some(pid) = peer_id {
+                                //             if bootstrap_peer_ids.contains(&pid) {
+                                //                 m.bootstrap_failures = m.bootstrap_failures.saturating_add(1);
+                                //             }
+                                //         }
+                                //     }
+                                // }
 
-                                if let Some(pid) = peer_id {
-                                    // Only log error for addresses that should be reachable
-                                    if !is_unreachable_addr {
-                                        error!("❌ Outgoing connection error to {}: {}", pid, error);
+                                // if let Some(pid) = peer_id {
+                                //     // Only log error for addresses that should be reachable
+                                //     if !is_unreachable_addr {
+                                //         error!("❌ Outgoing connection error to {}: {}", pid, error);
 
-                                        let is_bootstrap = bootstrap_peer_ids.contains(&pid);
-                                        if error.to_string().contains("rsa") {
-                                            error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
-                                        } else if error.to_string().contains("Timeout") {
-                                            if is_bootstrap {
-                                                warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
-                                            } else {
-                                                warn!("   ℹ Hint: Peer may be unreachable (timeout).");
-                                            }
-                                        } else if error.to_string().contains("Connection refused") {
-                                            if is_bootstrap {
-                                                warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
-                                            } else {
-                                                warn!("   ℹ Hint: Peer is not accepting connections.");
-                                            }
-                                        } else if error.to_string().contains("Transport") {
-                                            warn!("   ℹ Hint: Transport protocol negotiation failed.");
-                                        }
-                                    } else {
-                                        debug!("⏭️ Skipped connection to unreachable address for {}: {}", pid, error);
-                                    }
-                                } else {
-                                    error!("❌ Outgoing connection error to unknown peer: {}", error);
-                                }
+                                //         let is_bootstrap = bootstrap_peer_ids.contains(&pid);
+                                //         if error.to_string().contains("rsa") {
+                                //             error!("   ℹ Hint: This node uses RSA keys. Enable 'rsa' feature if needed.");
+                                //         } else if error.to_string().contains("Timeout") {
+                                //             if is_bootstrap {
+                                //                 warn!("   ℹ Hint: Bootstrap nodes may be unreachable or overloaded.");
+                                //             } else {
+                                //                 warn!("   ℹ Hint: Peer may be unreachable (timeout).");
+                                //             }
+                                //         } else if error.to_string().contains("Connection refused") {
+                                //             if is_bootstrap {
+                                //                 warn!("   ℹ Hint: Bootstrap nodes are not accepting connections.");
+                                //             } else {
+                                //                 warn!("   ℹ Hint: Peer is not accepting connections.");
+                                //             }
+                                //         } else if error.to_string().contains("Transport") {
+                                //             warn!("   ℹ Hint: Transport protocol negotiation failed.");
+                                //         }
+                                //     } else {
+                                //         debug!("⏭️ Skipped connection to unreachable address for {}: {}", pid, error);
+                                //     }
+                                // } else {
+                                //     error!("❌ Outgoing connection error to unknown peer: {}", error);
+                                // }
                                 let _ = event_tx.send(DhtEvent::Error(format!("Connection failed: {}", error))).await;
                             }
                             SwarmEvent::Behaviour(DhtBehaviourEvent::ProxyRr(ev)) if !is_bootstrap => {
@@ -3703,18 +3687,6 @@ async fn handle_kademlia_event(
         }
         KademliaEvent::RoutablePeer { peer, address, .. } => {
             debug!("Peer {} became routable", peer);
-            // if !ma_plausibly_reachable(&address) {
-            //     swarm
-            //         .behaviour_mut()
-            //         .kademlia
-            //         .remove_address(&peer, &address);
-            //     debug!(
-            //         "⏭️ Kad RoutablePeer ignored (unreachable): {} -> {}",
-            //         peer, address
-            //     );
-            // } else {
-            //     debug!("✅ Kad RoutablePeer accepted: {} -> {}", peer, address);
-            // }
         }
         KademliaEvent::OutboundQueryProgressed { id, result, .. } => {
             match result {
@@ -4433,30 +4405,44 @@ async fn handle_identify_event(
                     peer_selection.lock().await.update_peer_metrics(metrics);
                 }
 
-                if !reachable_addrs.is_empty() {
-                    let mut relay_peers = relay_capable_peers.lock().await;
-                    relay_peers.insert(peer_id, reachable_addrs.clone());
-                    info!(
-                        "✅ Added {} to relay-capable peers list ({} addresses)",
-                        peer_id,
-                        reachable_addrs.len()
-                    );
-                    for (i, addr) in reachable_addrs.iter().enumerate().take(3) {
-                        info!("   Relay address {}: {}", i + 1, addr);
-                        if let Err(e) = swarm.listen_on(
-                            addr.clone()
-                                .with(Protocol::P2p(peer_id))
-                                .with(Protocol::P2pCircuit),
-                        ) {
-                            info!("   Failed to listen on relay address: {}", e);
-                        } else {
+                // randomly pick a relay address to avoid stressing a single relay
+                let mut indices: Vec<usize> = (0..reachable_addrs.len()).collect();
+                indices.shuffle(&mut rand::thread_rng());
+
+                let mut success = false;
+
+                for i in indices {
+                    let addr = &reachable_addrs[i];
+
+                    let relay_addr = addr
+                        .clone()
+                        .with(Protocol::P2p(peer_id))
+                        .with(Protocol::P2pCircuit);
+
+                    match swarm.listen_on(relay_addr.clone()) {
+                        Ok(_) => {
+                            info!("Success: Listening on relay address {}: {}", i + 1, addr);
+
+                            // Advertise this circuit address to others
                             swarm.add_external_address(
-                                addr.clone()
-                                    .with(Protocol::P2pCircuit)
-                                    .with(Protocol::P2p(*local_peer_id)),
+                                relay_addr.with(Protocol::P2p(*local_peer_id)),
                             );
+
+                            success = true;
+                            break; // Exit the loop immediately on success
+                        }
+                        Err(e) => {
+                            // Log the failure but continue to the next iteration
+                            info!("Failed relay address {} ({}): {}", i + 1, addr, e);
                         }
                     }
+                }
+
+                if !success {
+                    info!(
+                        "Could not listen on any addresses for relay peer {}",
+                        peer_id
+                    );
                 }
             }
 
@@ -5381,22 +5367,6 @@ impl DhtService {
         };
         let relay_server_toggle = toggle::Toggle::from(relay_server_behaviour);
 
-        // let mut behaviour = Some(DhtBehaviour {
-        //     kademlia,
-        //     identify,
-        //     mdns: mdns_toggle,
-        //     bitswap,
-        //     ping: Ping::new(ping::Config::new()),
-        //     proxy_rr,
-        //     webrtc_signaling_rr,
-        //     key_request,
-        //     autonat_client: autonat_client_toggle,
-        //     autonat_server: autonat_server_toggle,
-        //     relay_client: relay_client_behaviour,
-        //     relay_server: relay_server_toggle,
-        //     dcutr: dcutr_toggle,
-        // });
-
         let bootstrap_set: HashSet<String> = bootstrap_nodes.iter().cloned().collect();
         let mut autonat_targets: HashSet<String> = if enable_autonat && !autonat_servers.is_empty()
         {
@@ -5457,20 +5427,9 @@ impl DhtService {
             HashSet::new()
         };
 
-        // Use the new relay-aware transport builder
-        // let noise_cfg = noise::Config::new(keypair)?;
-        // let transport = build_transport_with_relay(&local_key, relay_transport, proxy_address)?;
-
-        // Extract behaviour or return error if already taken
-        // let behaviour_instance = behaviour
-        // .take()
-        // .ok_or_else(|| Box::<dyn Error>::from("behaviour already taken"))?;
-
         // Create the swarm
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
-            // .with_other_transport(|| Ok(transport))
-            // .map_err(|e| format!("Failed to create libp2p transport: {}", e))?
             .with_tcp(
                 tcp::Config::default().nodelay(true),
                 noise::Config::new,
@@ -5500,48 +5459,41 @@ impl DhtService {
             )
             .build();
 
-        // Listen on the specified port
-        // let listen_addr_quic: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
+        // Always listen on the specified port
+        let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
+        swarm.listen_on(tcp_addr)?;
 
-        if is_bootstrap {
-            let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
-            swarm.listen_on(listen_addr)?;
-        } else {
-            swarm
-                .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
-                .unwrap();
-            swarm
-                .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-                .unwrap();
-        }
+        // QUIC also bound to the same port (udp)
+        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port).parse()?;
+        swarm.listen_on(quic_addr)?;
         // Clean up any unreachable addresses from Kademlia's routing table at startup
         // This removes stale localhost/private addresses that may have been persisted
-        // {
-        //     let kademlia = swarm.behaviour_mut().kademlia.kbuckets();
-        //     let mut addrs_to_remove: Vec<(PeerId, Multiaddr)> = Vec::new();
+        {
+            let kademlia = swarm.behaviour_mut().kademlia.kbuckets();
+            let mut addrs_to_remove: Vec<(PeerId, Multiaddr)> = Vec::new();
 
-        //     for bucket in kademlia {
-        //         for entry in bucket.iter() {
-        //             let peer_id = entry.node.key.preimage();
-        //             for addr in entry.node.value.iter() {
-        //                 if !ma_plausibly_reachable(addr) {
-        //                     addrs_to_remove.push((*peer_id, addr.clone()));
-        //                 }
-        //             }
-        //         }
-        //     }
+            for bucket in kademlia {
+                for entry in bucket.iter() {
+                    let peer_id = entry.node.key.preimage();
+                    for addr in entry.node.value.iter() {
+                        if !ma_plausibly_reachable(addr) {
+                            addrs_to_remove.push((*peer_id, addr.clone()));
+                        }
+                    }
+                }
+            }
 
-        //     for (peer_id, addr) in addrs_to_remove {
-        //         swarm
-        //             .behaviour_mut()
-        //             .kademlia
-        //             .remove_address(&peer_id, &addr);
-        //         debug!(
-        //             "🧹 Cleaned up unreachable address at startup: {} -> {}",
-        //             peer_id, addr
-        //         );
-        //     }
-        // }
+            for (peer_id, addr) in addrs_to_remove {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .remove_address(&peer_id, &addr);
+                debug!(
+                    "🧹 Cleaned up unreachable address at startup: {} -> {}",
+                    peer_id, addr
+                );
+            }
+        }
 
         // ---- advertise external addresses so relay reservations include routable addrs
         let mut ext_addrs: Vec<Multiaddr> = Vec::new();
