@@ -214,6 +214,10 @@ pub enum DhtCommand {
         info_hash: String,
         sender: oneshot::Sender<Option<FileMetadata>>,
     },
+    SearchPeersByInfohash {
+        info_hash: String,
+        sender: oneshot::Sender<Result<Vec<String>, String>>,
+    },
     SearchFile(String),
     DownloadFile(FileMetadata, String),
     ConnectPeer(String),
@@ -1880,6 +1884,18 @@ async fn run_dht_node(
                                 let search = PendingInfohashSearch { id: 0, sender };
                                 pending_infohash_searches.lock().await.insert(query_id, search);
                             }
+                            Some(DhtCommand::SearchPeersByInfohash { info_hash, sender }) => {
+                                let key = kad::RecordKey::new(&info_hash.as_bytes());
+                                let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
+                                info!("Searching for torrent providers (info_hash): {} (query: {:?})", info_hash, query_id);
+
+                                get_providers_queries.lock().await.insert(query_id, (info_hash.clone(), std::time::Instant::now()));
+                                let pending_query = PendingProviderQuery {
+                                    id: 0,
+                                    sender,
+                                };
+                                pending_provider_queries.lock().await.insert(info_hash, pending_query);
+                            }
                             Some(DhtCommand::SetPrivacyProxies { addresses }) => {
                                 info!("Updating privacy proxy targets ({} addresses)", addresses.len());
 
@@ -2878,9 +2894,9 @@ async fn run_dht_node(
                                     .await;
                             }
                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                                warn!("❌ DISCONNECTED from peer: {}", peer_id);
-                                warn!("   Cause: {:?}", cause);
-                                swarm.behaviour_mut().kademlia.remove_peer(peer_id);
+                                // warn!("❌ DISCONNECTED from peer: {}", peer_id);
+                                // warn!("   Cause: {:?}", cause);
+                                swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
 
                                 let peers_count = {
                                     let mut peers = connected_peers.lock().await;
@@ -5960,7 +5976,7 @@ impl DhtService {
             return Ok(None);
         }
 
-        let timeout_duration = Duration::from_millis(timeout_ms);
+        let tzimeout_duration = Duration::from_millis(timeout_ms);
         let waiter_id = self.search_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
 
@@ -5990,7 +6006,7 @@ impl DhtService {
             return Err(err.to_string());
         }
 
-        match tokio::time::timeout(timeout_duration, rx).await {
+        match tokio::time::timeout(tzimeout_duration, rx).await {
             Ok(Ok(SearchResponse::Found(metadata))) => Ok(Some(metadata)),
             Ok(Ok(SearchResponse::NotFound)) => Ok(None),
             Ok(Err(_)) => Err("Search channel closed".into()),

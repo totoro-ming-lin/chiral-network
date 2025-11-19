@@ -154,7 +154,13 @@ pub struct Ed2kSourceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 }
-
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Ed2kDownloadStatus {
+    pub progress: f32,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub state: String,
+}
 impl Ed2kSourceInfo {
     pub fn from_ed2k_link(link: &str) -> Result<Self, Ed2kError> {
         let Some(parts_str) = link.strip_prefix("ed2k://|") else {
