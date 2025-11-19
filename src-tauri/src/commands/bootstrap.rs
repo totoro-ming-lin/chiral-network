@@ -9,7 +9,7 @@ pub fn get_bootstrap_nodes() -> Vec<String> {
         //     .to_string(),
         // "/ip4/104.198.62.217/tcp/4001/p2p/12D3KooWPpgX9ZigUgdo6KKMfCjPSD5G6m2iXRBvEzch2SeQKJym"
         //     .to_string(),
-        "/ip4/104.198.62.217/tcp/4001/p2p/12D3KooWETLNJUVLbkAbenbSPPdwN9ZLkBU3TLfyAeEUW2dsVptr"
+        "/ip4/104.198.62.217/tcp/4005/p2p/12D3KooWETLNJUVLbkAbenbSPPdwN9ZLkBU3TLfyAeEUW2dsVptr"
             .to_string(),
         "/ip4/104.198.62.217/tcp/4002/p2p/12D3KooWGV5BUSYMhNMrhdPh9EUbuLrvAiDsMXEMRpGGvt4LQneA"
             .to_string(),
