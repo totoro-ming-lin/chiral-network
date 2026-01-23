@@ -2,11 +2,16 @@ pub mod models;
 // pub mod protocol;
 pub use self::models::*;
 use bon::Builder;
+use libp2p::kad::RecordKey;
 use rand::seq::SliceRandom;
 // use self::protocol::*;
 use crate::config::CHAIN_ID;
 use crate::download_source::HttpSourceInfo;
 use crate::encryption::EncryptedAesKeyBundle;
+use crate::gossipsub_metadata::{
+    derive_protocols, file_seeder_topic, general_seeder_topic, GossipSubManager, ProtocolDetails,
+    SeederFileInfo, SeederGeneralInfo,
+};
 use serde_bytes;
 use x25519_dalek::PublicKey;
 /// Helper function to deserialize CIDs from JSON values that may be strings or Cid objects.
@@ -263,11 +268,14 @@ static LAST_CONNECTION_ERROR_LOG: AtomicU64 = AtomicU64::new(0);
 use libp2p::{
     autonat::v2,
     core::{
-        muxing::StreamMuxerBox,
         // FIXED E0432: ListenerEvent is removed, only import what is available.
-        transport::{Boxed, DialOpts, ListenerId, Transport, TransportError, TransportEvent},
+        transport::{DialOpts, ListenerId, Transport, TransportError, TransportEvent},
     },
     dcutr,
+    gossipsub::{
+        Behaviour as GossipsubBehaviour, ConfigBuilder as GossipsubConfigBuilder,
+        Event as GossipsubEvent, MessageAuthenticity, ValidationMode,
+    },
     identify::{self, Event as IdentifyEvent},
     identity,
     kad::{
@@ -287,6 +295,7 @@ const EXPECTED_PROTOCOL_VERSION: &str = "/chiral/1.0.0";
 const MAX_MULTIHASH_LENGHT: usize = 64;
 /// Prefix for DHT records that map a torrent info_hash to a Chiral Merkle root.
 const INFO_HASH_PREFIX: &str = "info_hash_idx::";
+static RELAY_KEY_IDENT: Bytes = Bytes::from_static(b"chiral:service:relay");
 pub const RAW_CODEC: u64 = 0x55;
 
 /// thread-safe, mutable block store
@@ -307,6 +316,7 @@ struct DhtBehaviour {
     relay_server: toggle::Toggle<relay::Behaviour>,
     dcutr: toggle::Toggle<dcutr::Behaviour>,
     upnp: toggle::Toggle<upnp::tokio::Behaviour>,
+    gossipsub: GossipsubBehaviour,
 }
 #[derive(Debug)]
 pub enum DhtCommand {
@@ -478,6 +488,55 @@ pub enum DhtEvent {
     PaymentNotificationReceived {
         from_peer: String,
         payload: serde_json::Value,
+    },
+
+    // Progressive search events
+    SearchStarted {
+        file_hash: String,
+        timestamp: u64,
+    },
+
+    DhtMetadataFound {
+        file_hash: String,
+        file_name: String,
+        file_size: u64,
+        created_at: u64,
+        mime_type: Option<String>,
+    },
+
+    ProvidersFound {
+        file_hash: String,
+        providers: Vec<String>, // PeerID strings
+        count: usize,
+    },
+
+    SeederGeneralInfoFound {
+        file_hash: String,
+        seeder_index: usize,
+        peer_id: String,
+        wallet_address: String,
+        default_price_per_mb: f64,
+        supported_protocols: Vec<String>,
+    },
+
+    SeederFileInfoFound {
+        file_hash: String,
+        seeder_index: usize,
+        peer_id: String,
+        price_per_mb: Option<f64>,
+        protocol_details: serde_json::Value, // Serialized ProtocolDetails
+    },
+
+    SearchComplete {
+        file_hash: String,
+        total_seeders: usize,
+        duration_ms: u64,
+    },
+
+    SearchTimeout {
+        file_hash: String,
+        partial_seeders: usize,
+        missing_count: usize,
     },
 }
 
@@ -762,6 +821,7 @@ fn construct_file_metadata_from_json_simple(
             .get("manifest")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        encryption: None, // Not included in DHT records
     }
 }
 
@@ -1364,6 +1424,28 @@ async fn run_dht_node(
     // Track peers that support relay (discovered via identify protocol)
     let relay_capable_peers: Arc<Mutex<HashMap<PeerId, Vec<Multiaddr>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Initialize GossipSub manager for seeder metadata distribution
+    let gossipsub_manager = Arc::new(GossipSubManager::new());
+
+    // Storage for published metadata to enable periodic republishing
+    let published_general_info: Arc<Mutex<Option<SeederGeneralInfo>>> = Arc::new(Mutex::new(None));
+    let published_files: Arc<Mutex<HashMap<String, SeederFileInfo>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Periodic cleanup for GossipSub cache (every 30 minutes)
+    let gossipsub_cleanup_manager = gossipsub_manager.clone();
+    tokio::spawn(async move {
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30 * 60));
+        cleanup_interval.tick().await; // Skip first tick
+        loop {
+            cleanup_interval.tick().await;
+            gossipsub_cleanup_manager
+                .cleanup_old_entries(3600) // Remove entries older than 1 hour
+                .await;
+        }
+    });
+
     let mut dht_maintenance_interval = tokio::time::interval(Duration::from_secs(30 * 60));
     dht_maintenance_interval.tick().await;
     // Periodic relay discovery interval (every 5 minutes if autorelay is enabled)
@@ -1373,6 +1455,13 @@ async fn run_dht_node(
         tokio::time::interval(Duration::from_secs(24 * 60 * 60)) // 24 hours if disabled
     };
     relay_discovery_interval.tick().await;
+
+    // Periodic GossipSub publishing intervals (1 second)
+    let mut gossipsub_general_interval = tokio::time::interval(Duration::from_secs(1));
+    gossipsub_general_interval.tick().await; // Skip first tick
+    let mut gossipsub_files_interval = tokio::time::interval(Duration::from_secs(1));
+    gossipsub_files_interval.tick().await; // Skip first tick
+
     // Periodic bootstrap interval
 
     /// Creates a proper circuit relay address for connecting through a relay peer
@@ -1481,11 +1570,50 @@ async fn run_dht_node(
                             // Periodic relay discovery - automatically discover relay providers in DHT
                             _ = relay_discovery_interval.tick(), if enable_autorelay => {
                                 info!("🔍 Starting periodic relay discovery");
-                                let relay_key = kad::RecordKey::new(b"chiral:service:relay");
-                                let query_id = swarm.behaviour_mut().kademlia.get_providers(relay_key);
-                                // Store a dummy sender - we'll handle results in handle_kademlia_event
-                                // The discovered relays will be automatically used by relay client when needed
+                                let relay_key = kad::RecordKey::new(&RELAY_KEY_IDENT);
+                                let query_id = swarm.behaviour_mut().kademlia.get_providers(relay_key.clone());
                                 info!("🔍 Periodic relay discovery started (QueryId: {:?})", query_id);
+                            }
+
+                            // Periodic GossipSub general seeder info publishing (1s intervals)
+                            _ = gossipsub_general_interval.tick() => {
+                                let general_info_opt = published_general_info.lock().await.clone();
+                                if let Some(general_info) = general_info_opt {
+
+                                    let general_topic = general_seeder_topic(&peer_id);
+                                    match serde_json::to_vec(&general_info) {
+                                        Ok(data) => {
+                                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(general_topic.clone(), data) {
+                                                debug!("Failed to publish general seeder info: {}", e);
+                                            } else {
+                                                debug!("📣 Republished general seeder info");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to serialize general seeder info: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Periodic GossipSub file-specific info publishing (1s intervals)
+                            _ = gossipsub_files_interval.tick() => {
+                                let files = published_files.lock().await.clone();
+                                for (file_hash, file_info) in files.iter() {
+                                    let file_topic = file_seeder_topic(&peer_id, file_hash);
+                                    match serde_json::to_vec(&file_info) {
+                                        Ok(data) => {
+                                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(file_topic.clone(), data) {
+                                                debug!("Failed to publish file info for {}: {}", file_hash, e);
+                                            } else {
+                                                debug!("📣 Republished file info for {}", file_hash);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("Failed to serialize file info for {}: {}", file_hash, e);
+                                        }
+                                    }
+                                }
                             }
 
                             cmd = cmd_rx.recv() => {
@@ -1499,12 +1627,9 @@ async fn run_dht_node(
             let now = unix_timestamp();
             let peer_id_str = peer_id.to_string();
 
-            // 1. Resolve naming: use merkle_root as the identifier
-            info!("🔍 DEBUG DHT PUBLISH: Local peer_id = {}", peer_id_str);
-            info!("🔍 DEBUG DHT PUBLISH: Merkle root = {}", metadata.merkle_root);
+            info!("📤 Publishing file to DHT+GossipSub: peer={}, hash={}", peer_id_str, metadata.merkle_root);
 
-            // 2. Define merged_metadata by checking the local cache
-            // This fixes the "cannot find value merged_metadata" errors
+            // 1. Merge with existing metadata if present
             let merged_metadata = {
                 let cache = file_metadata_cache.lock().await;
                 if let Some(existing) = cache.get(&metadata.merkle_root) {
@@ -1514,42 +1639,21 @@ async fn run_dht_node(
                 }
             };
 
-            // 3. Update local cache with the merged result
+            // 2. Update local cache
             {
                 let mut cache = file_metadata_cache.lock().await;
                 cache.insert(merged_metadata.merkle_root.clone(), merged_metadata.clone());
             }
 
-            // 4. Create the JSON for DHT storage
-            let dht_metadata = serde_json::json!({
-                "file_hash": merged_metadata.merkle_root, // Changed from file_hash
-                "merkle_root": merged_metadata.merkle_root,
-                "file_name": merged_metadata.file_name,
-                "file_size": merged_metadata.file_size,
-                "created_at": merged_metadata.created_at,
-                "mime_type": merged_metadata.mime_type,
-                "is_encrypted": merged_metadata.is_encrypted,
-                "encryption_method": merged_metadata.encryption_method,
-                "key_fingerprint": merged_metadata.key_fingerprint,
-                "parent_hash": merged_metadata.parent_hash,
-                "cids": merged_metadata.cids,
-                "encrypted_key_bundle": merged_metadata.encrypted_key_bundle,
-                "info_hash": merged_metadata.info_hash,
-                "trackers": merged_metadata.trackers,
-                "seeders": merged_metadata.seeders,
-                "price": merged_metadata.price,
-                "uploader_address": merged_metadata.uploader_address,
-                "httpSources": merged_metadata.http_sources,
-                "ed2kSources": merged_metadata.ed2k_sources,
-                "ftpSources": merged_metadata.ftp_sources,
-            });
-
+            // 3. Create MINIMAL DHT record (discovery data only)
+            let dht_record = DhtFileRecord::from(merged_metadata.clone());
             let record_key = kad::RecordKey::new(&merged_metadata.merkle_root.as_bytes());
 
-            let dht_record_data = match serde_json::to_vec(&dht_metadata) {
+            let dht_record_data = match serde_json::to_vec(&dht_record) {
                 Ok(data) => data,
                 Err(e) => {
-                    error!("Failed to serialize DHT metadata: {}", e);
+                    error!("Failed to serialize minimal DHT record: {}", e);
+                    let _ = event_tx.send(DhtEvent::Error(format!("Failed to serialize DHT record: {}", e))).await;
                     return;
                 }
             };
@@ -1561,9 +1665,9 @@ async fn run_dht_node(
                 expires: None,
             };
 
+            // 4. Calculate quorum
             let connected_peers_count = connected_peers.lock().await.len();
             let replication_factor = 3;
-
             let quorum = if connected_peers_count >= 3 {
                 let half_up = (connected_peers_count + 1) / 2;
                 let target = std::cmp::min(replication_factor, std::cmp::max(1, half_up));
@@ -1576,38 +1680,115 @@ async fn run_dht_node(
                 kad::Quorum::One
             };
 
+            // 5. Publish minimal record to DHT
             match swarm.behaviour_mut().kademlia.put_record(record, quorum) {
                 Ok(_) => {
-                    // FIX: Use indexing for JSON value access instead of dot notation
-                    info!("put file: {}", dht_metadata["file_hash"]);
+                    info!("✅ Published minimal DHT record for {}", merged_metadata.merkle_root);
                 }
                 Err(e) => {
-                    error!("failed to put file {}: {}", merged_metadata.merkle_root, e);
-                    let _ = event_tx.send(DhtEvent::Error(format!("failed to start providing: {}", e))).await;
+                    error!("❌ Failed to publish DHT record for {}: {}", merged_metadata.merkle_root, e);
+                    let _ = event_tx.send(DhtEvent::Error(format!("Failed to publish DHT record: {}", e))).await;
                 }
             }
 
-            match swarm.behaviour_mut().kademlia.start_providing(record_key) {
+            // 6. Announce as provider
+            match swarm.behaviour_mut().kademlia.start_providing(record_key.clone()) {
                 Ok(_) => {
-                    // FIX: Use indexing for JSON value access instead of dot notation
-                    info!("providing file: {}", dht_metadata["file_hash"]);
+                    info!("✅ Announced as provider for {}", merged_metadata.merkle_root);
                 }
                 Err(e) => {
-                    error!("failed to start providing file {}: {}", merged_metadata.merkle_root, e);
-                    let _ = event_tx.send(DhtEvent::Error(format!("failed to start providing: {}", e))).await;
+                    error!("❌ Failed to announce provider for {}: {}", merged_metadata.merkle_root, e);
+                    let _ = event_tx.send(DhtEvent::Error(format!("Failed to announce provider: {}", e))).await;
                 }
             }
 
-            // 5. Notify frontend and respond to the command
-            info!("🔍 DEBUG DHT: Sending PublishedFile event for {}", merged_metadata.merkle_root);
-            let _ = event_tx.send(DhtEvent::PublishedFile(merged_metadata.clone())).await;
+            // 7. Subscribe to GossipSub topics
+            let general_topic = general_seeder_topic(&peer_id);
+            let file_topic = file_seeder_topic(&peer_id, &merged_metadata.merkle_root);
 
+            if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&general_topic) {
+                warn!("Failed to subscribe to general topic: {}", e);
+            } else {
+                info!("📡 Subscribed to general topic: {}", general_topic);
+            }
+
+            if let Err(e) = swarm.behaviour_mut().gossipsub.subscribe(&file_topic) {
+                warn!("Failed to subscribe to file topic: {}", e);
+            } else {
+                info!("📡 Subscribed to file topic: {}", file_topic);
+            }
+
+            // 8. Prepare GossipSub metadata
+            let general_info = SeederGeneralInfo {
+                peer_id: peer_id_str.clone(),
+                wallet_address: merged_metadata.uploader_address.clone().unwrap_or_default(),
+                default_price_per_mb: merged_metadata.price,
+                supported_protocols: derive_protocols(&merged_metadata),
+                timestamp: now,
+            };
+
+            let file_info = SeederFileInfo {
+                peer_id: peer_id_str.clone(),
+                file_hash: merged_metadata.merkle_root.clone(),
+                price_per_mb: Some(merged_metadata.price),
+                protocol_details: ProtocolDetails::from(merged_metadata.clone()),
+                timestamp: now,
+            };
+
+            // 9. Publish to GossipSub (authenticated by libp2p automatically)
+            let general_msg = match serde_json::to_vec(&general_info) {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Failed to serialize general info: {}", e);
+                    return;
+                }
+            };
+
+            let file_msg = match serde_json::to_vec(&file_info) {
+                Ok(data) => data,
+                Err(e) => {
+                    error!("Failed to serialize file info: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(general_topic, general_msg) {
+                warn!("Failed to publish general info to GossipSub: {}", e);
+            } else {
+                info!("📣 Published general seeder info to GossipSub");
+            }
+
+            // Store general info for periodic republishing
+            {
+                let mut stored_general = published_general_info.lock().await;
+                *stored_general = Some(general_info);
+            }
+
+            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(file_topic, file_msg) {
+                warn!("Failed to publish file info to GossipSub: {}", e);
+            } else {
+                info!("📣 Published file-specific info to GossipSub");
+            }
+
+            // Store file-specific info for periodic republishing
+            {
+                let mut stored_files = published_files.lock().await;
+                stored_files.insert(merged_metadata.merkle_root.clone(), file_info);
+            }
+
+            // 10. Publish info_hash index if present
             if let Some(info_hash) = &merged_metadata.info_hash {
                 let index_key = format!("{}{}", INFO_HASH_PREFIX, info_hash);
-                let index_record = Record::new(index_key.as_bytes().to_vec(), merged_metadata.merkle_root.as_bytes().to_vec());
+                let index_record = Record::new(
+                    index_key.as_bytes().to_vec(),
+                    merged_metadata.merkle_root.as_bytes().to_vec(),
+                );
                 let _ = swarm.behaviour_mut().kademlia.put_record(index_record, quorum);
             }
 
+            // 11. Notify frontend and respond
+            info!("✅ File published successfully: {}", merged_metadata.merkle_root);
+            let _ = event_tx.send(DhtEvent::PublishedFile(merged_metadata.clone())).await;
             let _ = response_tx.send(merged_metadata);
         }
                                         Some(DhtCommand::StoreBlocks { blocks, root_cid, mut metadata }) => {
@@ -1855,24 +2036,48 @@ async fn run_dht_node(
                                                 }
                                             }
 
+                                            // Remove from published files (stop periodic republishing)
+                                            {
+                                                let mut stored_files = published_files.lock().await;
+                                                stored_files.remove(&file_hash);
+                                            }
+
+                                            // Unsubscribe from GossipSub file topic
+                                            let file_topic = file_seeder_topic(&peer_id, &file_hash);
+                                            if let Err(e) = swarm.behaviour_mut().gossipsub.unsubscribe(&file_topic) {
+                                                debug!("Failed to unsubscribe from file topic: {}", e);
+                                            } else {
+                                                info!("📡 Unsubscribed from file topic: {}", file_topic);
+                                            }
+
                                             debug!("StopPublish completed for {}", file_hash);
                                         }
                                     Some(DhtCommand::SearchFile { file_hash, sender }) => {
                                         info!("🔍 Received search command for file: {}", file_hash);
-                                        info!("🔍 Initiating DHT queries for file search");
-                                        // Query both the metadata record AND the provider records
-                                        // This ensures we find the file even if only provider announcements exist
+                                        info!("🔍 Initiating DHT+GossipSub queries for file search");
+
+                                        // Emit search started event immediately
+                                        let _ = event_tx.send(DhtEvent::SearchStarted {
+                                            file_hash: file_hash.clone(),
+                                            timestamp: unix_timestamp(),
+                                        }).await;
+
                                         let key = kad::RecordKey::new(&file_hash.as_bytes());
 
                                         // Create a pending search query to track both lookups
                                         let mut pending_query = PendingSearchQuery::new(file_hash.clone(), sender);
 
-                                        // Start record lookup
+                                        // Start record lookup (for minimal DHT metadata)
                                         let record_query_id = swarm.behaviour_mut().kademlia.get_record(key.clone());
-                                        info!("🔍 Searching for file metadata: {} (record query: {:?})", file_hash, record_query_id);
+                                        info!("🔍 Searching for DHT record: {} (query: {:?})", file_hash, record_query_id);
                                         pending_query.record_query_id = Some(record_query_id);
 
-                                        // Track both queries under the record query ID (primary)
+                                        // Start provider lookup (will trigger GossipSub subscription)
+                                        // let providers_query_id = swarm.behaviour_mut().kademlia.get_providers(key);
+                                        // info!("🔍 Searching for providers: {} (query: {:?})", file_hash, providers_query_id);
+                                        // pending_query.providers_query_id = Some(providers_query_id);
+
+                                        // Track query
                                         pending_search_queries.lock().await.insert(record_query_id, pending_query);
                                     }
                                     Some(DhtCommand::SearchByInfohash { info_hash, sender }) => {
@@ -1970,7 +2175,7 @@ async fn run_dht_node(
                                         }
                                     }
                                     Some(DhtCommand::DiscoverRelays { sender }) => {
-                                        let relay_key = kad::RecordKey::new(&b"chiral:service:relay");
+                                let relay_key = kad::RecordKey::new(&RELAY_KEY_IDENT);
                                         let query_id = swarm.behaviour_mut().kademlia.get_providers(relay_key);
                                         pending_relay_discoveries.lock().await.insert(query_id, sender);
                                         info!("🔍 Started discovery for relay services (QueryId: {:?})", query_id);
@@ -2465,6 +2670,7 @@ async fn run_dht_node(
                                             &pending_dht_queries,
                                             &pending_search_queries,
                                             &pending_relay_discoveries,
+                                            &gossipsub_manager,
                                         )
                                         .await;
                                     }
@@ -2932,7 +3138,7 @@ async fn run_dht_node(
                 let total_expected = active_download.total_chunks as usize;
 
                 info!("File {} progress: {}/{} chunks received, {} queries remaining",
-                      file_hash, received_count, total_expected, queries_remaining);
+                    file_hash, received_count, total_expected, queries_remaining);
 
                 if active_download.is_complete() {
                     info!("🎉 Download complete for file {}! Finalizing...", file_hash);
@@ -3110,6 +3316,52 @@ async fn run_dht_node(
                                     }
                                     SwarmEvent::Behaviour(DhtBehaviourEvent::Upnp(upnp_event)) => {
                                         handle_upnp_event(upnp_event, &mut swarm, &event_tx).await;
+                                    }
+                                    SwarmEvent::Behaviour(DhtBehaviourEvent::Gossipsub(gossipsub_event)) => {
+                                        match gossipsub_event {
+                                            GossipsubEvent::Message {
+                                                propagation_source: _,
+                                                message_id: _,
+                                                message,
+                                            } => {
+                                                let topic = message.topic.to_string();
+                                                debug!("📬 Received GossipSub message on topic: {}", topic);
+
+                                                if topic.starts_with("seeder/") && topic.contains("/file/") {
+                                                    // File-specific metadata
+                                                    match serde_json::from_slice::<SeederFileInfo>(&message.data) {
+                                                        Ok(file_info) => {
+                                                            debug!("✅ Cached file info for peer {} and file {}",
+                                                                file_info.peer_id, file_info.file_hash);
+                                                            gossipsub_manager.cache_file_info(file_info).await;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("❌ Failed to parse file info: {}", e);
+                                                        }
+                                                    }
+                                                } else if topic.starts_with("seeder/") {
+                                                    // General seeder info
+                                                    match serde_json::from_slice::<SeederGeneralInfo>(&message.data) {
+                                                        Ok(general_info) => {
+                                                            debug!("✅ Cached general info for peer {}", general_info.peer_id);
+                                                            gossipsub_manager.cache_general_info(general_info).await;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("❌ Failed to parse general info: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            GossipsubEvent::Subscribed { peer_id, topic } => {
+                                                debug!("📡 Peer {} subscribed to topic: {}", peer_id, topic);
+                                            }
+                                            GossipsubEvent::Unsubscribed { peer_id, topic } => {
+                                                debug!("📡 Peer {} unsubscribed from topic: {}", peer_id, topic);
+                                            }
+                                            _ => {
+                                                // Ignore other GossipSub events
+                                            }
+                                        }
                                     }
                                     SwarmEvent::ExternalAddrConfirmed { address, .. } if !is_bootstrap => {
                                         handle_external_addr_confirmed(&mut swarm, &address, &metrics, &event_tx, &proxy_mgr, &pending_provider_registrations, pure_client_mode, force_server_mode)
@@ -3970,6 +4222,7 @@ async fn handle_kademlia_event(
     pending_relay_discoveries: &Arc<
         Mutex<HashMap<kad::QueryId, oneshot::Sender<Result<Vec<String>, String>>>>,
     >,
+    gossipsub_manager: &Arc<GossipSubManager>,
 ) {
     match event {
         KademliaEvent::RoutingUpdated { peer, .. } => {
@@ -4017,10 +4270,10 @@ async fn handle_kademlia_event(
                                     // NOTE: We accept both snake_case and camelCase because different publish paths
                                     // historically stored different key styles (e.g., Bitswap vs legacy paths).
                                     let merkle_root = metadata_json
-                                        .get("merkle_root")
+                                        .get("file_hash")
                                         .and_then(|v| v.as_str())
                                         .or_else(|| {
-                                            metadata_json.get("merkleRoot").and_then(|v| v.as_str())
+                                            metadata_json.get("fileHash").and_then(|v| v.as_str())
                                         });
                                     let file_name = metadata_json
                                         .get("file_name")
@@ -4066,6 +4319,17 @@ async fn handle_kademlia_event(
                                                     created_at_val,
                                                 );
                                             info!("🔧 Metadata constructed successfully");
+
+                                            // Emit minimal DHT metadata immediately
+                                            let _ = event_tx
+                                                .send(DhtEvent::DhtMetadataFound {
+                                                    file_hash: file_hash.to_string(),
+                                                    file_name: file_name_val.to_string(),
+                                                    file_size: file_size_val,
+                                                    created_at: created_at_val,
+                                                    mime_type: metadata.mime_type.clone(),
+                                                })
+                                                .await;
 
                                             // Merge providers with existing seeders from metadata
                                             info!("🔧 Merging providers with metadata seeders");
@@ -4544,7 +4808,7 @@ async fn handle_kademlia_event(
                                 let _ = sender.send(Ok(peers));
                                 return;
                             }
-
+                            drop(pending_relays);
                             // Handle periodic relay discovery (no sender - just log and use)
                             // Check if this is a periodic discovery by checking if the key matches relay service key
                             let key_bytes = key.as_ref();
@@ -4559,8 +4823,9 @@ async fn handle_kademlia_event(
                                         .get_closest_peers(*provider_peer_id);
                                 }
                                 // Continue processing - don't return early for periodic discoveries
+                                // why?
+                                return;
                             }
-                            drop(pending_relays);
 
                             let file_hash = String::from_utf8_lossy(key.as_ref()).to_string();
 
@@ -4573,9 +4838,185 @@ async fn handle_kademlia_event(
                                 file_hash
                             );
 
-                            // Convert providers to string format
+                            // Convert providers to PeerIds and strings
+                            let provider_peer_ids: Vec<PeerId> =
+                                providers.iter().cloned().collect();
                             let provider_strings: Vec<String> =
-                                providers.iter().map(|p| p.to_string()).collect();
+                                provider_peer_ids.iter().map(|p| p.to_string()).collect();
+
+                            // Emit providers found event
+                            let _ = event_tx
+                                .send(DhtEvent::ProvidersFound {
+                                    file_hash: file_hash.clone(),
+                                    providers: provider_strings.clone(),
+                                    count: provider_strings.len(),
+                                })
+                                .await;
+
+                            // Subscribe to GossipSub topics for each provider
+                            info!(
+                                "📡 Subscribing to GossipSub topics for {} providers",
+                                provider_peer_ids.len()
+                            );
+                            for provider_peer_id in &provider_peer_ids {
+                                let general_topic = general_seeder_topic(provider_peer_id);
+                                let file_topic = file_seeder_topic(provider_peer_id, &file_hash);
+
+                                if let Err(e) =
+                                    swarm.behaviour_mut().gossipsub.subscribe(&general_topic)
+                                {
+                                    debug!(
+                                        "Already subscribed to general topic for {}: {}",
+                                        provider_peer_id, e
+                                    );
+                                }
+
+                                if let Err(e) =
+                                    swarm.behaviour_mut().gossipsub.subscribe(&file_topic)
+                                {
+                                    debug!(
+                                        "Already subscribed to file topic for {}: {}",
+                                        provider_peer_id, e
+                                    );
+                                }
+                            }
+
+                            {
+                                // Check for self-download
+                                let is_self_download = provider_peer_ids.contains(local_peer_id);
+
+                                // Start progressive collection with events
+                                let event_sender = event_tx.clone();
+                                let gossipsub_mgr = gossipsub_manager.clone();
+                                let providers = provider_peer_ids.clone();
+                                let hash = file_hash.clone();
+
+                                tokio::spawn(async move {
+                                    use std::collections::HashSet;
+                                    let start = std::time::Instant::now();
+                                    info!(
+                                        "⏳ Starting progressive GossipSub metadata collection..."
+                                    );
+
+                                    // Track which events have been emitted to avoid duplicates
+                                    let mut emitted_general: HashSet<String> = HashSet::new();
+                                    let mut emitted_file: HashSet<String> = HashSet::new();
+
+                                    // Progressive collection with events
+                                    // Wait up to 10 seconds total, checking periodically
+                                    for check in 0..100 {
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(100))
+                                            .await;
+
+                                        // Check each provider for metadata
+                                        for (index, provider_peer_id) in
+                                            providers.iter().enumerate()
+                                        {
+                                            let peer_id_str = provider_peer_id.to_string();
+
+                                            // Check and emit general info if available and not yet emitted
+                                            if !emitted_general.contains(&peer_id_str) {
+                                                if let Some(general_info) = gossipsub_mgr
+                                                    .get_general_info(&peer_id_str)
+                                                    .await
+                                                {
+                                                    let _ = event_sender
+                                                        .send(DhtEvent::SeederGeneralInfoFound {
+                                                            file_hash: hash.clone(),
+                                                            seeder_index: index,
+                                                            peer_id: general_info.peer_id.clone(),
+                                                            wallet_address: general_info
+                                                                .wallet_address
+                                                                .clone(),
+                                                            default_price_per_mb: general_info
+                                                                .default_price_per_mb,
+                                                            supported_protocols: general_info
+                                                                .supported_protocols
+                                                                .clone(),
+                                                        })
+                                                        .await;
+                                                    emitted_general.insert(peer_id_str.clone());
+                                                    debug!(
+                                                        "📤 Emitted general info for seeder {}",
+                                                        index
+                                                    );
+                                                }
+                                            }
+
+                                            // Check and emit file info if available and not yet emitted
+                                            if !emitted_file.contains(&peer_id_str) {
+                                                if let Some(file_info) = gossipsub_mgr
+                                                    .get_file_info(&hash, &peer_id_str)
+                                                    .await
+                                                {
+                                                    let protocol_json = serde_json::to_value(
+                                                        &file_info.protocol_details,
+                                                    )
+                                                    .unwrap_or(serde_json::Value::Null);
+
+                                                    let _ = event_sender
+                                                        .send(DhtEvent::SeederFileInfoFound {
+                                                            file_hash: hash.clone(),
+                                                            seeder_index: index,
+                                                            peer_id: file_info.peer_id.clone(),
+                                                            price_per_mb: file_info.price_per_mb,
+                                                            protocol_details: protocol_json,
+                                                        })
+                                                        .await;
+                                                    emitted_file.insert(peer_id_str.clone());
+                                                    debug!(
+                                                        "📤 Emitted file info for seeder {}",
+                                                        index
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        // Check if we have complete metadata for all seeders
+                                        let mut complete_count = 0;
+                                        for provider_peer_id in &providers {
+                                            let peer_id_str = provider_peer_id.to_string();
+                                            if gossipsub_mgr
+                                                .has_complete_metadata(&hash, &peer_id_str)
+                                                .await
+                                            {
+                                                complete_count += 1;
+                                            }
+                                        }
+
+                                        // If we have all metadata or reached timeout, emit completion
+                                        let duration = start.elapsed();
+                                        if complete_count == providers.len() || check >= 99 {
+                                            let duration_ms = duration.as_millis() as u64;
+
+                                            if complete_count == providers.len() {
+                                                info!("✅ Collected complete metadata from all {} seeders in {}ms", complete_count, duration_ms);
+                                                let _ = event_sender
+                                                    .send(DhtEvent::SearchComplete {
+                                                        file_hash: hash.clone(),
+                                                        total_seeders: complete_count,
+                                                        duration_ms,
+                                                    })
+                                                    .await;
+                                            } else {
+                                                warn!("⚠️ Search timeout after {}ms: {} complete, {} missing",
+                                                        duration_ms, complete_count, providers.len() - complete_count);
+                                                let _ = event_sender
+                                                    .send(DhtEvent::SearchTimeout {
+                                                        file_hash: hash.clone(),
+                                                        partial_seeders: complete_count,
+                                                        missing_count: providers.len()
+                                                            - complete_count,
+                                                    })
+                                                    .await;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                info!("📡 Spawned progressive GossipSub metadata collection task");
+                            }
 
                             // Update pending search queries with found providers (for SearchFile queries)
                             // This is needed because SearchFile runs both GetRecord and GetProviders in parallel
@@ -4992,15 +5433,18 @@ async fn handle_autonat_client_event(
             );
 
             // If we are public, and we have the relay server enabled (even if standby), advertise it!
-            if let Some(_) = swarm.behaviour().relay_server.as_ref() {
-                let relay_key = kad::RecordKey::new(b"chiral:service:relay");
-                if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(relay_key) {
-                    warn!("Failed to advertise relay service: {}", e);
-                } else {
-                    info!("✅ Started providing relay service in DHT (Public IP confirmed)");
-                }
-            }
-
+            // dont think this is an expected behaviour
+            // if let Some(_) = swarm.behaviour().relay_server.as_ref() {
+            //     if let Err(e) = swarm
+            //         .behaviour_mut()
+            //         .kademlia
+            //         .start_providing(relay_key.clone())
+            //     {
+            //         warn!("Failed to advertise relay service: {}", e);
+            //     } else {
+            //         info!("✅ Started providing relay service in DHT (Public IP confirmed)");
+            //     }
+            // }
             (
                 NatReachabilityState::Public,
                 Some(format!(
@@ -5036,9 +5480,14 @@ async fn handle_autonat_client_event(
     // If we just became public and have relay server enabled, advertise it in DHT
     if state == NatReachabilityState::Public && !was_public {
         // Check if relay server is enabled (even if in standby mode)
+        let relay_key = kad::RecordKey::new(&RELAY_KEY_IDENT);
+
         if swarm.behaviour_mut().relay_server.as_ref().is_some() {
-            let relay_key = kad::RecordKey::new(b"chiral:service:relay");
-            match swarm.behaviour_mut().kademlia.start_providing(relay_key) {
+            match swarm
+                .behaviour_mut()
+                .kademlia
+                .start_providing(relay_key.clone())
+            {
                 Ok(query_id) => {
                     info!(
                         "✅ Enabled relay server behavior due to public IP detection (query_id: {:?})",
@@ -5288,8 +5737,13 @@ async fn handle_external_addr_confirmed(
 
     // If we have relay server enabled (even if in standby mode), advertise it in DHT
     if swarm.behaviour_mut().relay_server.as_ref().is_some() {
-        let relay_key = kad::RecordKey::new(b"chiral:service:relay");
-        match swarm.behaviour_mut().kademlia.start_providing(relay_key) {
+        let relay_key = kad::RecordKey::new(&RELAY_KEY_IDENT);
+
+        match swarm
+            .behaviour_mut()
+            .kademlia
+            .start_providing(relay_key.clone())
+        {
             Ok(query_id) => {
                 info!(
                     "✅ Enabled relay server behavior due to public IP detection (query_id: {:?})",
@@ -5409,81 +5863,6 @@ impl Socks5Transport {
     pub fn new(proxy: SocketAddr) -> Self {
         Self { proxy }
     }
-}
-
-/// Build a libp2p transport, optionally tunneling through a SOCKS5 proxy.
-/// - Output type is unified to (PeerId, StreamMuxerBox).
-/// - Dial preference: Relay first, then Direct TCP (or SOCKS5 TCP if proxy is set).
-pub fn build_transport_with_relay(
-    keypair: &identity::Keypair,
-    relay_transport: relay::client::Transport,
-    proxy_address: Option<String>,
-) -> Result<Boxed<(PeerId, StreamMuxerBox)>, Box<dyn Error>> {
-    use libp2p::{
-        core::{muxing::StreamMuxerBox, transport::Boxed, upgrade::Version},
-        noise, tcp, yamux, Transport as _,
-    };
-    use std::{io, net::SocketAddr, time::Duration};
-
-    // === Upgrade stack for direct TCP/SOCKS5 paths ===
-    let noise_cfg = noise::Config::new(keypair)?;
-    let yamux_cfg = yamux::Config::default();
-
-    // TCP/SOCKS5 → (PeerId, StreamMuxerBox)
-    let into_muxed = |t: Boxed<Box<dyn AsyncIo>>| {
-        t.upgrade(Version::V1Lazy)
-            .authenticate(noise_cfg.clone())
-            .multiplex(yamux_cfg.clone())
-            .timeout(Duration::from_secs(20))
-            .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
-            .boxed()
-    };
-
-    // --- Direct TCP path ---
-    let tcp_base: Boxed<Box<dyn AsyncIo>> =
-        tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
-            .map(|s, _| -> Box<dyn AsyncIo> { Box::new(s.0.compat()) })
-            .boxed();
-
-    // --- SOCKS5 path (optional) ---
-    let direct_tcp_muxed: Boxed<(PeerId, StreamMuxerBox)> = match proxy_address {
-        Some(proxy) => {
-            info!(
-                "SOCKS5 enabled. Routing all P2P TCP dialing traffic via {}",
-                proxy
-            );
-            let proxy_addr: SocketAddr = proxy.parse().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Invalid proxy address: {}", e),
-                )
-            })?;
-            let socks5: Boxed<Box<dyn AsyncIo>> = Socks5Transport::new(proxy_addr).boxed();
-            into_muxed(socks5)
-        }
-        None => into_muxed(tcp_base),
-    };
-
-    // --- Relay path: Connection → (PeerId, StreamMuxerBox)
-    // Apply the same upgrade stack to the relay transport
-    let relay_muxed: Boxed<(PeerId, StreamMuxerBox)> = relay_transport
-        .upgrade(Version::V1Lazy)
-        .authenticate(noise_cfg.clone())
-        .multiplex(yamux_cfg.clone())
-        .timeout(Duration::from_secs(20))
-        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
-        .boxed();
-
-    // --- Combine: Relay first, then Direct ---
-    let layered: Boxed<(PeerId, StreamMuxerBox)> =
-        libp2p::core::transport::OrTransport::new(relay_muxed, direct_tcp_muxed)
-            .map(|either, _| match either {
-                futures::future::Either::Left(v) => v,
-                futures::future::Either::Right(v) => v,
-            })
-            .boxed();
-
-    Ok(layered)
 }
 
 impl DhtService {
@@ -5789,7 +6168,6 @@ pub struct DhtConfig<'a> {
 }
 
 impl DhtService {
-    // should maybe be migrated to use DhtConfig at some point...
     async fn _new(
         port: u16,
         bootstrap_nodes: Vec<String>,
@@ -6014,6 +6392,21 @@ impl DhtService {
             None
         };
         let upnp_toggle = toggle::Toggle::from(upnp_behaviour);
+
+        // GossipSub configuration for seeder metadata distribution
+        let gossipsub_config = GossipsubConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(10))
+            .validation_mode(ValidationMode::Strict)
+            .max_transmit_size(262144) // 256 KB
+            .build()
+            .expect("Valid GossipSub config");
+
+        let gossipsub = GossipsubBehaviour::new(
+            MessageAuthenticity::Signed(local_key.clone()),
+            gossipsub_config,
+        )
+        .expect("Failed to create GossipSub behaviour");
+
         let bootstrap_set: HashSet<String> = bootstrap_nodes.iter().cloned().collect();
         let mut autonat_targets: HashSet<String> = if enable_autonat && !autonat_servers.is_empty()
         {
@@ -6105,6 +6498,7 @@ impl DhtService {
                     relay_server: relay_server_toggle,
                     dcutr: dcutr_toggle,
                     upnp: upnp_toggle,
+                    gossipsub,
                 }
             })?
             .with_swarm_config(
@@ -6522,6 +6916,7 @@ impl DhtService {
             trackers: None,
             ed2k_sources: None,
             manifest: None,
+            encryption: None,
         })
     }
 
@@ -6643,13 +7038,6 @@ impl DhtService {
         }
         info!("✅ DHT search command sent successfully");
 
-        // Wait for the validated result
-        // Check DHT health before waiting
-        // let health = self.check_health(3, false).await;
-        // info!(
-        // "🔍 DHT health before search - peers: {}, healthy: {}",
-        // health.peer_count, health.healthy
-        // );
         info!("⏳ Waiting for search result with {}ms timeout", timeout_ms);
         match tokio::time::timeout(timeout_duration, rx).await {
             Ok(Ok(Ok(Some(metadata)))) => {

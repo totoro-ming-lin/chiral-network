@@ -21,6 +21,18 @@
 
   export let metadata: FileMetadata;
   export let isBusy = false;
+  export let isLoading = false; // Progressive search loading state
+  export let loadingSeederCount = 0; // Number of seeders still loading
+  export let seederDetails: Array<{
+    index: number;
+    peerId: string;
+    walletAddress?: string;
+    pricePerMb?: number;
+    protocols?: string[];
+    protocolDetails?: any;
+    hasGeneralInfo: boolean;
+    hasFileInfo: boolean;
+  }> = []; // Detailed seeder information from progressive search
 
   let canAfford = true;
   let checkingBalance = true; // Start as true since we check on mount
@@ -30,6 +42,8 @@
   let showPaymentConfirmDialog = false;
   let showSeedersSelection = false;
   let selectedSeederIndex: number | null = 0;
+  let showSeederDetailsModal = false;
+  let selectedSeederDetails: typeof seederDetails[0] | null = null;
 
   // Use reactive wallet balance from store
   $: userBalance = $wallet.balance;
@@ -45,7 +59,7 @@
 
 
   // Helper function to determine available protocols for a file
-  // Files can be downloaded via multiple protocols if they were uploaded with multiple protocols
+  // this is wrong, should be fixed to actually base it on available protoocls.
   $: availableProtocols = (() => {
     const protocols = [];
     
@@ -56,7 +70,6 @@
     const hasEd2kSources = !!(metadata.ed2kSources && metadata.ed2kSources.length > 0);
     const hasSeeders = !!(metadata.seeders && metadata.seeders.length > 0);
 
-    // WebRTC is available if file has seeders (for P2P transfers)
     const isWebRTCAvailable = hasSeeders && !hasInfoHash && !hasHttpSources && !hasFtpSources && !hasEd2kSources;
 
     // Check for WebRTC (P2P file sharing protocol)
@@ -270,6 +283,20 @@
 
   function cancelDecryptDialog() {
     showDecryptDialog = false;
+  }
+
+  function showSeederInfo(peerId: string) {
+    // Find the seeder details by peer ID
+    const details = seederDetails.find(s => s.peerId === peerId);
+    if (details) {
+      selectedSeederDetails = details;
+      showSeederDetailsModal = true;
+    }
+  }
+
+  function closeSeederDetailsModal() {
+    showSeederDetailsModal = false;
+    selectedSeederDetails = null;
   }
 
   // Favorites functionality
@@ -512,29 +539,64 @@
 
     <!-- Right Column: Available peers -->
     <div class="space-y-3">
-      {#if metadata.seeders?.length}
+      {#if isLoading && loadingSeederCount > 0}
+        <div class="space-y-2">
+          <p class="text-xs uppercase tracking-wide text-muted-foreground">Available peers</p>
+          <div class="space-y-2 max-h-40 overflow-auto pr-1">
+            {#each Array(loadingSeederCount) as _}
+              <div class="flex items-start gap-2 rounded-md border border-border/50 bg-muted/40 p-2 overflow-hidden animate-pulse">
+                <div class="mt-0.5 h-2 w-2 rounded-full bg-gray-300 flex-shrink-0"></div>
+                <div class="space-y-1 flex-1">
+                  <div class="h-4 bg-gray-300 rounded w-3/4"></div>
+                  <div class="h-3 bg-gray-200 rounded w-1/4"></div>
+                </div>
+              </div>
+            {/each}
+          </div>
+          <p class="text-xs text-muted-foreground text-center">Loading seeder information...</p>
+        </div>
+      {:else if metadata.seeders?.length}
         <div class="space-y-2">
           <p class="text-xs uppercase tracking-wide text-muted-foreground">Available peers</p>
           <div class="space-y-2 max-h-40 overflow-auto pr-1">
             {#each seederIds as seeder, index}
-              <div class="flex items-start gap-2 rounded-md border border-border/50 bg-muted/40 p-2 overflow-hidden">
+              {@const details = seederDetails.find(s => s.peerId === seeder.address)}
+              <button
+                type="button"
+                class="w-full flex items-start gap-2 rounded-md border border-border/50 bg-muted/40 p-2 overflow-hidden hover:bg-muted/60 transition-colors cursor-pointer text-left"
+                on:click={() => showSeederInfo(seeder.address)}
+                title={details?.hasGeneralInfo ? 'Click to view seeder details' : 'Seeder info loading...'}
+              >
                 <div class="mt-0.5 h-2 w-2 rounded-full bg-emerald-500 flex-shrink-0"></div>
-                <div class="space-y-1 flex-1">
+                <div class="space-y-1 flex-1 min-w-0">
                   <code class="text-xs font-mono break-words block">{seeder.address}</code>
-                  <div class="flex items-center gap-1 text-xs text-muted-foreground">
+                  <div class="flex items-center gap-2 text-xs text-muted-foreground">
                     <span>Seed #{index + 1}</span>
+                    {#if details?.hasGeneralInfo}
+                      <span class="text-emerald-600">• Info available</span>
+                    {:else}
+                      <span class="text-amber-600">• Loading...</span>
+                    {/if}
                   </div>
+                  {#if details?.walletAddress}
+                    <div class="text-xs text-muted-foreground truncate">
+                      {details.walletAddress.slice(0, 10)}...
+                    </div>
+                  {/if}
                 </div>
                 <Button
                   variant="ghost"
                   size="icon"
                   class="h-7 w-7"
-                  on:click={() => copySeeder(seeder.address, index)}
+                  on:click={(e) => {
+                    e.stopPropagation();
+                    copySeeder(seeder.address, index);
+                  }}
                 >
                   <Copy class="h-3.5 w-3.5" />
                   <span class="sr-only">Copy seeder address</span>
                 </Button>
-              </div>
+              </button>
             {/each}
           </div>
         </div>
@@ -763,6 +825,109 @@
         </Button>
         <Button on:click={confirmSeeder} disabled={selectedSeederIndex === null || metadata.seeders?.length === 0} class="flex-1 bg-blue-600 hover:bg-blue-700">
           Confirm
+        </Button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showSeederDetailsModal && selectedSeederDetails}
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+    <div class="bg-background rounded-lg shadow-lg p-6 w-full max-w-md border border-border">
+      <h2 class="text-xl font-bold mb-4">Seeder Details</h2>
+
+      <div class="space-y-4">
+        <!-- Peer ID -->
+        <div>
+          <p class="text-xs uppercase tracking-wide text-muted-foreground mb-1">Peer ID</p>
+          <div class="flex items-center gap-2 rounded-md border border-border/50 bg-muted/40 p-2">
+            <code class="flex-1 text-xs font-mono break-all">{selectedSeederDetails.peerId}</code>
+            <Button
+              variant="ghost"
+              size="icon"
+              class="h-7 w-7"
+              on:click={() => {
+                navigator.clipboard.writeText(selectedSeederDetails?.peerId || '');
+                showToast('Peer ID copied', 'success');
+              }}
+            >
+              <Copy class="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+
+        {#if selectedSeederDetails.hasGeneralInfo}
+          <!-- Wallet Address -->
+          {#if selectedSeederDetails.walletAddress}
+            <div>
+              <p class="text-xs uppercase tracking-wide text-muted-foreground mb-1">Wallet Address</p>
+              <div class="flex items-center gap-2 rounded-md border border-border/50 bg-muted/40 p-2">
+                <code class="flex-1 text-xs font-mono break-all">{selectedSeederDetails.walletAddress}</code>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="h-7 w-7"
+                  on:click={() => {
+                    navigator.clipboard.writeText(selectedSeederDetails?.walletAddress || '');
+                    showToast('Wallet address copied', 'success');
+                  }}
+                >
+                  <Copy class="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          {/if}
+
+          <!-- Price -->
+          {#if selectedSeederDetails.pricePerMb !== undefined}
+            <div>
+              <p class="text-xs uppercase tracking-wide text-muted-foreground mb-1">Price per MB</p>
+              <div class="rounded-md border border-border/50 bg-muted/40 p-3">
+                <p class="text-lg font-bold text-emerald-600">
+                  {selectedSeederDetails.pricePerMb.toFixed(6)} Chiral
+                </p>
+                <p class="text-xs text-muted-foreground mt-1">
+                  Total: {(selectedSeederDetails.pricePerMb * (metadata.fileSize / (1024 * 1024))).toFixed(4)} Chiral
+                </p>
+              </div>
+            </div>
+          {/if}
+
+          <!-- Supported Protocols -->
+          {#if selectedSeederDetails.protocols && selectedSeederDetails.protocols.length > 0}
+            <div>
+              <p class="text-xs uppercase tracking-wide text-muted-foreground mb-1">Supported Protocols</p>
+              <div class="flex flex-wrap gap-2">
+                {#each selectedSeederDetails.protocols as protocol}
+                  <Badge class="bg-blue-100 text-blue-800">
+                    {protocol}
+                  </Badge>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          <!-- Protocol Details -->
+          {#if selectedSeederDetails.hasFileInfo && selectedSeederDetails.protocolDetails}
+            <div>
+              <p class="text-xs uppercase tracking-wide text-muted-foreground mb-1">Protocol Details</p>
+              <div class="rounded-md border border-border/50 bg-muted/40 p-3 max-h-40 overflow-auto">
+                <pre class="text-xs font-mono whitespace-pre-wrap break-all">{JSON.stringify(selectedSeederDetails.protocolDetails, null, 2)}</pre>
+              </div>
+            </div>
+          {/if}
+        {:else}
+          <div class="p-4 bg-amber-500/10 rounded-lg border border-amber-500/30">
+            <p class="text-sm text-amber-600 text-center">
+              Seeder information is still loading...
+            </p>
+          </div>
+        {/if}
+      </div>
+
+      <div class="flex justify-end gap-2 mt-6">
+        <Button variant="outline" on:click={closeSeederDetailsModal}>
+          Close
         </Button>
       </div>
     </div>

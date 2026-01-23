@@ -84,6 +84,80 @@ export interface FileMetadata {
   trackers?: string[];
 }
 
+// ========== GossipSub Metadata Types ==========
+
+/**
+ * Minimal DHT record for file discovery (published to Kademlia DHT)
+ * Contains only basic information needed to discover a file
+ */
+export interface DhtFileRecord {
+  fileHash: string;
+  fileName: string;
+  fileSize: number;
+  createdAt: number;
+  mimeType?: string;
+}
+
+/**
+ * Encryption details for a file
+ */
+export interface EncryptionInfo {
+  algorithm: string;
+  keyDerivation: string;
+}
+
+/**
+ * Protocol-specific details for downloading a file
+ */
+export interface ProtocolDetails {
+  cids?: string[];
+  httpSources?: HttpSourceInfo[];
+  ftpSources?: FtpSourceInfo[];
+  ed2kSources?: Ed2kSourceInfo[];
+  infoHash?: string;
+  trackers?: string[];
+  encryption?: EncryptionInfo;
+}
+
+/**
+ * General information about a seeder (broadcasted on topic: seeder/{peerID})
+ */
+export interface SeederGeneralInfo {
+  peerId: string;
+  walletAddress: string;
+  defaultPricePerMb: number;
+  supportedProtocols: string[];
+  timestamp: number;
+}
+
+/**
+ * File-specific information from a seeder (broadcasted on topic: seeder/{peerID}/file/{fileHash})
+ */
+export interface SeederFileInfo {
+  peerId: string;
+  fileHash: string;
+  pricePerMb?: number; // Overrides defaultPricePerMb if set
+  protocolDetails: ProtocolDetails;
+  timestamp: number;
+}
+
+/**
+ * Complete metadata from a single seeder (combines general + file-specific info)
+ */
+export interface SeederCompleteMetadata {
+  general: SeederGeneralInfo;
+  fileSpecific: SeederFileInfo;
+}
+
+/**
+ * Complete file metadata combining DHT discovery + GossipSub seeder metadata
+ * This is what downloaders receive after querying the DHT and subscribing to GossipSub
+ */
+export interface CompleteFileMetadata {
+  dhtRecord: DhtFileRecord;
+  seederInfo: Record<string, SeederCompleteMetadata>; // peerId -> SeederCompleteMetadata
+}
+
 export interface DhtHealth {
   peerCount: number;
   lastBootstrap: number | null;
@@ -233,7 +307,7 @@ export class DhtService {
     filePath: string,
     price?: number,
     protocol?: string,
-    originalFileName?: string
+    originalFileName?: string,
   ): Promise<FileMetadata> {
     try {
       // Start listening for the published_file event
@@ -255,15 +329,15 @@ export class DhtService {
             resolve(metadata);
             // Unsubscribe once we got the event
             unlistenPromise.then((unlistenFn) => unlistenFn());
-          }
+          },
         );
 
         // Add timeout to reject the promise if publishing takes too long
         timeoutId = setTimeout(() => {
           reject(
             new Error(
-              "File publishing timeout - no published_file event received"
-            )
+              "File publishing timeout - no published_file event received",
+            ),
           );
           unlistenPromise.then((unlistenFn) => unlistenFn());
         }, 30000); // Increase timeout to 30 seconds for ED2K and other protocols
@@ -313,13 +387,13 @@ export class DhtService {
             resolve(event.payload);
             // Unsubscribe once we got the event
             unlistenPromise.then((unlistenFn) => unlistenFn());
-          }
+          },
         );
 
         // Add timeout to reject the promise if download takes too long
         setTimeout(() => {
           reject(
-            new Error("Download timeout - no file_content event received")
+            new Error("Download timeout - no file_content event received"),
           );
           unlistenPromise.then((unlistenFn) => unlistenFn());
         }, 300000); // 5 minute timeout
@@ -349,7 +423,7 @@ export class DhtService {
             fileHash: fileMetadata.fileHash,
             fileName: fileMetadata.fileName,
             cidsCount: fileMetadata.cids?.length,
-          }
+          },
         );
 
         // Trigger the backend download AFTER setting up the listener
@@ -360,7 +434,7 @@ export class DhtService {
       } catch (error) {
         console.error(
           "🔽 Frontend: download_blocks_from_network invoke failed:",
-          error
+          error,
         );
         throw error;
       }
@@ -392,7 +466,7 @@ export class DhtService {
     // might be from the backend saying networking isn't implemented
     if (!this.peerId) {
       console.error(
-        "DHT service peerId not set, service may not be initialized"
+        "DHT service peerId not set, service may not be initialized",
       );
       throw new Error("DHT service not initialized properly");
     }
@@ -475,7 +549,7 @@ export class DhtService {
 
   async searchFileMetadata(
     fileHash: string,
-    timeoutMs = 10_000
+    timeoutMs = 10_000,
   ): Promise<FileMetadata | null> {
     const trimmed = fileHash.trim();
     if (!trimmed) {
@@ -490,11 +564,11 @@ export class DhtService {
         {
           fileHash: trimmed,
           timeoutMs,
-        }
+        },
       );
       console.log(
         "🔍 Frontend received direct result from search_file_metadata:",
-        metadata
+        metadata,
       );
 
       if (metadata) {

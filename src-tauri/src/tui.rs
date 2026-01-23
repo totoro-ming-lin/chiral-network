@@ -933,6 +933,7 @@ async fn execute_command(command: &str, context: &TuiContext) -> Result<String, 
                 info_hash: None,
                 trackers: None,
                 ed2k_sources: None,
+                encryption: None,
             };
 
             context.dht_service.publish_file(metadata, None).await

@@ -1351,6 +1351,7 @@
     { value: "BitTorrent", label: "BitTorrent" },
     { value: "ED2K", label: "ED2K" },
     { value: "FTP", label: "FTP" },
+    { value: "BitSwap", label: "BitSwap"}
   ];
 
   async function handleCopy(hash: string) {

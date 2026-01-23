@@ -575,6 +575,7 @@ async fn api_upload_generate(
                 info_hash: None,
                 trackers: None,
                 manifest: None,
+                encryption: None,
             };
             if let Err(e) = dht.publish_file(meta, None).await {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::http_server::ErrorResponse {

@@ -382,6 +382,7 @@ pub async fn run_headless(mut args: CliArgs) -> Result<(), Box<dyn std::error::E
             trackers: None,
             ed2k_sources: None,
             manifest: None,
+            encryption: None,
         };
 
         dht_arc.publish_file(example_metadata, None).await?;

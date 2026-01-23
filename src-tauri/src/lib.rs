@@ -25,6 +25,7 @@ pub mod download_paths;
 
 // Required modules for multi_source_download
 pub mod dht;
+pub mod gossipsub_metadata;
 pub mod file_transfer;
 pub mod ftp_downloader;
 pub mod ftp_server;
