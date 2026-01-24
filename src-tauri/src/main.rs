@@ -1584,15 +1584,16 @@ async fn start_dht_node(
     enable_relay_server: bool,
     enable_upnp: bool,
 
+    // Optional feature flags
+    pure_client_mode: Option<bool>,
+    force_server_mode: Option<bool>,
+
     // Conditionally present
     autonat_servers: Option<Vec<String>>,
     preferred_relays: Option<Vec<String>>,
     proxy_address: Option<String>,
-    // Currently NOT sent by tauri frontend,
-    // just using defaults present in struct for single src of truth
+    // Currently NOT sent by tauri frontend:
     // is_bootstrap: Option<bool>, false
-    // pure_client_mode: Option<bool>, false
-    // force_server_mode: Option<bool>, false
 ) -> Result<String, String> {
     {
         let dht_guard = state.dht.lock().await;
@@ -1657,6 +1658,8 @@ async fn start_dht_node(
         .enable_autorelay(enable_autorelay)
         .enable_relay_server(enable_relay_server)
         .enable_upnp(enable_upnp)
+        .pure_client_mode(pure_client_mode.unwrap_or(false))
+        .force_server_mode(force_server_mode.unwrap_or(false))
         // conditionally present, so names are different
         .autonat_servers(autonat_server_list)
         .preferred_relays(preferred_relays_list)
@@ -1933,29 +1936,51 @@ async fn start_dht_node(
                     }
 
                     // Progressive search events
-                    DhtEvent::SearchStarted { file_hash, timestamp } => {
-                        let _ = app_handle.emit("search_started", serde_json::json!({
-                            "fileHash": file_hash,
-                            "timestamp": timestamp
-                        }));
+                    DhtEvent::SearchStarted {
+                        file_hash,
+                        timestamp,
+                    } => {
+                        let _ = app_handle.emit(
+                            "search_started",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "timestamp": timestamp
+                            }),
+                        );
                     }
 
-                    DhtEvent::DhtMetadataFound { file_hash, file_name, file_size, created_at, mime_type } => {
-                        let _ = app_handle.emit("dht_metadata_found", serde_json::json!({
-                            "fileHash": file_hash,
-                            "fileName": file_name,
-                            "fileSize": file_size,
-                            "createdAt": created_at,
-                            "mimeType": mime_type
-                        }));
+                    DhtEvent::DhtMetadataFound {
+                        file_hash,
+                        file_name,
+                        file_size,
+                        created_at,
+                        mime_type,
+                    } => {
+                        let _ = app_handle.emit(
+                            "dht_metadata_found",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "fileName": file_name,
+                                "fileSize": file_size,
+                                "createdAt": created_at,
+                                "mimeType": mime_type
+                            }),
+                        );
                     }
 
-                    DhtEvent::ProvidersFound { file_hash, providers, count } => {
-                        let _ = app_handle.emit("providers_found", serde_json::json!({
-                            "fileHash": file_hash,
-                            "providers": providers,
-                            "count": count
-                        }));
+                    DhtEvent::ProvidersFound {
+                        file_hash,
+                        providers,
+                        count,
+                    } => {
+                        let _ = app_handle.emit(
+                            "providers_found",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "providers": providers,
+                                "count": count
+                            }),
+                        );
                     }
 
                     DhtEvent::SeederGeneralInfoFound {
@@ -1964,16 +1989,17 @@ async fn start_dht_node(
                         peer_id,
                         wallet_address,
                         default_price_per_mb,
-                        supported_protocols,
                     } => {
-                        let _ = app_handle.emit("seeder_general_info", serde_json::json!({
-                            "fileHash": file_hash,
-                            "seederIndex": seeder_index,
-                            "peerId": peer_id,
-                            "walletAddress": wallet_address,
-                            "defaultPricePerMb": default_price_per_mb,
-                            "supportedProtocols": supported_protocols
-                        }));
+                        let _ = app_handle.emit(
+                            "seeder_general_info",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "seederIndex": seeder_index,
+                                "peerId": peer_id,
+                                "walletAddress": wallet_address,
+                                "defaultPricePerMb": default_price_per_mb,
+                            }),
+                        );
                     }
 
                     DhtEvent::SeederFileInfoFound {
@@ -1981,31 +2007,50 @@ async fn start_dht_node(
                         seeder_index,
                         peer_id,
                         price_per_mb,
+                        supported_protocols,
                         protocol_details,
                     } => {
-                        let _ = app_handle.emit("seeder_file_info", serde_json::json!({
-                            "fileHash": file_hash,
-                            "seederIndex": seeder_index,
-                            "peerId": peer_id,
-                            "pricePerMb": price_per_mb,
-                            "protocolDetails": protocol_details
-                        }));
+                        let _ = app_handle.emit(
+                            "seeder_file_info",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "seederIndex": seeder_index,
+                                "peerId": peer_id,
+                                "pricePerMb": price_per_mb,
+                                "supportedProtocols": supported_protocols,
+                                "protocolDetails": protocol_details
+                            }),
+                        );
                     }
 
-                    DhtEvent::SearchComplete { file_hash, total_seeders, duration_ms } => {
-                        let _ = app_handle.emit("search_complete", serde_json::json!({
-                            "fileHash": file_hash,
-                            "totalSeeders": total_seeders,
-                            "durationMs": duration_ms
-                        }));
+                    DhtEvent::SearchComplete {
+                        file_hash,
+                        total_seeders,
+                        duration_ms,
+                    } => {
+                        let _ = app_handle.emit(
+                            "search_complete",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "totalSeeders": total_seeders,
+                                "durationMs": duration_ms
+                            }),
+                        );
                     }
 
-                    DhtEvent::SearchTimeout { file_hash, partial_seeders, missing_count } => {
-                        let _ = app_handle.emit("search_timeout", serde_json::json!({
-                            "fileHash": file_hash,
-                            "partialSeeders": partial_seeders,
-                            "missingCount": missing_count
-                        }));
+                    DhtEvent::SearchTimeout {
+                        file_hash,
+                        partial_seeders,
+                        missing_count,
+                    } => {
+                        let _ = app_handle.emit(
+                            "search_timeout",
+                            serde_json::json!({
+                                "fileHash": file_hash,
+                                "partialSeeders": partial_seeders,
+                                "missingCount": missing_count
+                            }),
+                        );
                     }
 
                     _ => {}
@@ -2448,26 +2493,74 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                     .unwrap_or_else(|_| "{}".to_string());
                     format!("reputation_event:{}", json)
                 }
-                DhtEvent::SearchStarted { file_hash, timestamp } => {
+                DhtEvent::SearchStarted {
+                    file_hash,
+                    timestamp,
+                } => {
                     format!("search_started:{}:{}", file_hash, timestamp)
                 }
-                DhtEvent::DhtMetadataFound { file_hash, file_name, file_size, created_at, mime_type } => {
-                    format!("dht_metadata_found:{}:{}:{}:{}:{}", file_hash, file_name, file_size, created_at, mime_type.unwrap_or_default())
+                DhtEvent::DhtMetadataFound {
+                    file_hash,
+                    file_name,
+                    file_size,
+                    created_at,
+                    mime_type,
+                } => {
+                    format!(
+                        "dht_metadata_found:{}:{}:{}:{}:{}",
+                        file_hash,
+                        file_name,
+                        file_size,
+                        created_at,
+                        mime_type.unwrap_or_default()
+                    )
                 }
-                DhtEvent::ProvidersFound { file_hash, count, .. } => {
+                DhtEvent::ProvidersFound {
+                    file_hash, count, ..
+                } => {
                     format!("providers_found:{}:{}", file_hash, count)
                 }
-                DhtEvent::SeederGeneralInfoFound { file_hash, seeder_index, peer_id, .. } => {
-                    format!("seeder_general_info:{}:{}:{}", file_hash, seeder_index, peer_id)
+                DhtEvent::SeederGeneralInfoFound {
+                    file_hash,
+                    seeder_index,
+                    peer_id,
+                    ..
+                } => {
+                    format!(
+                        "seeder_general_info:{}:{}:{}",
+                        file_hash, seeder_index, peer_id
+                    )
                 }
-                DhtEvent::SeederFileInfoFound { file_hash, seeder_index, peer_id, .. } => {
-                    format!("seeder_file_info:{}:{}:{}", file_hash, seeder_index, peer_id)
+                DhtEvent::SeederFileInfoFound {
+                    file_hash,
+                    seeder_index,
+                    peer_id,
+                    ..
+                } => {
+                    format!(
+                        "seeder_file_info:{}:{}:{}",
+                        file_hash, seeder_index, peer_id
+                    )
                 }
-                DhtEvent::SearchComplete { file_hash, total_seeders, duration_ms } => {
-                    format!("search_complete:{}:{}:{}", file_hash, total_seeders, duration_ms)
+                DhtEvent::SearchComplete {
+                    file_hash,
+                    total_seeders,
+                    duration_ms,
+                } => {
+                    format!(
+                        "search_complete:{}:{}:{}",
+                        file_hash, total_seeders, duration_ms
+                    )
                 }
-                DhtEvent::SearchTimeout { file_hash, partial_seeders, missing_count } => {
-                    format!("search_timeout:{}:{}:{}", file_hash, partial_seeders, missing_count)
+                DhtEvent::SearchTimeout {
+                    file_hash,
+                    partial_seeders,
+                    missing_count,
+                } => {
+                    format!(
+                        "search_timeout:{}:{}:{}",
+                        file_hash, partial_seeders, missing_count
+                    )
                 }
             })
             .collect();
@@ -4220,7 +4313,7 @@ async fn upload_file_to_network(
                 println!("✅ FTP upload complete - file available at: {}", ftp_url);
                 return Ok(());
             }
-            "Bitswap" => {
+            "Bitswap" | "bitswap" | "BitSwap" => {
                 // Use streaming upload for Bitswap to handle large files
                 println!(
                     "📡 Using streaming Bitswap upload for protocol: {}",
@@ -4551,9 +4644,11 @@ async fn upload_file_to_network(
 
                         dht.publish_file(metadata.clone(), None).await?;
 
+                        // Store under the same identifier peers request over WebRTC.
+                        // For WebRTC + manifests, the network identifier is the manifest merkle_root.
                         ft.store_file_data(
-                            file_hash.clone(),
-                            file_name.to_string(),
+                            metadata.merkle_root.clone(),
+                            original_file_name.clone(),
                             file_data.clone(),
                         )
                         .await;
@@ -5195,11 +5290,20 @@ async fn add_ed2k_source(
     let dht_guard = state.dht.lock().await;
     let dht = dht_guard.as_ref().ok_or("DHT not initialized")?;
 
-    let metadata_opt = dht
-        .synchronous_search_metadata(file_hash.clone(), 3000)
-        .await?;
+    // Trigger search and poll cache
+    dht.search_metadata(file_hash.clone(), 3000).await?;
 
-    let mut metadata = metadata_opt.ok_or("Metadata not found")?;
+    let mut metadata = None;
+    for _ in 0..30 {
+        // 30 * 100ms = 3s
+        if let Some(m) = dht.get_cached_metadata(&file_hash).await {
+            metadata = Some(m);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let mut metadata = metadata.ok_or("Metadata not found")?;
 
     let mut list = metadata.ed2k_sources.take().unwrap_or_default();
     list.push(ed2k_info);
@@ -5218,11 +5322,20 @@ async fn list_ed2k_sources(
     let dht_guard = state.dht.lock().await;
     let dht = dht_guard.as_ref().ok_or("DHT not initialized")?;
 
-    let metadata_opt = dht
-        .synchronous_search_metadata(file_hash.clone(), 3000)
-        .await?;
+    // Trigger search and poll cache
+    dht.search_metadata(file_hash.clone(), 3000).await?;
 
-    let metadata = metadata_opt.ok_or(format!("Metadata not found for {}", file_hash))?;
+    let mut metadata = None;
+    for _ in 0..30 {
+        // 30 * 100ms = 3s
+        if let Some(m) = dht.get_cached_metadata(&file_hash).await {
+            metadata = Some(m);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let metadata = metadata.ok_or(format!("Metadata not found for {}", file_hash))?;
 
     Ok(metadata.ed2k_sources.unwrap_or_default())
 }
@@ -5236,11 +5349,20 @@ async fn remove_ed2k_source(
     let dht_guard = state.dht.lock().await;
     let dht = dht_guard.as_ref().ok_or("DHT not initialized")?;
 
-    let metadata_opt = dht
-        .synchronous_search_metadata(file_hash.clone(), 3000)
-        .await?;
+    // Trigger search and poll cache
+    dht.search_metadata(file_hash.clone(), 3000).await?;
 
-    let mut metadata = metadata_opt.ok_or("Metadata not found")?;
+    let mut metadata = None;
+    for _ in 0..30 {
+        // 30 * 100ms = 3s
+        if let Some(m) = dht.get_cached_metadata(&file_hash).await {
+            metadata = Some(m);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let mut metadata = metadata.ok_or("Metadata not found")?;
 
     if let Some(list) = &mut metadata.ed2k_sources {
         list.retain(|s| s.server_url != server_url);
@@ -5382,11 +5504,24 @@ async fn download_file_from_network(
             // - Provider queries that run in parallel (can take 3-5s)
             // - Network latency and retries
             // - Multiple query rounds for distant peers
-            match dht_service
-                .synchronous_search_metadata(file_hash.clone(), 35000)
-                .await
-            {
-                Ok(Some(metadata)) => {
+
+            // Trigger search and poll cache
+            if let Err(e) = dht_service.search_metadata(file_hash.clone(), 35000).await {
+                return Err(format!("Failed to trigger DHT search: {}", e));
+            }
+
+            let mut metadata_opt = None;
+            for _ in 0..350 {
+                // 350 * 100ms = 35s
+                if let Some(m) = dht_service.get_cached_metadata(&file_hash).await {
+                    metadata_opt = Some(m);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            match metadata_opt {
+                Some(metadata) => {
                     info!(
                         "Found file metadata in DHT: {} (size: {} bytes)",
                         metadata.file_name, metadata.file_size
@@ -5710,13 +5845,8 @@ async fn download_file_from_network(
                         Err("WebRTC service not available".to_string())
                     }
                 }
-                Ok(None) => {
+                None => {
                     return Err("DHT search timed out - file metadata not found".to_string());
-                }
-                Err(e) => {
-                    warn!("DHT search failed: {}", e);
-
-                    return Err(format!("DHT search failed: {}", e));
                 }
             }
         } else {
@@ -6640,23 +6770,19 @@ async fn search_file_metadata(
     state: State<'_, AppState>,
     file_hash: String,
     timeout_ms: Option<u64>,
-) -> Result<Option<FileMetadata>, String> {
+) -> Result<(), String> {
     let dht = {
         let dht_guard = state.dht.lock().await;
         dht_guard.as_ref().cloned()
     };
 
     if let Some(dht) = dht {
-        let timeout = timeout_ms.unwrap_or(10_000);
-        let result = dht.synchronous_search_metadata(file_hash, timeout).await?;
-
-        // If we found metadata (including from cache), emit the found_file event
-        // This ensures the frontend gets notified even for cache hits
-        if let Some(ref metadata) = result {
-            let _ = app.emit("found_file", metadata);
-        }
-
-        Ok(result)
+        // Just trigger the search - all updates will come via progressive events:
+        // search_started, dht_metadata_found, providers_found,
+        // seeder_general_info, seeder_file_info, search_complete/search_timeout
+        dht.search_metadata(file_hash, timeout_ms.unwrap_or(10_000))
+            .await?;
+        Ok(())
     } else {
         Err("DHT node is not running".to_string())
     }
@@ -10963,27 +11089,49 @@ async fn pump_dht_events(
                 }
 
                 // Progressive search events
-                DhtEvent::SearchStarted { file_hash, timestamp } => {
-                    let _ = app_handle.emit("search_started", serde_json::json!({
-                        "fileHash": file_hash,
-                        "timestamp": timestamp
-                    }));
+                DhtEvent::SearchStarted {
+                    file_hash,
+                    timestamp,
+                } => {
+                    let _ = app_handle.emit(
+                        "search_started",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "timestamp": timestamp
+                        }),
+                    );
                 }
-                DhtEvent::DhtMetadataFound { file_hash, file_name, file_size, created_at, mime_type } => {
-                    let _ = app_handle.emit("dht_metadata_found", serde_json::json!({
-                        "fileHash": file_hash,
-                        "fileName": file_name,
-                        "fileSize": file_size,
-                        "createdAt": created_at,
-                        "mimeType": mime_type
-                    }));
+                DhtEvent::DhtMetadataFound {
+                    file_hash,
+                    file_name,
+                    file_size,
+                    created_at,
+                    mime_type,
+                } => {
+                    let _ = app_handle.emit(
+                        "dht_metadata_found",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "fileName": file_name,
+                            "fileSize": file_size,
+                            "createdAt": created_at,
+                            "mimeType": mime_type
+                        }),
+                    );
                 }
-                DhtEvent::ProvidersFound { file_hash, providers, count } => {
-                    let _ = app_handle.emit("providers_found", serde_json::json!({
-                        "fileHash": file_hash,
-                        "providers": providers,
-                        "count": count
-                    }));
+                DhtEvent::ProvidersFound {
+                    file_hash,
+                    providers,
+                    count,
+                } => {
+                    let _ = app_handle.emit(
+                        "providers_found",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "providers": providers,
+                            "count": count
+                        }),
+                    );
                 }
                 DhtEvent::SeederGeneralInfoFound {
                     file_hash,
@@ -10991,45 +11139,65 @@ async fn pump_dht_events(
                     peer_id,
                     wallet_address,
                     default_price_per_mb,
-                    supported_protocols,
                 } => {
-                    let _ = app_handle.emit("seeder_general_info", serde_json::json!({
-                        "fileHash": file_hash,
-                        "seederIndex": seeder_index,
-                        "peerId": peer_id,
-                        "walletAddress": wallet_address,
-                        "defaultPricePerMb": default_price_per_mb,
-                        "supportedProtocols": supported_protocols
-                    }));
+                    let _ = app_handle.emit(
+                        "seeder_general_info",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "seederIndex": seeder_index,
+                            "peerId": peer_id,
+                            "walletAddress": wallet_address,
+                            "defaultPricePerMb": default_price_per_mb,
+                        }),
+                    );
                 }
                 DhtEvent::SeederFileInfoFound {
                     file_hash,
                     seeder_index,
                     peer_id,
                     price_per_mb,
+                    supported_protocols,
                     protocol_details,
                 } => {
-                    let _ = app_handle.emit("seeder_file_info", serde_json::json!({
-                        "fileHash": file_hash,
-                        "seederIndex": seeder_index,
-                        "peerId": peer_id,
-                        "pricePerMb": price_per_mb,
-                        "protocolDetails": protocol_details
-                    }));
+                    let _ = app_handle.emit(
+                        "seeder_file_info",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "seederIndex": seeder_index,
+                            "peerId": peer_id,
+                            "pricePerMb": price_per_mb,
+                            "supportedProtocols": supported_protocols,
+                            "protocolDetails": protocol_details
+                        }),
+                    );
                 }
-                DhtEvent::SearchComplete { file_hash, total_seeders, duration_ms } => {
-                    let _ = app_handle.emit("search_complete", serde_json::json!({
-                        "fileHash": file_hash,
-                        "totalSeeders": total_seeders,
-                        "durationMs": duration_ms
-                    }));
+                DhtEvent::SearchComplete {
+                    file_hash,
+                    total_seeders,
+                    duration_ms,
+                } => {
+                    let _ = app_handle.emit(
+                        "search_complete",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "totalSeeders": total_seeders,
+                            "durationMs": duration_ms
+                        }),
+                    );
                 }
-                DhtEvent::SearchTimeout { file_hash, partial_seeders, missing_count } => {
-                    let _ = app_handle.emit("search_timeout", serde_json::json!({
-                        "fileHash": file_hash,
-                        "partialSeeders": partial_seeders,
-                        "missingCount": missing_count
-                    }));
+                DhtEvent::SearchTimeout {
+                    file_hash,
+                    partial_seeders,
+                    missing_count,
+                } => {
+                    let _ = app_handle.emit(
+                        "search_timeout",
+                        serde_json::json!({
+                            "fileHash": file_hash,
+                            "partialSeeders": partial_seeders,
+                            "missingCount": missing_count
+                        }),
+                    );
                 }
 
                 _ => {}

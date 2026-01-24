@@ -76,6 +76,100 @@ export class WalletService {
       typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   }
 
+  private getAccurateTotalsCacheKey(chainId: number, address: string): string {
+    return `chiral_accurate_totals_v1:${chainId}:${address.toLowerCase()}`;
+  }
+
+  async hydrateAccurateTotalsFromCache(): Promise<boolean> {
+    if (!this.isTauri || typeof window === "undefined") {
+      return false;
+    }
+
+    let accountAddress: string;
+    try {
+      accountAddress = await invoke<string>("get_active_account_address");
+    } catch {
+      return false;
+    }
+
+    let chainId: number;
+    try {
+      chainId = await invoke<number>("get_chain_id");
+    } catch {
+      chainId = 98765;
+    }
+
+    const { accurateTotals, miningState, blockReward, accurateTotalsProgress } =
+      await import("$lib/stores");
+
+    const key = this.getAccurateTotalsCacheKey(chainId, accountAddress);
+    const raw = localStorage.getItem(key);
+    if (!raw) {
+      return false;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as {
+        version: number;
+        chainId: number;
+        address: string;
+        headBlock: number;
+        computedAt: number;
+        totals: {
+          blocksMined: number;
+          totalReceived: number;
+          totalSent: number;
+        };
+      };
+
+      if (
+        !parsed ||
+        parsed.version !== 1 ||
+        parsed.chainId !== chainId ||
+        typeof parsed.address !== "string" ||
+        parsed.address.toLowerCase() !== accountAddress.toLowerCase() ||
+        !parsed.totals ||
+        typeof parsed.totals.blocksMined !== "number" ||
+        typeof parsed.totals.totalReceived !== "number" ||
+        typeof parsed.totals.totalSent !== "number"
+      ) {
+        return false;
+      }
+
+      accurateTotals.set({
+        blocksMined: parsed.totals.blocksMined,
+        totalReceived: parsed.totals.totalReceived,
+        totalSent: parsed.totals.totalSent,
+      });
+
+      // Ensure UI doesn't show stale progress.
+      accurateTotalsProgress.set(null);
+
+      // Keep mining UI consistent with the cached snapshot.
+      const reward = get(blockReward);
+      miningState.update((state) => ({
+        ...state,
+        blocksFound: parsed.totals.blocksMined,
+        totalRewards: parsed.totals.blocksMined * reward,
+      }));
+
+      // Initialize backend session counter from the snapshot so the mining page can
+      // use the backend counter as the source of truth without forcing a full scan.
+      try {
+        await invoke("initialize_mined_blocks_count", {
+          address: accountAddress,
+          count: parsed.totals.blocksMined,
+        });
+      } catch {
+        // Non-fatal: snapshot still hydrates frontend.
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async initialize(options?: WalletServiceOptions): Promise<void> {
     if (this.initialized) {
       return;
@@ -92,7 +186,7 @@ export class WalletService {
       } catch (err) {
         console.warn(
           "Failed to fetch block reward from backend, using default:",
-          err
+          err,
         );
       }
 
@@ -150,11 +244,11 @@ export class WalletService {
     method: string,
     path: string,
     body?: Uint8Array | null,
-    options?: { timestamp?: number }
+    options?: { timestamp?: number },
   ): Promise<ApiRequestSignature> {
     if (!this.isTauri) {
       throw new Error(
-        "Ethereum authentication headers require the desktop app"
+        "Ethereum authentication headers require the desktop app",
       );
     }
 
@@ -201,7 +295,7 @@ export class WalletService {
     // Skip sync if we're restoring an account
     if (this.isRestoringAccount) {
       console.log(
-        "[syncFromBackend] Skipping sync - account is being restored"
+        "[syncFromBackend] Skipping sync - account is being restored",
       );
       return;
     }
@@ -469,7 +563,7 @@ export class WalletService {
             }
           }
           return Array.from(uniqueMap.values()).sort(
-            (a, b) => b.date.getTime() - a.date.getTime()
+            (a, b) => b.date.getTime() - a.date.getTime(),
           );
         });
       }
@@ -529,18 +623,24 @@ export class WalletService {
           await this.refreshTransactions();
           await this.refreshBalance();
         } catch (error) {
-          console.error("[WalletService] Failed to refresh after block_mined", error);
+          console.error(
+            "[WalletService] Failed to refresh after block_mined",
+            error,
+          );
         }
       });
     } catch (error) {
-      console.warn("[WalletService] Could not bind block_mined listener:", error);
+      console.warn(
+        "[WalletService] Could not bind block_mined listener:",
+        error,
+      );
     }
   }
 
   async updatePendingTransactions(): Promise<void> {
     const currentTransactions = get(transactions);
     const pendingTransactions = currentTransactions.filter(
-      (tx) => tx.status === "pending" && tx.txHash
+      (tx) => tx.status === "pending" && tx.txHash,
     );
 
     if (pendingTransactions.length === 0) {
@@ -567,8 +667,8 @@ export class WalletService {
                       ? ("success" as const)
                       : ("failed" as const),
                   }
-                : t
-            )
+                : t,
+            ),
           );
 
           // Update pending count
@@ -577,7 +677,7 @@ export class WalletService {
               ...w,
               pendingTransactions: Math.max(
                 0,
-                (w.pendingTransactions ?? 0) - 1
+                (w.pendingTransactions ?? 0) - 1,
               ),
             }));
           }
@@ -653,7 +753,7 @@ export class WalletService {
         (tx) =>
           (tx.status === "pending" || tx.status === "submitted") &&
           tx.type === "sent" &&
-          (tx.hash || tx.txHash)
+          (tx.hash || tx.txHash),
       );
 
       if (pendingSentTxs.length > 0) {
@@ -680,15 +780,15 @@ export class WalletService {
                         confirmations,
                         block_number: receipt.block_number ?? t.block_number,
                       }
-                    : t
-                )
+                    : t,
+                ),
               );
 
               wallet.update((w) => ({
                 ...w,
                 pendingTransactions: Math.max(
                   0,
-                  (w.pendingTransactions ?? 0) - 1
+                  (w.pendingTransactions ?? 0) - 1,
                 ),
               }));
             }
@@ -701,9 +801,9 @@ export class WalletService {
       // Calculate pending sent transactions (after reconciliation)
       // Exclude transactions to blacklisted addresses - they shouldn't reduce available balance
       const blacklistedAddresses = new Set(
-        get(blacklist).map((entry) => entry.chiral_address.toLowerCase())
+        get(blacklist).map((entry) => entry.chiral_address.toLowerCase()),
       );
-      
+
       const pendingSent = get(transactions)
         .filter((tx) => {
           if (tx.status !== "pending" || tx.type !== "sent") {
@@ -874,7 +974,7 @@ export class WalletService {
             }
           }
           return Array.from(uniqueMap.values()).sort(
-            (a, b) => b.date.getTime() - a.date.getTime()
+            (a, b) => b.date.getTime() - a.date.getTime(),
           );
         });
       }
@@ -1030,7 +1130,7 @@ export class WalletService {
   async createAccount(): Promise<AccountCreationResult> {
     if (this.isTauri) {
       const account = (await invoke(
-        "create_chiral_account"
+        "create_chiral_account",
       )) as AccountCreationResult;
       transactions.set([]);
       this.seenHashes.clear();
@@ -1100,7 +1200,7 @@ export class WalletService {
     // Get account address from backend for transaction record
     const accountAddress = await invoke<string>("get_active_account_address");
     console.log(
-      `[Transaction] Sending ${amount} CN from ${accountAddress} to ${toAddress}`
+      `[Transaction] Sending ${amount} CN from ${accountAddress} to ${toAddress}`,
     );
 
     const txHash = (await invoke("send_chiral_transaction", {
@@ -1110,7 +1210,7 @@ export class WalletService {
 
     console.log(`[Transaction] ✅ Broadcast successful! Hash: ${txHash}`);
     console.log(
-      `[Transaction] Status: PENDING - monitoring for confirmation...`
+      `[Transaction] Status: PENDING - monitoring for confirmation...`,
     );
 
     wallet.update((w) => ({
@@ -1144,7 +1244,7 @@ export class WalletService {
   private async monitorTransaction(
     txHash: string,
     amount: number,
-    toAddress: string
+    toAddress: string,
   ): Promise<void> {
     console.log(`[TX Monitor] 👀 Monitoring ${txHash.substring(0, 10)}...`);
 
@@ -1166,10 +1266,10 @@ export class WalletService {
           const status = receipt.status === "success" ? "success" : "failed";
 
           console.log(
-            `[TX Monitor] ✅ ${status.toUpperCase()} in block ${receipt.block_number}`
+            `[TX Monitor] ✅ ${status.toUpperCase()} in block ${receipt.block_number}`,
           );
           console.log(
-            `[TX Monitor] Confirmations: ${confirmations}, Gas: ${receipt.gas_used}`
+            `[TX Monitor] Confirmations: ${confirmations}, Gas: ${receipt.gas_used}`,
           );
 
           transactions.update((txs) =>
@@ -1180,8 +1280,8 @@ export class WalletService {
                     status: status as "success" | "failed",
                     confirmations,
                   }
-                : tx
-            )
+                : tx,
+            ),
           );
 
           wallet.update((w) => ({
@@ -1204,7 +1304,7 @@ export class WalletService {
                   block: receipt.block_number,
                 },
               }),
-              "success"
+              "success",
             );
           } else {
             // showToast(
@@ -1215,19 +1315,19 @@ export class WalletService {
               tr("toasts.wallet.transaction.failed", {
                 values: { block: receipt.block_number },
               }),
-              "error"
+              "error",
             );
           }
         } else if (attempts % 6 === 0) {
           console.log(
-            `[TX Monitor] ⏳ Pending... (${attempts * 5}s) - Mining active?`
+            `[TX Monitor] ⏳ Pending... (${attempts * 5}s) - Mining active?`,
           );
         }
 
         if (attempts >= maxAttempts) {
           clearInterval(checkInterval);
           console.warn(
-            `[TX Monitor] ⚠️ Timeout after ${maxAttempts * 5}s - check Blockchain page`
+            `[TX Monitor] ⚠️ Timeout after ${maxAttempts * 5}s - check Blockchain page`,
           );
         }
       } catch (error) {
@@ -1268,7 +1368,7 @@ export class WalletService {
 
   async loadFromKeystore(
     address: string,
-    password: string
+    password: string,
   ): Promise<AccountCreationResult> {
     if (!this.isTauri) {
       throw new Error("Keystore access is only available in the desktop app");
@@ -1285,13 +1385,13 @@ export class WalletService {
 
   async deleteKeystoreAccount(address: string): Promise<void> {
     if (!this.isTauri) {
-      throw new Error('Keystore deletion is only available in the desktop app');
+      throw new Error("Keystore deletion is only available in the desktop app");
     }
 
     try {
-      await invoke('remove_account_from_keystore', { address });
+      await invoke("remove_account_from_keystore", { address });
     } catch (error) {
-      console.error('Failed to delete keystore account:', error);
+      console.error("Failed to delete keystore account:", error);
       throw error;
     }
   }
@@ -1343,7 +1443,7 @@ export class WalletService {
   async verifyAndEnableTwoFactor(
     secret: string,
     code: string,
-    password: string
+    password: string,
   ): Promise<boolean> {
     if (!this.isTauri) {
       throw new Error("2FA is only available in the desktop app");
@@ -1387,7 +1487,7 @@ export class WalletService {
   async calculateAccurateTotals(): Promise<void> {
     if (!this.isTauri) {
       throw new Error(
-        "Accurate totals calculation is only available in the desktop app"
+        "Accurate totals calculation is only available in the desktop app",
       );
     }
 
@@ -1408,6 +1508,21 @@ export class WalletService {
     // Set loading state
     isCalculatingAccurateTotals.set(true);
     accurateTotalsProgress.set(null);
+
+    // Capture chain head at start (used for snapshot metadata)
+    let headBlockAtStart: number | null = null;
+    try {
+      headBlockAtStart = await invoke<number>("get_current_block");
+    } catch {
+      headBlockAtStart = null;
+    }
+
+    let chainId: number;
+    try {
+      chainId = await invoke<number>("get_chain_id");
+    } catch {
+      chainId = 98765;
+    }
 
     // Capture session counter BEFORE starting the scan
     // This tells us how many blocks were mined before the scan started
@@ -1456,6 +1571,28 @@ export class WalletService {
         totalSent: result.total_sent,
       });
 
+      // Persist snapshot so we don't re-scan on every app load.
+      try {
+        const key = this.getAccurateTotalsCacheKey(chainId, accountAddress);
+        localStorage.setItem(
+          key,
+          JSON.stringify({
+            version: 1,
+            chainId,
+            address: accountAddress,
+            headBlock: headBlockAtStart ?? null,
+            computedAt: Date.now(),
+            totals: {
+              blocksMined: result.blocks_mined,
+              totalReceived: result.total_received,
+              totalSent: result.total_sent,
+            },
+          }),
+        );
+      } catch {
+        // Non-fatal.
+      }
+
       // Initialize the backend counter with accurate count + blocks mined during scan
       // - sessionCounterAtStart: blocks mined before scan (might be included in scan result)
       // - sessionCounterAtEnd: blocks mined before + during scan
@@ -1483,7 +1620,7 @@ export class WalletService {
           count: totalCount,
         });
         console.debug(
-          `[Accurate Totals] Initialized backend blocks count to: ${totalCount} (scan: ${result.blocks_mined}, during calc: ${blocksDuringCalc}, session start: ${sessionCounterAtStart}, session end: ${sessionCounterAtEnd})`
+          `[Accurate Totals] Initialized backend blocks count to: ${totalCount} (scan: ${result.blocks_mined}, during calc: ${blocksDuringCalc}, session start: ${sessionCounterAtStart}, session end: ${sessionCounterAtEnd})`,
         );
 
         // Update the mining state store
@@ -1496,7 +1633,7 @@ export class WalletService {
       } catch (initError) {
         console.warn(
           "[Accurate Totals] Failed to initialize backend counter:",
-          initError
+          initError,
         );
       }
 
@@ -1569,7 +1706,7 @@ export class WalletService {
   }
 
   private createDemoAccount(
-    overridePrivateKey?: string
+    overridePrivateKey?: string,
   ): AccountCreationResult {
     const address = this.randomHex(40);
     const private_key = overridePrivateKey?.startsWith("0x")

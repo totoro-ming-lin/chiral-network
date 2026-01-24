@@ -592,6 +592,9 @@ $: canShowLockAction = !showFirstRunWizard;
           // Ensure selectedProtocol always has a valid default
           if (!parsed.selectedProtocol) {
             parsed.selectedProtocol = "WebRTC";
+          } else if (parsed.selectedProtocol === "BitSwap") {
+            // Backwards compatibility: older builds used "BitSwap"
+            parsed.selectedProtocol = "Bitswap";
           }
           settings.update(prev => ({ ...prev, ...parsed }));
         }

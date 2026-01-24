@@ -126,7 +126,6 @@ export interface SeederGeneralInfo {
   peerId: string;
   walletAddress: string;
   defaultPricePerMb: number;
-  supportedProtocols: string[];
   timestamp: number;
 }
 
@@ -137,6 +136,7 @@ export interface SeederFileInfo {
   peerId: string;
   fileHash: string;
   pricePerMb?: number; // Overrides defaultPricePerMb if set
+  supportedProtocols: string[];
   protocolDetails: ProtocolDetails;
   timestamp: number;
 }
@@ -223,8 +223,8 @@ export class DhtService {
   }
 
   async start(config?: Partial<DhtConfig>): Promise<string> {
-    const port = config?.port || 4001;
-    let bootstrapNodes = config?.bootstrapNodes || [];
+    const port = config?.port ?? 4001;
+    let bootstrapNodes = config?.bootstrapNodes ?? [];
 
     // Use default bootstrap nodes if none provided
     if (bootstrapNodes.length === 0) {
@@ -232,54 +232,64 @@ export class DhtService {
     }
 
     try {
+      // start_dht_node (Tauri) expects camelCase keys (it maps to Rust snake_case).
+      // Provide required values even when the caller supplies a partial config.
+      const enableAutonat =
+        typeof config?.enableAutonat === "boolean"
+          ? config.enableAutonat
+          : true;
+      const autonatProbeIntervalSeconds =
+        typeof config?.autonatProbeIntervalSeconds === "number"
+          ? config.autonatProbeIntervalSeconds
+          : 30;
+      const chunkSizeKb =
+        typeof config?.chunkSizeKb === "number" ? config.chunkSizeKb : 256;
+      const cacheSizeMb =
+        typeof config?.cacheSizeMb === "number" ? config.cacheSizeMb : 1024;
+      const enableAutorelay =
+        typeof config?.enableAutorelay === "boolean"
+          ? config.enableAutorelay
+          : true;
+      const enableRelayServer =
+        typeof config?.enableRelayServer === "boolean"
+          ? config.enableRelayServer
+          : false;
+      const enableUpnp =
+        typeof config?.enableUpnp === "boolean" ? config.enableUpnp : true;
+      const pureClientMode =
+        typeof config?.pureClientMode === "boolean"
+          ? config.pureClientMode
+          : false;
+      const forceServerMode =
+        typeof config?.forceServerMode === "boolean"
+          ? config.forceServerMode
+          : false;
+
       const payload: Record<string, unknown> = {
         port,
         bootstrapNodes,
+        enableAutonat,
+        autonatProbeIntervalSecs: autonatProbeIntervalSeconds,
+        chunkSizeKb,
+        cacheSizeMb,
+        enableAutorelay,
+        enableRelayServer,
+        enableUpnp,
+        pureClientMode,
+        forceServerMode,
       };
-      if (typeof config?.enableAutonat === "boolean") {
-        payload.enableAutonat = config.enableAutonat;
-      }
-      if (typeof config?.autonatProbeIntervalSeconds === "number") {
-        payload.autonatProbeIntervalSecs = config.autonatProbeIntervalSeconds;
-      }
+
       if (config?.autonatServers && config.autonatServers.length > 0) {
         payload.autonatServers = config.autonatServers;
+      }
+      if (config?.preferredRelays && config.preferredRelays.length > 0) {
+        payload.preferredRelays = config.preferredRelays;
       }
       if (
         typeof config?.proxyAddress === "string" &&
         config.proxyAddress.trim().length > 0
       ) {
-        payload.proxyAddress = config.proxyAddress;
-      }
-      if (typeof config?.chunkSizeKb === "number") {
-        payload.chunkSizeKb = config.chunkSizeKb;
-      }
-      if (typeof config?.cacheSizeMb === "number") {
-        payload.cacheSizeMb = config.cacheSizeMb;
-      }
-      if (typeof config?.enableAutorelay === "boolean") {
-        payload.enableAutorelay = config.enableAutorelay;
-      }
-      if (config?.preferredRelays && config.preferredRelays.length > 0) {
-        payload.preferredRelays = config.preferredRelays;
-      }
-      if (typeof config?.enableRelayServer === "boolean") {
-        payload.enableRelayServer = config.enableRelayServer;
-      }
-      if (typeof config?.enableUpnp === "boolean") {
-        payload.enableUpnp = config.enableUpnp;
-      }
-      if (
-        typeof config?.relayServerAlias === "string" &&
-        config.relayServerAlias.trim().length > 0
-      ) {
-        payload.relayServerAlias = config.relayServerAlias.trim();
-      }
-      if (typeof config?.pureClientMode === "boolean") {
-        payload.pureClientMode = config.pureClientMode;
-      }
-      if (typeof config?.forceServerMode === "boolean") {
-        payload.forceServerMode = config.forceServerMode;
+        payload.proxyAddress = config.proxyAddress.trim();
       }
 
       const peerId = await invoke<string>("start_dht_node", payload);
@@ -550,46 +560,24 @@ export class DhtService {
   async searchFileMetadata(
     fileHash: string,
     timeoutMs = 10_000,
-  ): Promise<FileMetadata | null> {
+  ): Promise<void> {
     const trimmed = fileHash.trim();
     if (!trimmed) {
       throw new Error("File hash is required");
     }
 
     try {
-      // Trigger the backend search and wait for the direct result
-      console.log("🔍 Frontend calling search_file_metadata for:", trimmed);
-      const metadata = await invoke<FileMetadata | null>(
-        "search_file_metadata",
-        {
-          fileHash: trimmed,
-          timeoutMs,
-        },
-      );
-      console.log(
-        "🔍 Frontend received direct result from search_file_metadata:",
-        metadata,
-      );
-
-      if (metadata) {
-        if (!metadata.merkleRoot && metadata.fileHash) {
-          metadata.merkleRoot = metadata.fileHash;
-        }
-        if (!metadata.fileHash && metadata.merkleRoot) {
-          metadata.fileHash = metadata.merkleRoot;
-        }
-        const hashForSeeders =
-          metadata.merkleRoot || metadata.fileHash || trimmed;
-        if (hashForSeeders) {
-          const seeders = await this.getSeedersForFile(hashForSeeders);
-          // Always update seeders with the current live list from DHT provider query
-          // This ensures we don't use stale seeders from the cached metadata
-          metadata.seeders = seeders;
-        }
-      }
-      return metadata;
+      // Trigger the backend search - results will come via progressive events
+      // Events: search_started, dht_metadata_found, providers_found,
+      // seeder_general_info, seeder_file_info, search_complete/search_timeout
+      console.log("🔍 Frontend triggering search_file_metadata for:", trimmed);
+      await invoke<void>("search_file_metadata", {
+        fileHash: trimmed,
+        timeoutMs,
+      });
+      console.log("🔍 Search triggered, awaiting progressive events...");
     } catch (error) {
-      console.error("Failed to search file metadata:", error);
+      console.error("Failed to trigger search:", error);
       throw error;
     }
   }

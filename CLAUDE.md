@@ -1,417 +1,298 @@
-# Chiral Network Development Guide
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Chiral Network is a decentralized peer-to-peer file sharing application that combines blockchain technology with distributed hash table (DHT) based file storage. It implements a BitTorrent-like continuous seeding model where files are instantly available to the network, with a strong focus on privacy, security, and legitimate use cases.
+Chiral Network is a decentralized P2P file sharing platform combining blockchain technology with DHT-based file storage. It implements a BitTorrent-like continuous seeding model with privacy-first design and is built using:
 
-## Current Architecture
+- **Frontend**: Svelte 5 + TypeScript + Tailwind CSS
+- **Desktop Runtime**: Tauri 2 (Rust backend)
+- **P2P Stack**: libp2p v0.54 (Kademlia DHT, WebRTC, NAT traversal)
+- **Blockchain**: Ethereum-compatible network via Geth integration
 
-### Core Design Principles
+## Essential Build Commands
 
-1. **Fully Decentralized P2P**: No centralized servers - all peer discovery via DHT
-2. **BitTorrent-Style Sharing**: Files immediately start seeding when added (no "upload" step)
-3. **Non-Commercial**: No marketplace, pricing, or trading features to prevent misuse
-4. **Privacy-First**: Circuit Relay v2, AutoNAT v2, SOCKS5 proxy support, anonymous mode
-5. **Legitimate Use Only**: Designed for personal, educational, and organizational file sharing
-6. **Blockchain Integration**: Separate Ethereum-compatible network with Geth integration
+### Development
+```bash
+npm run dev              # Web dev server (127.0.0.1:1420)
+npm run tauri:dev        # Desktop app with hot reload
+npm run check            # TypeScript type checking
+```
 
-### Technology Stack
+### Testing
+```bash
+# Frontend tests (vitest)
+npm test                 # Run all unit/integration tests
+npm run test:watch       # Watch mode
+npm run test:e2e         # End-to-end tests (excludes real-network)
+npm run test:e2e:real    # Real network E2E tests (spawns actual nodes)
 
-#### Frontend
-- **Svelte 5**: Latest reactive UI framework (upgraded from Svelte 4)
-- **TypeScript**: Type-safe development
-- **Tailwind CSS**: Utility-first styling
-- **@mateothegreat/svelte5-router**: Client-side routing for Svelte 5
-- **svelte-i18n**: Internationalization support (EN, ES, RU, ZH, KO)
-- **Lucide Svelte**: Icon library
-- **Bits UI**: Accessible component primitives
-- **mode-watcher**: Dark/light mode support
+# Rust tests
+cd src-tauri
+cargo test                              # All Rust tests
+cargo test --test <test_name>           # Specific integration test
+cargo test <test_name> -- --nocapture   # Show output during test
+```
 
-#### Desktop Integration
-- **Tauri 2**: Rust-based desktop runtime
-- **Native File System**: OS-level file operations
-- **System Tray**: Background operation support
+### Production Build
+```bash
+npm run build           # Web production build
+npm run tauri:build     # Desktop production build (creates installers)
+```
 
-#### P2P Network Infrastructure
-- **libp2p v0.54**: Full P2P networking stack (Rust backend)
-- **Kademlia DHT**: Distributed file metadata storage and peer discovery
-- **WebRTC**: Direct peer-to-peer data channels for file transfers
-- **NAT Traversal**:
-  - AutoNAT v2 for reachability detection
-  - Circuit Relay v2 with AutoRelay for NAT'd peers
-  - DCUtR (Direct Connection Upgrade through Relay) for hole punching
-  - mDNS for local peer discovery
-- **Noise Protocol**: Cryptographic transport security
-- **Bitswap Protocol**: Efficient block exchange
-- **SOCKS5 Proxy**: Privacy-focused traffic routing
+### Special Commands
+```bash
+npm run signaling-server              # Run WebRTC signaling server
+npm run test:e2e:real:uploader        # E2E uploader node only
+npm run test:e2e:real:downloader      # E2E downloader node only
+```
 
-#### Blockchain & Security
-- **Geth Integration**: Ethereum node for blockchain operations
-- **HD Wallets**: BIP32, BIP39, secp256k1 implementations
-- **AES-256-GCM**: File encryption with PBKDF2 key derivation
-- **HMAC Authentication**: Stream integrity verification
-- **Proof of Storage**: Solidity smart contract for storage verification
+## Core Architecture Concepts
 
-## Page Structure
+### 1. Decoupled Payment and Data Transfer
 
-The application uses client-side routing with the following pages:
+**Critical Design Principle**: Payment layer is completely separate from data transfer protocols.
 
-1. **Download** (default page) - File download management with search, history, and peer selection
-2. **Upload** - "Shared Files" page - instant seeding interface with drag & drop
-3. **Network** - Peer discovery, DHT status, NAT traversal monitoring
-4. **Relay** - Circuit Relay v2 configuration (server mode + client mode)
-5. **Mining** - CPU mining for network security (proof-of-work)
-6. **Proxy** - SOCKS5 proxy configuration and privacy routing
-7. **Analytics** - Usage statistics, bandwidth tracking, performance metrics
-8. **Reputation** - Peer reputation system with analytics and relay leaderboard
-9. **Account** - Wallet management, HD wallet support, transaction history
-10. **Settings** - Comprehensive configuration (storage, network, privacy, bandwidth scheduling, diagnostics, i18n)
+```
+Application Layer (File Management, UI)
+         │
+    ┌────┴────┐
+    │         │
+Payment    Data Transfer
+(Blockchain)  (HTTP/BitTorrent/WebTorrent/ed2k)
+    │         │
+    └────┬────┘
+         │
+   Settlement
+```
 
-### Removed Pages (Anti-Piracy Measures)
-- ❌ Search page (could enable finding copyrighted content)
-- ❌ Market page (no commercial transactions)
-- ❌ Bundles page (no selling file packages)
+This separation enables:
+- Protocol flexibility without changing payment logic
+- Adding new protocols (IPFS, custom) without touching blockchain code
+- Using established protocols (BitTorrent, ed2k) unmodified
+- Independent testing and evolution of each layer
 
-## State Management (`src/lib/stores.ts`)
+### 2. Protocol Manager Architecture
 
-### Core Stores
+The `ProtocolManager` (conceptual, see `docs/protocols.md`) provides a unified interface via `IContentProtocol`:
+
+**Key Operations**:
+- `getPeersServing()` - Find peers with content
+- `getFileMetadata()` - DHT metadata lookup
+- `getTransferTerms()` - Pricing/payment info
+- `getProtocolDetails()` - Protocol-specific config
+- `getContentFrom()` - Download from peer
+- `startSeeding()` / `stopSeeding()` - Upload/share
+- `pauseDownload()` / `resumeDownload()` / `cancelDownload()` - Transfer control
+
+### 3. DHT Bootstrap Flow (libp2p/Kademlia)
+
+Current implementation uses **single bootstrap node** architecture:
+
+1. **Connect to bootstrap node** - Dial configured multiaddress (e.g., `/ip4/bootstrap.chiral.network/tcp/4001/p2p/QmBootstrap`)
+2. **Seed routing table** - Add bootstrap peer to local Kademlia
+3. **Bootstrap walk** - Execute `kademlia.bootstrap()` to populate routing table via `FIND_NODE` queries
+4. **Periodic refresh** - Non-bootstrap peers run 1s interval loop to keep table fresh
+
+**Note**: Bootstrap node is flagged `is_bootstrap=true`, kept online permanently, and configured NOT to publish provider records (acts as pure router).
+
+### 4. Frontend-Backend Communication (Tauri)
+
+**Rust → Frontend**: Use Tauri `invoke()` system
+- Frontend calls: `await invoke('command_name', { params })`
+- Backend exports via `#[tauri::command]` macro
+- All commands registered in `src-tauri/src/main.rs`
+
+**Key Services**:
+- `src-tauri/src/dht.rs` - DHT operations (412KB file, core networking)
+- `src-tauri/src/bittorrent_handler.rs` - BitTorrent protocol (98KB)
+- `src-tauri/src/ed2k_client.rs` - eDonkey2000 protocol (64KB)
+- `src-tauri/src/ethereum.rs` - Blockchain integration (118KB)
+
+See `docs/tauri-commands.md` for full command reference.
+
+### 5. State Management (Svelte Stores)
+
+Central state in `src/lib/stores.ts`:
 
 ```typescript
 // File management
-files: FileItem[]                    // All files (downloading, seeding, completed)
-downloadQueue: FileItem[]            // Files waiting to download
-activeDownloads: number              // Current download count
+files: FileItem[]                    // All files (states: downloading, seeding, paused, etc.)
+downloadQueue: FileItem[]
+activeDownloads: number
 
 // Network
-peers: PeerInfo[]                    // Connected peers with metrics
-networkStats: NetworkStats           // Global network statistics
-networkStatus: NetworkStatus         // Connection status from networkService
-peerGeoDistribution: Derived         // Geographic distribution of peers
+peers: PeerInfo[]                    // Connected peers with reputation metrics
+networkStats: NetworkStats
+networkStatus: NetworkStatus
+peerGeoDistribution: Derived
 
-// Wallet & Transactions
-wallet: WalletInfo                   // Wallet address and balance
-etcAccount: ETCAccount | null        // Ethereum Classic account
-transactions: Transaction[]          // Transaction history
+// Wallet & Mining
+wallet: WalletInfo
+etcAccount: ETCAccount | null
+transactions: Transaction[]
+miningState: MiningState
 
-// Mining
-miningState: MiningState             // Mining status, hash rate, rewards, history
-miningProgress: MiningProgress       // Block progress tracking
-
-// Privacy & Proxy
-userLocation: string                 // User's region
-blacklist: BlacklistEntry[]          // Blacklisted peer addresses
-suspiciousActivity: ActivityLog[]    // Security monitoring
-
-// Settings
-settings: AppSettings                // Comprehensive app configuration
-activeTransfers: Map<>               // P2P/WebRTC transfer tracking
+// Privacy & Security
+userLocation: string
+blacklist: BlacklistEntry[]
+suspiciousActivity: ActivityLog[]
+settings: AppSettings
 ```
 
-### Key Interfaces
+Additional stores:
+- `src/lib/reputationStore.ts` - Peer reputation system
+- `src/lib/stores/searchHistory.ts` - Download search history
 
-**FileItem**: Supports multiple states (downloading, paused, completed, seeding, queued, canceled, failed), priority levels, encryption status, file versioning, multi-CID support, and visual ordering.
+### 6. Internationalization (i18n)
 
-**AppSettings**: Includes storage management, bandwidth limits (including bandwidth scheduling), network configuration (port, UPnP, NAT), proxy settings (SOCKS5), privacy modes, NAT traversal settings (AutoNAT v2, Circuit Relay v2, relay server mode), DHT configuration, notification preferences, and i18n.
+**Setup**: `src/i18n/i18n.ts` with `svelte-i18n` library
+**Languages**: EN, ES, RU, ZH, KO
+**Translation Files**: `src/locales/*.json`
+**Usage**: `$t('key.path')` in components
 
-**MiningState**: Tracks hash rate, rewards, blocks found, thread allocation, mining history for charts, recent blocks, and session persistence.
+**Flow**:
+1. `setupI18n()` called in `App.svelte` onMount
+2. Auto-detect language via geolocation
+3. Persist preference in localStorage
+4. All UI text must use translation keys
 
-**PeerInfo**: Includes reputation score, reliability metrics, geographic location, connection status, shared files, and last seen timestamp.
+### 7. Multi-Protocol Download Support
 
-## New Features Since Original CLAUDE.md
+**Supported Protocols**:
+- **HTTP/HTTPS**: Baseline with pause/resume via `download_restart.rs`
+- **BitTorrent**: Native integration via `librqbit` crate + custom Chiral extension
+- **WebTorrent**: Browser-compatible WebRTC-based torrenting
+- **ed2k/eDonkey2000**: Legacy P2P protocol support
+- **FTP/FTPS**: Resume-capable downloads with bookmarks
 
-### 1. Internationalization (i18n)
-- **Implementation**: svelte-i18n library
-- **Location**: `src/i18n/i18n.ts`, `src/locales/*.json`
-- **Languages**: English, Spanish, Russian, Chinese, Korean
-- **Usage**: All UI text uses `$t()` translation function
-- **Auto-detection**: Geolocation-based language detection on startup
+**Multi-Source Download**: `multiSourceDownloadService.ts` orchestrates parallel chunk downloads from multiple peers with intelligent peer selection based on reputation.
 
-### 2. Reputation System
-- **Page**: `src/pages/Reputation.svelte`
-- **Backend**: `src/lib/services/peerSelectionService.ts`
-- **Store**: `src/lib/reputationStore.ts`
-- **Types**: `src/lib/types/reputation.ts`
-- **Features**:
-  - Trust levels (Trusted, High, Medium, Low, Unknown)
-  - Composite scoring based on latency, bandwidth, uptime, transfers
-  - Analytics dashboard with trust level distribution
-  - Filtering by trust level, encryption support, uptime
-  - Sorting by score, interactions, last seen
-  - Relay reputation leaderboard
-  - Personal relay stats (if running as relay server)
+### 8. Testing Architecture
 
-### 3. Circuit Relay Infrastructure
-- **Page**: `src/pages/Relay.svelte`
-- **Configuration**:
-  - Relay Server Mode: Enable node to act as relay for NAT'd peers
-  - AutoRelay Client: Automatically find and use relay nodes
-  - Preferred Relays: Manual relay node configuration
-- **Features**:
-  - Circuit Relay v2 support
-  - Reservation management
-  - Relay health monitoring
-  - Reputation earning for relay operators
-  - Headless CLI support (`--enable-autorelay`, `--relay`, etc.)
+**Frontend Tests** (Vitest):
+- Unit tests in `tests/*.test.ts`
+- Component tests in `tests/components/`
+- E2E tests in `tests/e2e/`
+- Real network tests spawn actual Tauri nodes: `tests/e2e/real-network.test.ts`
 
-### 4. HD Wallet Implementation
-- **Location**: `src/lib/wallet/`
-- **Components**:
-  - `bip32.ts` - Hierarchical Deterministic wallet derivation
-  - `bip39.ts` - Mnemonic phrase generation and validation
-  - `secp256k1.ts` - Elliptic curve cryptography
-  - `hd.ts` - HD wallet utilities
-  - `wordlist-en.ts` - BIP39 English wordlist
-- **UI Components**:
-  - `MnemonicWizard.svelte` - Mnemonic generation/import
-  - `AccountList.svelte` - Account management
-- **Features**: QR code support, multiple accounts, secure key management
+**Rust Tests**:
+- Integration tests in `src-tauri/tests/`
+- 81 Rust source files in `src-tauri/src/`
+- Key test files:
+  - `dht_integration-test.rs` (DHT functionality)
+  - `bittorrent_integration_tests.rs` (BitTorrent protocol)
+  - `nat_traversal_e2e_test.rs` (NAT/relay testing)
+  - `download_restart_test.rs` (resume capability)
 
-### 5. DHT & libp2p Integration
-- **Location**: `src/lib/dht.ts`
-- **Backend**: Rust-based libp2p v0.54
-- **Features**:
-  - Kademlia DHT for file metadata
-  - Automatic peer discovery
-  - Bootstrap node support
-  - File metadata publishing/retrieval
-  - NAT reachability detection (AutoNAT v2)
-  - Circuit relay support
-  - Observed address tracking
-  - Health monitoring
+**Test Patterns**:
+```bash
+# Run specific Rust test with output
+cargo test dht_integration -- --nocapture
 
-### 6. WebRTC File Transfers
-- **Service**: `src/lib/services/webrtcService.ts`
-- **Signaling**: `src/lib/services/signalingService.ts`
-- **P2P Transfer**: `src/lib/services/p2pFileTransfer.ts`
-- **Features**:
-  - Direct peer-to-peer file transfer
-  - Chunk-based transfer with Bitswap
-  - Multi-source downloads
-  - Transfer encryption
-  - Progress tracking
-  - Connection state management
+# Run E2E test that spawns real nodes
+npm run test:e2e:real
 
-### 7. Multi-Source Downloads
-- **Service**: `src/lib/services/multiSourceDownloadService.ts`
-- **Features**:
-  - Parallel chunk downloads from multiple peers
-  - Intelligent peer selection based on reputation
-  - Bandwidth aggregation
-  - Automatic failover
-  - Chunk verification
-
-### 8. Bandwidth Scheduling
-- **Service**: `src/lib/services/bandwidthScheduler.ts`
-- **Interface**: `BandwidthScheduleEntry` in stores
-- **Features**:
-  - Time-based bandwidth limits (HH:MM format)
-  - Day-of-week rules (0-6, 0 = Sunday)
-  - Separate upload/download limits
-  - Multiple schedule support
-  - Enable/disable toggle
-  - Automatic schedule application
-
-### 9. File Encryption
-- **Service**: `src/lib/services/encryption.ts`
-- **Algorithm**: AES-256-GCM with PBKDF2 key derivation
-- **Features**:
-  - Upload encryption with recipient public key
-  - Download decryption with key management
-  - WebRTC chunk encryption
-  - Key fingerprinting
-  - Manifest-based chunk tracking
-
-### 10. Download Search & History
-- **Components**:
-  - `DownloadSearchSection.svelte`
-  - `SearchHistoryPanel.svelte`
-  - `SearchResultCard.svelte`
-  - `PeerSelectionModal.svelte`
-- **Store**: `src/lib/stores/searchHistory.ts`
-- **Features**:
-  - File hash search
-  - Search history tracking
-  - Peer selection modal
-  - Seeder/leecher display
-  - Quick re-download
-
-### 11. Geth Integration
-- **Service**: `src/lib/services/gethService.ts`
-- **Component**: `GethDownloader.svelte`, `GethStatusCard.svelte`
-- **Features**: Ethereum node integration, transaction handling, blockchain operations
-
-### 12. Advanced Services
-
-#### Analytics Service (`analyticsService.ts`)
-- Bandwidth tracking (upload/download)
-- Storage metrics
-- Network activity monitoring
-- Historical data persistence
-
-#### Peer Services
-- `peerService.ts` - Peer connection management
-- `peerEventService.ts` - Peer event handling
-- `peerSelectionService.ts` - Intelligent peer selection with reputation
-
-#### File Services
-- `fileService.ts` - File operation management
-- `seedPersistence.ts` - Seed state persistence
-- `p2pFileTransfer.ts` - P2P transfer protocol
-
-#### Network Services
-- `networkService.ts` - Network monitoring and status
-- `geolocation.ts` - User region detection
-- `proxyLoadBalancer.ts` - Proxy load balancing
-- `proxyLatencyOptimization.ts` - Proxy performance optimization
-
-#### Privacy & Security
-- `privacyService.ts` - Privacy mode management
-- `proxyAuth.ts` - Proxy authentication
-- `encryption.ts` - File encryption utilities
-
-#### System Diagnostics
-- `diagnosticsService.ts` - Comprehensive system health checks
-  - 13 diagnostic tests across 5 categories
-  - Environment, network, storage, security, system checks
-  - Real-time DHT, AutoNAT, Circuit Relay status
-  - Storage validation and disk space monitoring
-  - Encryption capability and WebRTC support testing
-  - Exportable text reports for troubleshooting
-
-### 13. Smart Contracts
-- **Location**: `src/lib/services/ProofOfStorage.sol`
-- **Purpose**: Proof of Storage consensus mechanism
-- **Language**: Solidity
-
-### 14. UI Components
-
-#### Core Components
-- `Modal.svelte` - Reusable modal dialog
-- `SimpleToast.svelte` - Toast notifications
-- `WindowControls.svelte` - Desktop window controls
-- `TransactionList.svelte` - Transaction history display
-- `TransactionReceipt.svelte` - Transaction details
-- `PeerMetrics.svelte` - Peer performance metrics
-
-#### Reputation Components
-- `ReputationCard.svelte` - Individual peer reputation display
-- `ReputationAnalytics.svelte` - System-wide reputation analytics
-- `RelayReputationLeaderboard.svelte` - Top relay nodes
-
-#### Geo/Network Components
-- `GeoDistributionCard.svelte` - Geographic distribution visualization
-
-#### UI Primitives (`src/lib/components/ui/`)
-- `button.svelte`, `card.svelte`, `input.svelte`, `label.svelte`
-- `badge.svelte`, `progress.svelte`, `dropDown.svelte`
-- `Expandable.svelte`
-
-### 15. System Diagnostics
-- **Service**: `src/lib/services/diagnosticsService.ts`
-- **Location**: Settings → Diagnostics section
-- **Features**:
-  - 13 comprehensive health checks across 5 categories
-  - Environment detection (Tauri vs web build)
-  - Network health (DHT connectivity, peer count, bootstrap nodes)
-  - NAT traversal status (AutoNAT v2, Circuit Relay v2)
-  - Storage validation (path, permissions, disk space)
-  - Security checks (proxy config, encryption capability)
-  - System tests (WebRTC support, bandwidth limits, LocalStorage)
-  - Real-time status indicators (pass/warn/fail/info)
-  - Exportable text reports for troubleshooting
-  - Graceful handling of non-existent directories
-  - Parent directory fallback for disk space checks
-
-### 16. Advanced FTP Features
-- **Module**: `src-tauri/src/ftp_client.rs`
-- **Bookmarks**: `src-tauri/src/ftp_bookmarks.rs`
-- **Commands**: 11 new Tauri commands for FTP operations
-- **Features**:
-  - **Resume Capability**: Automatic resume of interrupted downloads
-    - Detects partial files and calculates resume position
-    - Uses FTP REST command to resume from last byte
-    - Appends to existing partial files
-    - Progress tracking from resume position
-  - **Directory Listing**: Browse remote FTP directories
-    - Parse Unix-style directory listings
-    - Extract file metadata (name, size, permissions, modified date)
-    - Distinguish between files and directories
-    - Filter out current/parent directory entries
-  - **File Operations**: Remote file management
-    - Delete files or directories (automatic detection)
-    - Rename files or directories
-    - Create new directories
-    - Works with both FTP and FTPS
-  - **Server Bookmarks**: Save and manage FTP server configurations
-    - Full CRUD operations (create, read, update, delete)
-    - Search by name, URL, tags, or notes
-    - Usage tracking (use count, last used timestamp)
-    - Sort by most used or recently used
-    - Import/Export with merge option
-    - JSON storage in config directory
-  - **FTPS Support**: Secure FTP over TLS
-  - **Passive Mode**: Better firewall/NAT compatibility
-- **Tauri Commands**:
-  - `list_ftp_directory` - Browse FTP directories
-  - `delete_ftp_file` - Delete remote files/folders
-  - `rename_ftp_file` - Rename remote files/folders
-  - `create_ftp_directory` - Create remote directories
-  - `load_ftp_bookmarks` - Load saved bookmarks
-  - `add_ftp_bookmark` - Add new bookmark
-  - `update_ftp_bookmark` - Update existing bookmark
-  - `delete_ftp_bookmark` - Delete bookmark
-  - `search_ftp_bookmarks` - Search bookmarks
-  - `record_ftp_bookmark_usage` - Track bookmark usage
-  - `test_ftp_connection` - Test server connectivity
+# Run cross-machine E2E test (uploader on one machine, downloader on another)
+npm run test:e2e:real:uploader    # Machine A
+npm run test:e2e:real:downloader  # Machine B
+```
 
 ## Key Implementation Details
 
-### File Sharing Model
-- Files are **instantly seeded** when added (no pending/uploaded distinction)
-- Each file gets a cryptographic hash (SHA-256)
-- Files can be encrypted with AES-256-GCM
-- Metadata published to Kademlia DHT
-- Files show real-time seeder/leecher counts
-- Continuous seeding until manually removed
-- Support for file versioning
-- Multi-CID support for chunked files
-
-### NAT Traversal Architecture
+### NAT Traversal Stack
 1. **AutoNAT v2**: Automatic reachability detection with confidence scoring
 2. **Circuit Relay v2**: Relay reservation for NAT'd peers
-3. **DCUtR**: Hole punching for direct connections
+3. **DCUtR**: Direct Connection Upgrade through Relay (hole punching)
 4. **mDNS**: Local network peer discovery
 5. **SOCKS5 Proxy**: Privacy-focused routing
 
+### File Sharing Model
+- Files are **instantly seeded** when added (no "pending" state)
+- Each file gets SHA-256 hash
+- Metadata published to Kademlia DHT
+- Files show real-time seeder/leecher counts
+- Continuous seeding until manually removed
+- Support for AES-256-GCM encryption with PBKDF2 key derivation
+- Multi-CID support for chunked files (256KB chunks)
+
+### Blockchain Parameters
+- **Network ID**: 98765
+- **Chain ID**: 98765 (EIP-155)
+- **Block Time**: ~15 seconds
+- **Mining Algorithm**: Ethash (ASIC-resistant PoW)
+- **Initial Reward**: 2 Chiral
+- **Ports**: P2P (30304), RPC (8546), WebSocket (8547), File Transfer (8080), DHT (4001)
+
 ### Routing System
-- **Router**: `@mateothegreat/svelte5-router`
+- **Router**: `@mateothegreat/svelte5-router` (Svelte 5 compatible)
 - **Route Config**: Defined in `App.svelte`
-- **Navigation**: Context-based navigation with `goto()` function
-- **404 Handling**: NotFound page for invalid routes
-- **Browser History**: Synced with browser back/forward
-- **Scroll Management**: Auto-scroll to top on page change
+- **Pages**: Download (default), Upload, Network, Relay, Mining, Proxy, Analytics, Reputation, Account, Settings
+- **404 Handling**: NotFound page
 
-### Internationalization Flow
-1. **Initialization**: `setupI18n()` called in `App.svelte` onMount
-2. **Auto-detection**: Geolocation-based language detection
-3. **Persistence**: User preference stored in localStorage
-4. **Usage**: `$t('key.path')` for all UI text
-5. **Locale Files**: JSON files in `src/locales/`
+## Common Development Tasks
 
-### Mining Implementation
-- **Backend**: Geth integration for real blockchain mining
-- **UI**: Mining page with thread control, intensity adjustment
-- **History**: Mining history tracking with hash rate charts
-- **Rewards**: Block rewards tracked (some values are mock data)
-- **Persistence**: Session state saved to localStorage
-- **Power Monitoring**: Real-time power consumption monitoring
-  - Windows: PowerShell performance counters and WMI
-  - Linux: RAPL (Running Average Power Limit) interface
-  - macOS: SMC (System Management Controller) readings with CPU usage fallback
+### Adding a New Frontend Service
 
-## Development Guidelines
+1. Create file in `src/lib/services/`
+2. Export as singleton or factory pattern
+3. Add TypeScript interfaces for all types
+4. Integrate with Tauri backend via `invoke()` if needed
+5. Update relevant stores in `src/lib/stores.ts`
+6. Add error handling and logging
 
-### When Adding Features
+### Working with DHT
+
+1. DHT operations are in Rust backend: `src-tauri/src/dht.rs`
+2. Frontend calls via Tauri `invoke('dht_*', { params })`
+3. File metadata uses `FileMetadata` interface
+4. Monitor DHT health with `DhtHealth` interface
+5. Handle NAT traversal states (public/private/unknown)
+
+### Adding Translations
+
+1. Add keys to ALL locale files in `src/locales/`: `en.json`, `es.json`, `ru.json`, `zh.json`, `ko.json`
+2. Use descriptive key paths: `reputation.filters.trustLevel`
+3. Test with multiple languages
+4. Maintain consistency across translations
+
+### Running System Diagnostics
+
+Built-in diagnostics available in Settings → Diagnostics:
+- 13 comprehensive health checks across 5 categories
+- Environment, network, storage, security, system tests
+- Real-time DHT, AutoNAT, Circuit Relay status
+- Exportable text reports for troubleshooting
+
+See `src/lib/services/diagnosticsService.ts`
+
+## Important Constraints
+
+### What NOT to Implement
+
+**Commercial & Piracy Features** (NEVER add):
+- Global file search/discovery (could enable piracy)
+- Price fields or payment systems for file trading
+- File marketplace or trading features
+- Content recommendations
+- Social features (comments, likes, reviews)
+- Analytics that could track users
+
+**VPN/Anonymity Network Features** (We are NOT building a VPN):
+- ❌ VPN service functionality
+- ❌ General internet traffic routing
+- ❌ Exit node functionality
+- ❌ Anonymous browsing capabilities
+- ❌ Traffic mixing/onion routing
+
+**What we DO support** (limited to file sharing):
+- ✅ SOCKS5 proxy support (use existing proxies like Tor)
+- ✅ Circuit Relay v2 (for NAT traversal, not anonymity)
+- ✅ File encryption (protect file content)
+- ✅ Anonymous mode (hide IP during P2P file transfers only)
+
+### Development Guidelines
 
 1. **No Commercial Elements**: Never add pricing, trading, or marketplace features
 2. **Privacy First**: Always consider user privacy and anonymity
@@ -421,346 +302,91 @@ activeTransfers: Map<>               // P2P/WebRTC transfer tracking
 6. **i18n Support**: Add translation keys for all new UI text
 7. **Type Safety**: Use TypeScript interfaces for all data structures
 
-### Code Style
+## Module Organization
 
-- Use TypeScript for type safety
-- Follow existing Svelte 5 patterns (runes, reactive statements)
-- Keep components small and focused
-- Use Tailwind classes for styling
-- Add translation keys to locale files
-- Document complex services with JSDoc comments
-- Use consistent naming conventions
+### Rust Backend (`src-tauri/src/`)
+- 81 Rust files (55 in root, 26 in subdirectories)
+- Key modules exported in `lib.rs`:
+  - `protocols` - Protocol implementations
+  - `dht` - DHT/libp2p integration
+  - `multi_source_download` - Multi-source orchestration
+  - `download_restart` - Resume capability
+  - `bittorrent_handler` - BitTorrent protocol
+  - `ed2k_client` - eDonkey2000 protocol
+  - `ftp_client` / `ftp_bookmarks` - FTP support
+  - `ethereum` - Blockchain integration
+  - `encryption` / `keystore` - Security
+  - `reputation` - Peer reputation system
+  - `payment_checkpoint` - Payment integration
 
-### Testing Approach
-
-- Test with mock data first
-- Ensure UI works without backend
-- Verify drag-and-drop functionality
-- Test responsive design
-- Test i18n with multiple languages
-- Run vitest tests: `npm test`
-
-### Adding Translations
-
-1. Add keys to all locale files in `src/locales/`
-2. Use descriptive key paths (e.g., `reputation.filters.trustLevel`)
-3. Test with all languages
-4. Maintain consistency across translations
-
-## Common Tasks
-
-### Adding a New Page
-
-1. Create component in `src/pages/`
-2. Import in `App.svelte`
-3. Add to `routes` array in `App.svelte`
-4. Add to `menuItems` array with icon
-5. Add translation keys for nav label
-6. Update route handling
-
-### Modifying Stores
-
-1. Update interfaces in `stores.ts`
-2. Add TypeScript types
-3. Update dependent components
-4. Test state reactivity
-5. Ensure localStorage persistence if needed
-
-### Adding a New Service
-
-1. Create service file in `src/lib/services/`
-2. Export service as singleton or factory
-3. Add TypeScript interfaces for all types
-4. Integrate with Tauri backend if needed
-5. Update relevant stores
-6. Add error handling
-
-### Working with DHT/libp2p
-
-1. DHT operations are backend (Rust) via Tauri `invoke()`
-2. File metadata: `FileMetadata` interface
-3. Use `dhtService` from `src/lib/dht.ts`
-4. Monitor DHT health with `DhtHealth` interface
-5. Handle NAT traversal states
-
-### Adding UI Components
-
-1. Create in `src/lib/components/` or subdirectory
-2. Use TypeScript for props
-3. Follow accessibility best practices (Bits UI)
-4. Add i18n support with `$t()`
-5. Use existing UI primitives when possible
-6. Make responsive with Tailwind
-
-## Architecture Decisions
-
-### Why Svelte 5?
-- Modern reactive system with runes
-- Better performance than Svelte 4
-- Improved TypeScript support
-- Simpler state management
-
-### Why @mateothegreat/svelte5-router?
-- Svelte 5 compatible
-- Simple, declarative routing
-- Type-safe route configuration
-- Supports 404 handling
-
-### Why libp2p?
-- Industry-standard P2P networking
-- Built-in NAT traversal
-- Modular protocol stack
-- Production-ready DHT implementation
-- Strong privacy features
-
-### Why Separate Blockchain?
-- Custom parameters for file sharing use case
-- No reliance on external networks
-- Proof of Storage integration
-- Mining rewards for network participation
-
-### Why HD Wallets?
-- Secure key management
-- Multiple account support
-- Industry-standard (BIP32/BIP39)
-- Recovery phrase backup
-
-## Security Considerations
-
-### Implemented Security
-- Input validation on all forms
-- XSS protection in user content
-- Secure random for IDs
-- AES-256-GCM file encryption
-- PBKDF2 key derivation
-- HMAC stream authentication
-- No centralized servers to compromise
-- HD wallet security
-- Private key protection
-
-### Privacy Features
-- Anonymous mode with mandatory relay/proxy routing
-- SOCKS5 proxy support
-- Circuit Relay v2 for IP hiding
-- Encrypted file transfers
-- No analytics tracking in anonymous mode
-
-### Best Practices
-- Never log private keys
-- Sanitize all user inputs
-- Validate file sizes and types
-- Use secure WebRTC connections
-- Verify peer identities
-- Rate limiting on network operations
-
-## Performance Optimizations
-
-### Current Optimizations
-- Virtual scrolling for large lists
-- Lazy loading of components
-- Efficient state management with Svelte 5
-- Debounced search inputs
-- Progressive file streaming
-- Chunk-based file transfers
-- Multi-source parallel downloads
-- Bandwidth scheduling
-
-### Monitoring
-- Analytics service tracks performance
-- DHT health monitoring
-- Peer latency tracking
-- Bandwidth usage metrics
-- Mining hash rate monitoring
-
-## Future Enhancements (Allowed)
-
-### Phase 3+ Priorities
-- [ ] WebAssembly for crypto operations
-- [ ] Service workers for offline support
-- [ ] Advanced compression for network traffic
-- [ ] Database indexing for faster searches
-- [ ] Enhanced file versioning UI
-- [ ] Advanced relay discovery mechanisms
-- [ ] Improved geolocation accuracy
-- [ ] Mobile app version
-- [ ] Hardware wallet support
-
-### Phase 4+ Possibilities
-- [ ] IPFS compatibility layer
-- [ ] Advanced analytics dashboard
-- [ ] Network visualization tools
-- [ ] Automated testing framework
-- [ ] Performance benchmarking suite
-
-## What NOT to Implement
-
-### Commercial & Piracy-Enabling Features
-
-**Never add:**
-- Global file search/discovery (could enable piracy)
-- Price fields or payment systems
-- File marketplace or trading
-- Content recommendations
-- Social features (comments, likes, reviews)
-- Advertising systems
-- Analytics that could track users
-- Centralized market servers
-
-### VPN & General Anonymity Network Features
-
-**We are NOT building a VPN or anonymity network:**
-- ❌ VPN service functionality
-- ❌ General internet traffic routing (only P2P file transfer traffic)
-- ❌ Exit node functionality (no routing of non-P2P traffic)
-- ❌ Anonymous browsing capabilities
-- ❌ Full anonymity network features
-- ❌ Traffic mixing/onion routing
-
-**What we DO support** (limited to file sharing):
-- ✅ SOCKS5 proxy support (use existing proxies like Tor)
-- ✅ Circuit Relay v2 (for NAT traversal, not anonymity)
-- ✅ File encryption (protect file content)
-- ✅ Anonymous mode (hide IP during P2P file transfers only)
-
-**Why?**
-1. Legal compliance - VPN/anonymity networks attract regulatory scrutiny
-2. Resource focus - Different expertise and infrastructure required
-3. Liability concerns - General traffic routing creates legal risks
-4. Mission clarity - We're a file sharing platform, not a privacy network
-
-## Deployment
-
-```bash
-# Development
-npm run dev              # Web dev server
-npm run tauri:dev        # Desktop app with hot reload
-
-# Production build
-npm run build            # Web production build
-npm run tauri:build      # Desktop production build
-
-# Testing
-npm test                 # Run vitest tests
-npm run test:watch       # Watch mode
-
-# Type checking
-npm run check            # TypeScript type check
+### Frontend (`src/`)
 ```
+src/
+├── i18n/                    # Internationalization
+├── lib/
+│   ├── components/          # Reusable components
+│   │   ├── download/        # Download-specific
+│   │   ├── ui/              # UI primitives
+│   │   └── wallet/          # Wallet components
+│   ├── services/            # Frontend services (39 files)
+│   ├── stores/              # Additional stores
+│   ├── types/               # TypeScript types
+│   ├── utils/               # Utility functions
+│   ├── wallet/              # HD wallet (BIP32/BIP39)
+│   ├── dht.ts               # DHT config
+│   └── stores.ts            # Main state
+├── locales/                 # Translation JSON files
+├── pages/                   # Application pages (10 pages)
+├── routes/                  # Special routes
+├── App.svelte               # Main app + routing
+└── main.ts                  # Entry point
+```
+
+## Documentation
+
+- `docs/architecture.md` - Decoupled architecture design
+- `docs/protocols.md` - Protocol Manager and IContentProtocol interface
+- `docs/network-protocol.md` - DHT, bootstrap, and message formats
+- `docs/technical-specifications.md` - Network parameters and specs
+- `docs/implementation-guide.md` - Development workflows
+- `docs/tauri-commands.md` - Backend command reference
+- `docs/user-guide.md` - End-user documentation
+
+Full documentation index: `docs/index.md`
 
 ## Troubleshooting
 
-### Using Built-in Diagnostics
-
-**Run system diagnostics first** (Settings → Diagnostics):
-- Checks environment, network, storage, security, and system health
-- 13 comprehensive tests with color-coded results
-- Export report for bug reports
-- See `docs/user-guide.md` for interpretation guide
-
 ### Common Issues
 
-1. **Extra `</script>` tags**: Check Svelte files end correctly
-2. **Import errors**: Ensure all pages are properly imported in `App.svelte`
-3. **Drag-drop failing**: Verify event handlers are attached to correct elements
-4. **i18n not loading**: Check `setupI18n()` is called in `App.svelte`
-5. **DHT not connecting**: Run diagnostics, verify bootstrap nodes are reachable
-6. **Mining not starting**: Check Geth service is initialized
-7. **Tauri invoke errors**: Ensure backend commands are registered
-8. **Storage path errors**: Diagnostics will show if directory is missing/inaccessible
-9. **NAT/Relay issues**: Check diagnostics for AutoNAT and Circuit Relay status
+1. **DHT not connecting**: Run diagnostics (Settings → Diagnostics), verify bootstrap nodes
+2. **Mining not starting**: Check Geth service initialization
+3. **Tauri invoke errors**: Ensure backend commands are registered in `main.rs`
+4. **Storage path errors**: Diagnostics will show if directory is missing/inaccessible
+5. **NAT/Relay issues**: Check diagnostics for AutoNAT and Circuit Relay status
 
 ### Debug Commands
-
 ```bash
-# Check for syntax errors
-npm run check
-
-# Clean and rebuild
+# Clean rebuild
 rm -rf node_modules dist
 npm install
 npm run build
 
-# View DHT logs (in dev mode)
-# Check browser console for DHT events
+# Type checking
+npm run check
 
-# Test vitest
+# Verbose test output
 npm test -- --reporter=verbose
+cargo test -- --nocapture
 ```
 
-## File Organization
+## Repository Notes
 
-```
-src/
-├── i18n/                    # Internationalization
-│   └── i18n.ts
-├── lib/
-│   ├── components/          # Reusable components
-│   │   ├── download/        # Download-specific components
-│   │   ├── ui/              # UI primitives
-│   │   └── wallet/          # Wallet components
-│   ├── services/            # Backend services
-│   │   ├── analyticsService.ts
-│   │   ├── bandwidthScheduler.ts
-│   │   ├── diagnosticsService.ts
-│   │   ├── fileService.ts
-│   │   ├── gethService.ts
-│   │   ├── multiSourceDownloadService.ts
-│   │   ├── networkService.ts
-│   │   ├── p2pFileTransfer.ts
-│   │   ├── peerSelectionService.ts
-│   │   ├── privacyService.ts
-│   │   ├── webrtcService.ts
-│   │   └── ...
-│   ├── stores/              # Additional stores
-│   │   └── searchHistory.ts
-│   ├── types/               # TypeScript type definitions
-│   │   └── reputation.ts
-│   ├── utils/               # Utility functions
-│   │   └── validation.ts
-│   ├── wallet/              # HD wallet implementation
-│   │   ├── bip32.ts
-│   │   ├── bip39.ts
-│   │   ├── secp256k1.ts
-│   │   └── ...
-│   ├── dht.ts               # DHT configuration and utilities
-│   ├── stores.ts            # Main state stores
-│   ├── reputationStore.ts   # Reputation state
-│   └── ...
-├── locales/                 # Translation files
-│   ├── en.json
-│   ├── es.json
-│   ├── ru.json
-│   ├── zh.json
-│   └── ko.json
-├── pages/                   # Application pages
-│   ├── Account.svelte
-│   ├── Analytics.svelte
-│   ├── Download.svelte
-│   ├── Mining.svelte
-│   ├── Network.svelte
-│   ├── NotFound.svelte
-│   ├── Proxy.svelte
-│   ├── Relay.svelte
-│   ├── Reputation.svelte
-│   ├── Settings.svelte
-│   └── Upload.svelte
-├── routes/                  # Special routes
-│   └── proxy-self-test.svelte
-├── App.svelte               # Main app component
-└── main.ts                  # Entry point
-```
-
-## Contact & Support
-
-For questions about design decisions or implementation details, refer to:
-
-1. This CLAUDE.md file
-2. README.md for user-facing documentation
-3. Git history for decision context
-4. Community support via Zulip
+- **Main Branch**: `main`
+- **Current Version**: v0.1.0
+- **License**: MIT
+- **Support**: Zulip (https://brooknet.zulipchat.com/join/f3jj4k2okvlfpu5vykz5kkk5/)
+- **Issues**: GitHub Issues
 
 ---
 
-_Last Updated: October 2024_
-_Current Version: v0.1.0_
-_Focus: Fully decentralized BitTorrent-like P2P sharing with blockchain integration_
+*Last Updated: January 2025*

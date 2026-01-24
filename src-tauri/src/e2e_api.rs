@@ -655,15 +655,16 @@ async fn api_upload_generate(
             }))
             .into_response();
         };
+        // Trigger search and poll cache for metadata
+        let _ = dht.search_metadata(expected_merkle_root.clone(), 1500).await;
+
         let mut found = None;
         for _ in 0..40 {
-            match dht.synchronous_search_metadata(expected_merkle_root.clone(), 1500).await {
-                Ok(m) if m.is_some() => {
-                    found = m;
-                    break;
-                }
-                _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            if let Some(m) = dht.get_cached_metadata(&expected_merkle_root).await {
+                found = Some(m);
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         if found.is_none() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::http_server::ErrorResponse {
@@ -708,10 +709,24 @@ async fn api_search(
     };
 
     let timeout = req.timeout_ms.unwrap_or(10_000);
-    match dht.synchronous_search_metadata(req.file_hash, timeout).await {
-        Ok(m) => (StatusCode::OK, Json(m)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::http_server::ErrorResponse { error: e })).into_response(),
+
+    // Trigger search
+    if let Err(e) = dht.search_metadata(req.file_hash.clone(), timeout).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::http_server::ErrorResponse { error: e })).into_response();
     }
+
+    // Poll cache for metadata
+    let poll_iterations = (timeout / 100) as usize;
+    let mut metadata = None;
+    for _ in 0..poll_iterations {
+        if let Some(m) = dht.get_cached_metadata(&req.file_hash).await {
+            metadata = Some(m);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    (StatusCode::OK, Json(metadata)).into_response()
 }
 
 async fn api_download(
@@ -727,12 +742,20 @@ async fn api_download(
         .into_response();
     };
 
-    let meta_opt = match dht.synchronous_search_metadata(req.file_hash.clone(), 10_000).await {
-        Ok(m) => m,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::http_server::ErrorResponse { error: e })).into_response();
+    // Trigger search and poll cache
+    if let Err(e) = dht.search_metadata(req.file_hash.clone(), 10_000).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(crate::http_server::ErrorResponse { error: e })).into_response();
+    }
+
+    let mut meta_opt = None;
+    for _ in 0..100 {  // 100 * 100ms = 10s
+        if let Some(m) = dht.get_cached_metadata(&req.file_hash).await {
+            meta_opt = Some(m);
+            break;
         }
-    };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
     let Some(meta) = meta_opt else {
         return (StatusCode::NOT_FOUND, Json(crate::http_server::ErrorResponse {
             error: "Metadata not found".to_string(),

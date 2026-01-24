@@ -1224,7 +1224,7 @@
 
         // Construct protocol-specific hash for display
         let protocolHash = metadata.merkleRoot || "";
-        if ((selectedProtocol as "WebRTC" | "BitTorrent" | "ED2K" | "FTP") === "BitTorrent" && metadata.infoHash) {
+        if (selectedProtocol === "BitTorrent" && metadata.infoHash) {
           // Construct magnet link for BitTorrent
           const trackers = metadata.trackers
             ? metadata.trackers.join("&tr=")
@@ -1351,7 +1351,7 @@
     { value: "BitTorrent", label: "BitTorrent" },
     { value: "ED2K", label: "ED2K" },
     { value: "FTP", label: "FTP" },
-    { value: "BitSwap", label: "BitSwap"}
+    { value: "Bitswap", label: "BitSwap"}
   ];
 
   async function handleCopy(hash: string) {

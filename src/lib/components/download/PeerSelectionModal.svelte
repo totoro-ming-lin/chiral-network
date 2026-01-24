@@ -1,11 +1,13 @@
 <script context="module" lang="ts">
   export interface PeerInfo {
     peerId: string;
+    walletAddress?: string;
     location?: string;
     latency_ms?: number;
     bandwidth_kbps?: number;
     reliability_score: number;
     price_per_mb: number;
+    offerSource?: 'seeder' | 'fallback';
     selected: boolean;
     percentage: number;
   }
@@ -18,6 +20,7 @@
   import Badge from '$lib/components/ui/badge.svelte';
   import { Server, Zap, TrendingUp, Clock, X, Download, Globe, Wifi } from 'lucide-svelte';
   import { toHumanReadableSize } from '$lib/utils';
+  import { costFromPricePerMb, pickLowestPricePeer, weightedTotalCost } from '$lib/utils/pricing';
 
   export let show = false;
   export let fileName: string;
@@ -37,13 +40,21 @@
     cancel: void;
   }>();
 
-  // Calculate total cost
-  $: totalCost = peers
-    .filter(p => p.selected)
-    .reduce((sum, p) => {
-      const peerCost = (fileSize / 1024 / 1024) * p.price_per_mb;
-      return sum + (mode === 'manual' ? peerCost * (p.percentage / 100) : peerCost / peers.filter(p => p.selected).length);
-    }, 0);
+  $: selectedPeers = peers.filter(p => p.selected);
+
+  // Single payee model: pay the selected peer with the lowest offer.
+  $: paymentPeer = pickLowestPricePeer(peers);
+  $: requiresPaymentPeer = !isTorrent && !isSeeding && protocol !== 'ftp';
+
+  // Weighted total is still useful as an informational "blended" cost,
+  // but the actual payment goes to a single peer.
+  $: weightedCost = weightedTotalCost({ bytes: fileSize, peers });
+
+  $: estimatedPayment = (() => {
+    if (isSeeding) return 0;
+    if (!paymentPeer) return null;
+    return costFromPricePerMb({ bytes: fileSize, pricePerMb: paymentPeer.price_per_mb });
+  })();
 
   // Format speed
   function formatSpeed(kbps?: number): string {
@@ -95,7 +106,9 @@
     : 100;
 
   $: isValidAllocation = totalAllocation === 100;
-  $: selectedPeerCount = peers.filter(p => p.selected).length;
+  $: selectedPeerCount = selectedPeers.length;
+
+  $: hasValidPaymentPeer = !requiresPaymentPeer || (!!paymentPeer && !!paymentPeer.walletAddress);
 </script>
 
 {#if show}
@@ -302,16 +315,35 @@
               {selectedPeerCount} of {peers.length}
             </Badge>
           </div>
-          <div class="flex justify-between items-center">
-            <span class="font-medium text-sm">Estimated Cost:</span>
-            <span class="text-green-600 dark:text-green-400 font-bold">
-              {#if isSeeding}
-                Free
-              {:else}
-                {Math.max(totalCost, 0.0001).toFixed(4)} Chiral
-              {/if}
-            </span>
-          </div>
+           <div class="flex justify-between items-center">
+             <span class="font-medium text-sm">Estimated Payment:</span>
+             <span class="text-green-600 dark:text-green-400 font-bold">
+               {#if isSeeding}
+                 Free
+               {:else if estimatedPayment === null}
+                 Loading...
+               {:else}
+                 {estimatedPayment.toFixed(4)} Chiral
+               {/if}
+             </span>
+           </div>
+           {#if !isSeeding && !isTorrent && protocol !== 'ftp'}
+             <div class="flex justify-between items-center">
+               <span class="font-medium text-sm">Paying:</span>
+               <span class="text-sm text-muted-foreground">
+                 {#if paymentPeer}
+                   <code class="font-mono">{paymentPeer.peerId.slice(0, 12)}...</code>
+                   <span class="ml-2">@ {paymentPeer.price_per_mb.toFixed(4)} / MB</span>
+                 {:else}
+                   —
+                 {/if}
+               </span>
+             </div>
+             <div class="flex justify-between items-center">
+               <span class="font-medium text-sm">Blended Estimate:</span>
+               <span class="text-sm text-muted-foreground">{Math.max(weightedCost, 0.0001).toFixed(4)} Chiral</span>
+             </div>
+           {/if}
           {#if mode === 'manual'}
             <div class="flex justify-between items-center">
               <span class="font-medium text-sm">Total Allocation:</span>
@@ -338,7 +370,7 @@
           </Button>
           <Button
             on:click={handleConfirm}
-            disabled={!isTorrent && mode === 'manual' && (!isValidAllocation || selectedPeerCount === 0)}
+            disabled={(!isTorrent && mode === 'manual' && (!isValidAllocation || selectedPeerCount === 0)) || (!isTorrent && selectedPeerCount === 0) || !hasValidPaymentPeer}
           >
             <Download class="h-4 w-4 mr-2" />
             {isTorrent ? 'Start Download' : `Start Download (${selectedPeerCount} ${selectedPeerCount === 1 ? 'peer' : 'peers'})`}

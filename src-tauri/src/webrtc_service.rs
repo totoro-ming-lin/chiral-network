@@ -1351,21 +1351,19 @@ impl WebRTCService {
             peer_id, request.file_hash, request.file_name
         );
 
-        // Check if we have the file locally
-        let stored_files = file_transfer_service
-            .get_stored_files()
+        // Prefer checking actual data availability. Stored-file listing relies on .meta files and
+        // can fail (missing dir, permissions, partial writes) even when the file exists.
+        let has_file_data = file_transfer_service
+            .get_file_data(&request.file_hash)
             .await
-            .unwrap_or_default();
-        
-        info!("📂 Checking {} stored files for hash {}", stored_files.len(), request.file_hash);
-        
-        let has_file = stored_files
-            .iter()
-            .any(|(hash, _)| hash == &request.file_hash);
+            .is_some();
 
-        info!("📂 File {} found: {}", request.file_hash, has_file);
+        info!(
+            "📂 Local data available for {}: {}",
+            request.file_hash, has_file_data
+        );
 
-        if has_file {
+        if has_file_data {
             // Spawn file transfer as a separate task so the message handler
             // can continue processing incoming ACKs concurrently
             let peer_id = peer_id.to_string();
@@ -1407,10 +1405,30 @@ impl WebRTCService {
                 }
             });
         } else {
-            error!("❌ File {} not found locally - cannot fulfill request from peer {}", request.file_hash, peer_id);
-            // Log available files for debugging
-            let available_hashes: Vec<_> = stored_files.iter().map(|(h, _)| h.clone()).collect();
-            info!("📂 Available file hashes: {:?}", available_hashes);
+            error!(
+                "❌ File {} not found locally - cannot fulfill request from peer {}",
+                request.file_hash, peer_id
+            );
+
+            // Best-effort debug info: list available hashes if we can read the directory.
+            match file_transfer_service.get_stored_files().await {
+                Ok(stored_files) => {
+                    info!(
+                        "📂 Checked {} stored files while handling request for {}",
+                        stored_files.len(),
+                        request.file_hash
+                    );
+                    let available_hashes: Vec<_> =
+                        stored_files.iter().map(|(h, _)| h.clone()).collect();
+                    info!("📂 Available file hashes: {:?}", available_hashes);
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ Failed to list stored files while handling request for {}: {}",
+                        request.file_hash, e
+                    );
+                }
+            }
             
             let _ = event_tx
                 .send(WebRTCEvent::TransferFailed {

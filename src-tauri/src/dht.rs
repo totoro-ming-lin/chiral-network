@@ -2,7 +2,6 @@ pub mod models;
 // pub mod protocol;
 pub use self::models::*;
 use bon::Builder;
-use libp2p::kad::RecordKey;
 use rand::seq::SliceRandom;
 // use self::protocol::*;
 use crate::config::CHAIN_ID;
@@ -337,7 +336,6 @@ pub enum DhtCommand {
     },
     SearchFile {
         file_hash: String,
-        sender: oneshot::Sender<Result<Option<FileMetadata>, String>>,
     },
     DownloadFile(FileMetadata, String),
     ConnectPeer(String),
@@ -516,7 +514,6 @@ pub enum DhtEvent {
         peer_id: String,
         wallet_address: String,
         default_price_per_mb: f64,
-        supported_protocols: Vec<String>,
     },
 
     SeederFileInfoFound {
@@ -524,6 +521,7 @@ pub enum DhtEvent {
         seeder_index: usize,
         peer_id: String,
         price_per_mb: Option<f64>,
+        supported_protocols: Vec<String>,
         protocol_details: serde_json::Value, // Serialized ProtocolDetails
     },
 
@@ -1399,6 +1397,7 @@ async fn run_dht_node(
     root_query_mapping: Arc<Mutex<HashMap<beetswap::QueryId, FileMetadata>>>,
     active_downloads: Arc<Mutex<HashMap<String, Arc<Mutex<ActiveDownload>>>>>,
     get_providers_queries: Arc<Mutex<HashMap<kad::QueryId, (String, std::time::Instant)>>>,
+    emitted_providers_for_query: Arc<Mutex<HashSet<kad::QueryId>>>,
     pending_provider_registrations: Arc<Mutex<HashSet<String>>>,
     file_metadata_cache: Arc<Mutex<HashMap<String, FileMetadata>>>,
     pending_dht_queries: Arc<
@@ -1409,7 +1408,6 @@ async fn run_dht_node(
             HashMap<rr::OutboundRequestId, oneshot::Sender<Result<EncryptedAesKeyBundle, String>>>,
         >,
     >,
-    pending_search_queries: Arc<Mutex<HashMap<kad::QueryId, PendingSearchQuery>>>,
     pending_relay_discoveries: Arc<
         Mutex<HashMap<kad::QueryId, oneshot::Sender<Result<Vec<String>, String>>>>,
     >,
@@ -1723,7 +1721,6 @@ async fn run_dht_node(
                 peer_id: peer_id_str.clone(),
                 wallet_address: merged_metadata.uploader_address.clone().unwrap_or_default(),
                 default_price_per_mb: merged_metadata.price,
-                supported_protocols: derive_protocols(&merged_metadata),
                 timestamp: now,
             };
 
@@ -1731,6 +1728,7 @@ async fn run_dht_node(
                 peer_id: peer_id_str.clone(),
                 file_hash: merged_metadata.merkle_root.clone(),
                 price_per_mb: Some(merged_metadata.price),
+                supported_protocols: derive_protocols(&merged_metadata),
                 protocol_details: ProtocolDetails::from(merged_metadata.clone()),
                 timestamp: now,
             };
@@ -1761,8 +1759,12 @@ async fn run_dht_node(
             // Store general info for periodic republishing
             {
                 let mut stored_general = published_general_info.lock().await;
-                *stored_general = Some(general_info);
+                *stored_general = Some(general_info.clone());
             }
+
+            // Also cache in GossipSubManager so it's available for self-downloads
+            gossipsub_manager.cache_general_info(general_info).await;
+            info!("✅ Cached local general info in GossipSubManager for self-downloads");
 
             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(file_topic, file_msg) {
                 warn!("Failed to publish file info to GossipSub: {}", e);
@@ -1773,8 +1775,12 @@ async fn run_dht_node(
             // Store file-specific info for periodic republishing
             {
                 let mut stored_files = published_files.lock().await;
-                stored_files.insert(merged_metadata.merkle_root.clone(), file_info);
+                stored_files.insert(merged_metadata.merkle_root.clone(), file_info.clone());
             }
+
+            // Also cache in GossipSubManager so it's available for self-downloads
+            gossipsub_manager.cache_file_info(file_info).await;
+            info!("✅ Cached local file info in GossipSubManager for self-downloads");
 
             // 10. Publish info_hash index if present
             if let Some(info_hash) = &merged_metadata.info_hash {
@@ -2052,9 +2058,9 @@ async fn run_dht_node(
 
                                             debug!("StopPublish completed for {}", file_hash);
                                         }
-                                    Some(DhtCommand::SearchFile { file_hash, sender }) => {
+                                    Some(DhtCommand::SearchFile { file_hash }) => {
                                         info!("🔍 Received search command for file: {}", file_hash);
-                                        info!("🔍 Initiating DHT+GossipSub queries for file search");
+                                        info!("🔍 Initiating DHT record query for basic metadata");
 
                                         // Emit search started event immediately
                                         let _ = event_tx.send(DhtEvent::SearchStarted {
@@ -2064,21 +2070,16 @@ async fn run_dht_node(
 
                                         let key = kad::RecordKey::new(&file_hash.as_bytes());
 
-                                        // Create a pending search query to track both lookups
-                                        let mut pending_query = PendingSearchQuery::new(file_hash.clone(), sender);
-
                                         // Start record lookup (for minimal DHT metadata)
                                         let record_query_id = swarm.behaviour_mut().kademlia.get_record(key.clone());
-                                        info!("🔍 Searching for DHT record: {} (query: {:?})", file_hash, record_query_id);
-                                        pending_query.record_query_id = Some(record_query_id);
 
-                                        // Start provider lookup (will trigger GossipSub subscription)
-                                        // let providers_query_id = swarm.behaviour_mut().kademlia.get_providers(key);
-                                        // info!("🔍 Searching for providers: {} (query: {:?})", file_hash, providers_query_id);
-                                        // pending_query.providers_query_id = Some(providers_query_id);
+                                        // Start provider lookup
+                                        let providers_query_id = swarm.behaviour_mut().kademlia.get_providers(key);
 
-                                        // Track query
-                                        pending_search_queries.lock().await.insert(record_query_id, pending_query);
+                                        // Track this search for the GossipSub progressive collection
+                                        get_providers_queries.lock().await.insert(providers_query_id, (file_hash.clone(), std::time::Instant::now()));
+
+                                        info!("🔍 Started queries: record={:?}, providers={:?}", record_query_id, providers_query_id);
                                     }
                                     Some(DhtCommand::SearchByInfohash { info_hash, sender }) => {
                                         let index_key = format!("{}{}", INFO_HASH_PREFIX, info_hash);
@@ -2665,10 +2666,10 @@ async fn run_dht_node(
                                             &pending_searches,
                                             &pending_provider_queries,
                                             &get_providers_queries,
+                                            &emitted_providers_for_query,
                                             &pending_infohash_searches,
                                             &file_metadata_cache,
                                             &pending_dht_queries,
-                                            &pending_search_queries,
                                             &pending_relay_discoveries,
                                             &gossipsub_manager,
                                         )
@@ -4213,12 +4214,12 @@ async fn handle_kademlia_event(
     pending_searches: &Arc<Mutex<HashMap<String, Vec<PendingSearch>>>>,
     pending_provider_queries: &Arc<Mutex<HashMap<String, PendingProviderQuery>>>,
     get_providers_queries: &Arc<Mutex<HashMap<kad::QueryId, (String, std::time::Instant)>>>,
+    emitted_providers_for_query: &Arc<Mutex<HashSet<kad::QueryId>>>,
     pending_infohash_searches: &Arc<Mutex<HashMap<kad::QueryId, PendingInfohashSearch>>>,
     file_metadata_cache: &Arc<Mutex<HashMap<String, FileMetadata>>>,
     pending_dht_queries: &Arc<
         Mutex<HashMap<kad::QueryId, oneshot::Sender<Result<Option<Vec<u8>>, String>>>>,
     >,
-    pending_search_queries: &Arc<Mutex<HashMap<kad::QueryId, PendingSearchQuery>>>,
     pending_relay_discoveries: &Arc<
         Mutex<HashMap<kad::QueryId, oneshot::Sender<Result<Vec<String>, String>>>>,
     >,
@@ -4238,6 +4239,7 @@ async fn handle_kademlia_event(
             match result {
                 QueryResult::GetRecord(Ok(ok)) => match ok {
                     GetRecordOk::FoundRecord(peer_record) => {
+                        info!("processing: {} ", id);
                         // Check if this is a response to a generic DHT value query (e.g., reputation verdicts)
                         if let Some(sender) = pending_dht_queries.lock().await.remove(&id) {
                             info!(
@@ -4248,346 +4250,120 @@ async fn handle_kademlia_event(
                             return; // Don't process further as this was a raw DHT query
                         }
 
-                        // Check if this is a response to a file search query
-                        if let Some(pending_search) =
-                            pending_search_queries.lock().await.remove(&id)
-                        {
-                            let search_file_hash = pending_search.file_hash.clone();
-                            info!(
-                                "📥 Received search result for query ID: {:?}, searching for: {}",
-                                id, search_file_hash
-                            );
-
-                            // This is a search result - parse it and send it back
-                            match serde_json::from_slice::<serde_json::Value>(
-                                &peer_record.record.value,
-                            ) {
-                                Ok(metadata_json) => {
-                                    // Debug: Log the raw metadata JSON
-                                    info!("🔍 Raw metadata JSON: {}", metadata_json);
-
-                                    // Construct FileMetadata from the JSON
-                                    // NOTE: We accept both snake_case and camelCase because different publish paths
-                                    // historically stored different key styles (e.g., Bitswap vs legacy paths).
-                                    let merkle_root = metadata_json
-                                        .get("file_hash")
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| {
-                                            metadata_json.get("fileHash").and_then(|v| v.as_str())
-                                        });
-                                    let file_name = metadata_json
-                                        .get("file_name")
-                                        .and_then(|v| v.as_str())
-                                        .or_else(|| {
-                                            metadata_json.get("fileName").and_then(|v| v.as_str())
-                                        });
-                                    let file_size = metadata_json
-                                        .get("file_size")
-                                        .and_then(|v| v.as_u64())
-                                        .or_else(|| {
-                                            metadata_json.get("fileSize").and_then(|v| v.as_u64())
-                                        });
-                                    let created_at = metadata_json
-                                        .get("created_at")
-                                        .and_then(|v| v.as_u64())
-                                        .or_else(|| {
-                                            metadata_json.get("createdAt").and_then(|v| v.as_u64())
-                                        });
-
-                                    info!("🔍 Parsed fields - merkleRoot: {:?}, fileName: {:?}, fileSize: {:?}, createdAt: {:?}", merkle_root, file_name, file_size, created_at);
-
-                                    if let (
-                                        Some(file_hash),
-                                        Some(file_name_val),
-                                        Some(file_size_val),
-                                        Some(created_at_val),
-                                    ) = (merkle_root, file_name, file_size, created_at)
-                                    {
-                                        info!("🔍 Found metadata record - merkleRoot: {}, searching for: {}", file_hash, search_file_hash);
-                                        // Verify this is the file we were searching for
-                                        if file_hash == search_file_hash {
-                                            info!(
-                                                "🔧 Constructing metadata for found file: {}",
-                                                file_hash
-                                            );
-                                            let mut metadata =
-                                                construct_file_metadata_from_json_simple(
-                                                    &metadata_json,
-                                                    file_hash,
-                                                    file_name_val,
-                                                    file_size_val,
-                                                    created_at_val,
-                                                );
-                                            info!("🔧 Metadata constructed successfully");
-
-                                            // Emit minimal DHT metadata immediately
-                                            let _ = event_tx
-                                                .send(DhtEvent::DhtMetadataFound {
-                                                    file_hash: file_hash.to_string(),
-                                                    file_name: file_name_val.to_string(),
-                                                    file_size: file_size_val,
-                                                    created_at: created_at_val,
-                                                    mime_type: metadata.mime_type.clone(),
-                                                })
-                                                .await;
-
-                                            // Merge providers with existing seeders from metadata
-                                            info!("🔧 Merging providers with metadata seeders");
-                                            if let Some(providers) = &pending_search.found_providers
-                                            {
-                                                // Add providers that aren't already in seeders
-                                                for provider in providers {
-                                                    if !metadata.seeders.contains(provider) {
-                                                        metadata.seeders.push(provider.clone());
-                                                    }
-                                                }
-                                                info!("✅ Found searched file: {} ({}) with {} seeders (merged from metadata + providers)", file_name_val, file_hash, metadata.seeders.len());
-                                            } else {
-                                                info!("✅ Found searched file: {} ({}) with {} seeders from metadata", file_name_val, file_hash, metadata.seeders.len());
-                                            }
-
-                                            // Merge with local cache to preserve multi-protocol metadata
-                                            // This ensures that if we uploaded via both WebRTC and Bitswap locally,
-                                            // the search result will include CIDs from local cache even if DHT
-                                            // record only has one protocol's data
-                                            info!("🔧 Merging with local cache");
-                                            {
-                                                let cache = file_metadata_cache.lock().await;
-                                                if let Some(cached) =
-                                                    cache.get(&metadata.merkle_root)
-                                                {
-                                                    info!("🔍 Merging search result with local cache for {}", metadata.merkle_root);
-                                                    metadata = merge_file_metadata(
-                                                        cached.clone(),
-                                                        metadata,
-                                                    );
-                                                }
-                                            }
-
-                                            // Send event to frontend for search results
-                                            info!("📡 Sending DhtEvent::FileDiscovered for file: {} (CIDs: {:?}, FTP: {})",
-                                            metadata.file_name,
-                                            metadata.cids.as_ref().map(|v| v.len()),
-                                            metadata.ftp_sources.as_ref().map(|v| v.len()).unwrap_or(0));
-                                            let _ = event_tx
-                                                .send(DhtEvent::FileDiscovered(metadata.clone()))
-                                                .await;
-                                            info!(
-                                                "📡 Sending result through channel for file: {}",
-                                                metadata.file_name
-                                            );
-                                            let _ = pending_search.sender.send(Ok(Some(metadata)));
-                                            info!("✅ Search result processing completed successfully");
-                                            return; // Successfully handled the search result
-                                        } else {
-                                            info!("❌ Hash mismatch - found metadata for {} but searching for {}", file_hash, search_file_hash);
-                                        }
-                                    } else {
-                                        debug!("Received incomplete metadata record during search");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("❌ Failed to parse metadata JSON: {}", e);
-                                    info!("❌ Raw metadata bytes: {:?}", &peer_record.record.value);
-                                }
-                            }
-
-                            // If we get here, put the search back for retry
-                            let _ = pending_search_queries
-                                .lock()
-                                .await
-                                .insert(id, pending_search);
-                            return;
-                        }
-                        if let Ok(metadata_json) =
-                            serde_json::from_slice::<serde_json::Value>(&peer_record.record.value)
-                        {
-                            // Check if this is a response to an info_hash index lookup
-                            if let Some(search) = pending_infohash_searches.lock().await.remove(&id)
-                            {
-                                if let Ok(merkle_root) =
-                                    String::from_utf8(peer_record.record.value.clone())
-                                {
+                        // 1) Handle info_hash index lookup first (NOT JSON)
+                        if let Some(search) = pending_infohash_searches.lock().await.remove(&id) {
+                            match String::from_utf8(peer_record.record.value.clone()) {
+                                Ok(merkle_root) => {
                                     info!("Resolved info_hash to merkle_root: {}", merkle_root);
-                                    // Now, initiate the second step: search for the actual file metadata
-                                    let record_key = kad::RecordKey::new(&merkle_root.as_bytes());
+
+                                    let record_key = kad::RecordKey::new(&merkle_root);
                                     let final_query_id =
                                         swarm.behaviour_mut().kademlia.get_record(record_key);
 
-                                    // We need to re-insert the sender to be notified when the *second* query finishes.
-                                    // This is a simplification. A more robust solution would use a state machine
-                                    // to track multi-step queries. For now, we'll just re-use the infohash search map.
-                                    // This assumes no overlapping queries for the same initial info_hash.
                                     pending_infohash_searches
                                         .lock()
                                         .await
                                         .insert(final_query_id, search);
 
-                                    info!("Initiating second-step search for merkle_root: {} (query: {:?})", merkle_root, final_query_id);
-                                } else {
-                                    warn!("Failed to decode info_hash index value as string.");
+                                    info!(
+                "Initiating second-step search for merkle_root: {} (query: {:?})",
+                merkle_root, final_query_id
+            );
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        "Failed to decode info_hash index value as UTF-8 string."
+                                    );
                                     let _ = search.sender.send(None);
                                 }
-                                return; // End processing for this event here.
                             }
-
-                            // Construct FileMetadata from the JSON
-                            if let (
-                                Some(file_hash),
-                                Some(file_name),
-                                Some(file_size),
-                                Some(created_at),
-                            ) = (
-                                // Use merkle_root as the primary identifier
-                                metadata_json.get("merkleRoot").and_then(|v| v.as_str()),
-                                metadata_json.get("fileName").and_then(|v| v.as_str()),
-                                metadata_json.get("fileSize").and_then(|v| v.as_u64()),
-                                metadata_json.get("createdAt").and_then(|v| v.as_u64()),
-                            ) {
-                                let peer_from_record =
-                                    peer_record.peer.clone().map(|p| p.to_string());
-
-                                // Simply use seeders array directly
-                                let seeders: Vec<String> = metadata_json
-                                    .get("seeders")
-                                    .and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-
-                                let metadata = FileMetadata {
-                                    merkle_root: file_hash.to_string(),
-                                    file_name: file_name.to_string(),
-                                    file_size,
-                                    file_data: Vec::new(), // Will be populated during download
-                                    seeders: if seeders.is_empty() {
-                                        peer_from_record
-                                            .clone()
-                                            .into_iter()
-                                            .collect::<Vec<String>>()
-                                    } else {
-                                        seeders.clone()
-                                    },
-                                    created_at,
-                                    mime_type: metadata_json
-                                        .get("mimeType")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    is_encrypted: metadata_json
-                                        .get("isEncrypted")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false),
-                                    encryption_method: metadata_json
-                                        .get("encryptionMethod")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    key_fingerprint: metadata_json
-                                        .get("keyFingerprint")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    parent_hash: metadata_json
-                                        .get("parentHash")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    cids: metadata_json
-                                        .get("cids")
-                                        .and_then(|v| deserialize_cids_from_json(v)),
-                                    encrypted_key_bundle: metadata_json
-                                        .get("encryptedKeyBundle")
-                                        .and_then(|v| {
-                                            // The field name is camelCase in the JSON
-                                            serde_json::from_value::<
-                                                Option<crate::encryption::EncryptedAesKeyBundle>,
-                                            >(v.clone())
-                                            .unwrap_or(None)
-                                        }),
-                                    info_hash: metadata_json
-                                        .get("infoHash")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    trackers: metadata_json.get("trackers").and_then(|v| {
-                                        serde_json::from_value::<Option<Vec<String>>>(v.clone())
-                                            .unwrap_or(None)
-                                    }),
-                                    is_root: metadata_json
-                                        .get("is_root")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(true),
-                                    price: metadata_json
-                                        .get("price")
-                                        .and_then(|v| v.as_f64())
-                                        .unwrap_or(0.0),
-                                    http_sources: metadata_json.get("httpSources").and_then(|v| {
-                                        serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(
-                                            v.clone(),
-                                        )
-                                        .unwrap_or(None)
-                                    }),
-                                    ed2k_sources: metadata_json.get("ed2kSources").and_then(|v| {
-                                        serde_json::from_value::<Option<Vec<Ed2kSourceInfo>>>(
-                                            v.clone(),
-                                        )
-                                        .unwrap_or(None)
-                                    }),
-                                    ftp_sources: metadata_json.get("ftpSources").and_then(|v| {
-                                        serde_json::from_value::<Option<Vec<FtpSourceInfo>>>(
-                                            v.clone(),
-                                        )
-                                        .unwrap_or(None)
-                                    }),
-                                    uploader_address: metadata_json
-                                        .get("uploader_address")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string()),
-                                    ..Default::default()
-                                };
-
-                                let notify_metadata = metadata.clone();
-                                let file_hash = notify_metadata.merkle_root.clone();
-
-                                // Cache the discovered file so subsequent searches don't need DHT queries
-                                // DHT data is authoritative - always update cache with latest network state
-                                let mut cache = file_metadata_cache.lock().await;
-                                if let Some(existing) = cache.get(&file_hash) {
-                                    // Merge if both exist to preserve any local-only fields
-                                    let merged =
-                                        merge_file_metadata(existing.clone(), metadata.clone());
-                                    cache.insert(file_hash.clone(), merged);
-                                    info!(
-                                        "Merged DHT discovery with existing cache for file {}",
-                                        file_hash
-                                    );
-                                } else {
-                                    // No existing cache entry, just store DHT data
-                                    cache.insert(file_hash.clone(), metadata.clone());
-                                    info!("Cached discovered file {} from DHT", file_hash);
-                                }
-
-                                info!(
-                                    "File discovered: {} ({})",
-                                    notify_metadata.file_name, file_hash
-                                );
-                                // Don't send FileDiscovered events for general discoveries to avoid interfering with searches
-                                // The frontend will discover files through other means (like browsing)
-                                // // Don't send FileDiscovered events for general discoveries to avoid interfering with searches
-                                // let _ = event_tx.send(DhtEvent::FileDiscovered(metadata)).await;
-
-                                // only for synchronous_search_metadata
-                                notify_pending_searches(
-                                    pending_searches,
-                                    &file_hash,
-                                    SearchResponse::Found(notify_metadata),
-                                )
-                                .await;
-                            } else {
-                                debug!("DHT record missing required fields");
-                            }
-                        } else {
-                            debug!("Received non-JSON DHT record");
+                            return;
                         }
+
+                        // 2) Always try to parse JSON; if it fails, ignore
+                        let metadata_json: serde_json::Value =
+                            match serde_json::from_slice(&peer_record.record.value) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    debug!("Received non-JSON DHT record; ignoring.");
+                                    return;
+                                }
+                            };
+
+                        // 3) Minimal required fields (camelCase only)
+                        let file_hash = metadata_json.get("fileHash").and_then(|v| v.as_str());
+                        let file_name = metadata_json.get("fileName").and_then(|v| v.as_str());
+                        let file_size = metadata_json.get("fileSize").and_then(|v| v.as_u64());
+                        let created_at = metadata_json.get("createdAt").and_then(|v| v.as_u64());
+                        let mime_type = metadata_json
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+
+                        let (file_hash, file_name, file_size, created_at) =
+                            match (file_hash, file_name, file_size, created_at) {
+                                (Some(h), Some(n), Some(s), Some(t)) => (h, n, s, t),
+                                _ => {
+                                    debug!(
+                                    "JSON DHT record missing required metadata fields; ignoring."
+                                );
+                                    return;
+                                }
+                            };
+
+                        // 4) Emit minimal metadata immediately
+                        let _ = event_tx
+                            .send(DhtEvent::DhtMetadataFound {
+                                file_hash: file_hash.to_string(),
+                                file_name: file_name.to_string(),
+                                file_size,
+                                created_at,
+                                mime_type: mime_type.clone(),
+                            })
+                            .await;
+                        info!("Emitted dhtmetadatafound");
+                        // 5) Build minimal FileMetadata
+                        let peer_from_record = peer_record.peer.clone().map(|p| p.to_string());
+
+                        let seeders: Vec<String> = metadata_json
+                            .get("seeders")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let mut metadata = FileMetadata {
+                            merkle_root: file_hash.to_string(),
+                            file_name: file_name.to_string(),
+                            file_size,
+                            file_data: Vec::new(),
+                            seeders: if seeders.is_empty() {
+                                peer_from_record.into_iter().collect()
+                            } else {
+                                seeders
+                            },
+                            created_at,
+                            mime_type,
+                            ..Default::default()
+                        };
+
+                        // 6) Merge with cache (optional but keeps multi-protocol/local-only fields)
+                        {
+                            let mut cache = file_metadata_cache.lock().await;
+                            if let Some(existing) = cache.get(&metadata.merkle_root).cloned() {
+                                metadata = merge_file_metadata(existing, metadata);
+                            }
+                            cache.insert(metadata.merkle_root.clone(), metadata.clone());
+                        }
+
+                        // 7) Emit full metadata for frontend
+                        let _ = event_tx
+                            .send(DhtEvent::FileDiscovered(metadata.clone()))
+                            .await;
+                        info!("✅ Emitted FileDiscovered with full metadata including CIDs and sources");
                     }
                     GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {
                         // Check if this was an infohash search that found no record
@@ -4844,14 +4620,25 @@ async fn handle_kademlia_event(
                             let provider_strings: Vec<String> =
                                 provider_peer_ids.iter().map(|p| p.to_string()).collect();
 
-                            // Emit providers found event
-                            let _ = event_tx
-                                .send(DhtEvent::ProvidersFound {
-                                    file_hash: file_hash.clone(),
-                                    providers: provider_strings.clone(),
-                                    count: provider_strings.len(),
-                                })
-                                .await;
+                            // Emit providers found event (only once per query to avoid duplicates)
+                            let mut emitted = emitted_providers_for_query.lock().await;
+                            if !emitted.contains(&id) {
+                                let _ = event_tx
+                                    .send(DhtEvent::ProvidersFound {
+                                        file_hash: file_hash.clone(),
+                                        providers: provider_strings.clone(),
+                                        count: provider_strings.len(),
+                                    })
+                                    .await;
+                                emitted.insert(id);
+                                info!("📤 Emitted providers_found event for query {:?}", id);
+                            } else {
+                                debug!(
+                                    "⏭️ Skipping duplicate providers_found event for query {:?}",
+                                    id
+                                );
+                            }
+                            drop(emitted);
 
                             // Subscribe to GossipSub topics for each provider
                             info!(
@@ -4930,9 +4717,6 @@ async fn handle_kademlia_event(
                                                                 .clone(),
                                                             default_price_per_mb: general_info
                                                                 .default_price_per_mb,
-                                                            supported_protocols: general_info
-                                                                .supported_protocols
-                                                                .clone(),
                                                         })
                                                         .await;
                                                     emitted_general.insert(peer_id_str.clone());
@@ -4960,6 +4744,9 @@ async fn handle_kademlia_event(
                                                             seeder_index: index,
                                                             peer_id: file_info.peer_id.clone(),
                                                             price_per_mb: file_info.price_per_mb,
+                                                            supported_protocols: file_info
+                                                                .supported_protocols
+                                                                .clone(),
                                                             protocol_details: protocol_json,
                                                         })
                                                         .await;
@@ -5018,25 +4805,6 @@ async fn handle_kademlia_event(
                                 info!("📡 Spawned progressive GossipSub metadata collection task");
                             }
 
-                            // Update pending search queries with found providers (for SearchFile queries)
-                            // This is needed because SearchFile runs both GetRecord and GetProviders in parallel
-                            {
-                                let mut search_queries = pending_search_queries.lock().await;
-                                // Find the pending search query by file_hash and update its found_providers
-                                for (_query_id, pending_search) in search_queries.iter_mut() {
-                                    if pending_search.file_hash == file_hash {
-                                        pending_search.found_providers =
-                                            Some(provider_strings.clone());
-                                        info!(
-                                            "✅ Updated pending search for {} with {} providers",
-                                            file_hash,
-                                            provider_strings.len()
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-
                             // Provider results - check for direct queries first
                             // Check for direct provider queries (not from SearchFile)
                             let mut pending_queries = pending_provider_queries.lock().await;
@@ -5064,6 +4832,9 @@ async fn handle_kademlia_event(
                                     file_hash
                                 );
 
+                                // Clean up emitted providers tracking
+                                emitted_providers_for_query.lock().await.remove(&id);
+
                                 // Notify pending searches that the file was not found
                                 notify_pending_searches(
                                     &pending_searches,
@@ -5087,6 +4858,9 @@ async fn handle_kademlia_event(
 
                             // Remove from pending queries tracking
                             get_providers_queries.lock().await.remove(&id);
+
+                            // Clean up emitted providers tracking
+                            emitted_providers_for_query.lock().await.remove(&id);
 
                             // Notify pending searches
                             info!(
@@ -6658,14 +6432,13 @@ impl DhtService {
         let get_providers_queries_local: Arc<
             Mutex<HashMap<kad::QueryId, (String, std::time::Instant)>>,
         > = Arc::new(Mutex::new(HashMap::new()));
+        let emitted_providers_for_query: Arc<Mutex<HashSet<kad::QueryId>>> =
+            Arc::new(Mutex::new(HashSet::new()));
         let pending_infohash_searches: Arc<Mutex<HashMap<kad::QueryId, PendingInfohashSearch>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_dht_queries: Arc<
             Mutex<HashMap<kad::QueryId, oneshot::Sender<Result<Option<Vec<u8>>, String>>>>,
         > = Arc::new(Mutex::new(HashMap::new()));
-        // Add this initialization around line 6100 after pending_dht_queries:
-        let pending_search_queries: Arc<Mutex<HashMap<kad::QueryId, PendingSearchQuery>>> =
-            Arc::new(Mutex::new(HashMap::new()));
         let pending_relay_discoveries: Arc<
             Mutex<HashMap<kad::QueryId, oneshot::Sender<Result<Vec<String>, String>>>>,
         > = Arc::new(Mutex::new(HashMap::new()));
@@ -6715,11 +6488,11 @@ impl DhtService {
             root_query_mapping.clone(),
             active_downloads.clone(),
             get_providers_queries_local.clone(),
+            emitted_providers_for_query.clone(),
             pending_provider_registrations.clone(),
             file_metadata_cache_local.clone(),
             pending_dht_queries.clone(),
             pending_key_requests.clone(),
-            pending_search_queries.clone(),
             pending_relay_discoveries.clone(),
             is_bootstrap,
             final_enable_autorelay,
@@ -6972,13 +6745,10 @@ impl DhtService {
             .map_err(|e| e.to_string())
     }
 
-    // Fix the search_file method around line 6464:
     pub async fn search_file(&self, file_hash: String) -> Result<(), String> {
-        // Create a dummy channel since this is fire-and-forget
-        let (sender, _receiver) = oneshot::channel();
-
+        // Trigger progressive search - results come via events
         self.cmd_tx
-            .send(DhtCommand::SearchFile { file_hash, sender })
+            .send(DhtCommand::SearchFile { file_hash })
             .await
             .map_err(|e| e.to_string())
     }
@@ -6987,103 +6757,41 @@ impl DhtService {
         self.search_file(file_hash).await
     }
 
-    // Fix the search_metadata method around line 6474:
-    pub async fn search_metadata(&self, file_hash: String, timeout_ms: u64) -> Result<(), String> {
-        // Create a dummy channel since this is fire-and-forget
-        let (sender, _receiver) = oneshot::channel();
-
+    pub async fn search_metadata(&self, file_hash: String, _timeout_ms: u64) -> Result<(), String> {
+        // Trigger progressive search - results come via events
         self.cmd_tx
-            .send(DhtCommand::SearchFile { file_hash, sender })
+            .send(DhtCommand::SearchFile { file_hash })
             .await
             .map_err(|e| e.to_string())
     }
-    pub async fn synchronous_search_metadata(
+
+    /// Get file metadata from local cache (non-blocking, cache-only lookup)
+    /// Use this when you need synchronous access to metadata that should already be cached
+    pub async fn get_cached_metadata(&self, file_hash: &str) -> Option<FileMetadata> {
+        let cache = self.file_metadata_cache.lock().await;
+        cache.get(file_hash).cloned()
+    }
+
+    /// Internal helper for tests: trigger search and poll cache
+    #[cfg(test)]
+    async fn synchronous_search_metadata(
         &self,
         file_hash: String,
         timeout_ms: u64,
     ) -> Result<Option<FileMetadata>, String> {
-        info!(
-            "🔍 Starting search for file: {} (timeout: {}ms)",
-            file_hash, timeout_ms
-        );
+        // Trigger search
+        self.search_metadata(file_hash.clone(), timeout_ms).await?;
 
-        // Skip local cache to always get fresh metadata from DHT
-        // This ensures we have the latest protocols, seeders, and availability info
-        info!("Querying DHT for fresh metadata for file {}...", file_hash);
-
-        if timeout_ms == 0 {
-            let (sender, _receiver) = oneshot::channel();
-            self.cmd_tx
-                .send(DhtCommand::SearchFile { file_hash, sender })
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(None);
+        // Poll cache
+        let poll_iterations = (timeout_ms / 100) as usize;
+        for _ in 0..poll_iterations {
+            if let Some(meta) = self.get_cached_metadata(&file_hash).await {
+                return Ok(Some(meta));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let timeout_duration = Duration::from_millis(timeout_ms);
-        let (tx, rx) = oneshot::channel();
-
-        // Send the validated search command
-        info!("🔍 Sending DHT search command for file: {}", file_hash);
-        if let Err(err) = self
-            .cmd_tx
-            .send(DhtCommand::SearchFile {
-                file_hash: file_hash.clone(),
-                sender: tx,
-            })
-            .await
-        {
-            error!("❌ Failed to send DHT search command: {}", err);
-            return Err(err.to_string());
-        }
-        info!("✅ DHT search command sent successfully");
-
-        info!("⏳ Waiting for search result with {}ms timeout", timeout_ms);
-        match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(Ok(Some(metadata)))) => {
-                info!("✅ Search succeeded for file: {}", metadata.merkle_root);
-                // Cache the result locally
-                {
-                    let mut cache = self.file_metadata_cache.lock().await;
-                    cache.insert(metadata.merkle_root.clone(), metadata.clone());
-                }
-                Ok(Some(metadata))
-            }
-            Ok(Ok(Ok(None))) => {
-                info!("❌ Search found no results for file: {}", file_hash);
-                Ok(None)
-            }
-            Ok(Ok(Err(e))) => {
-                error!("❌ Search error for file {}: {}", file_hash, e);
-                Err(format!("Search error: {}", e))
-            }
-            Ok(Err(_)) => {
-                error!("❌ Search channel closed for file: {}", file_hash);
-                Err("Search channel closed".into())
-            }
-            Err(_) => {
-                warn!(
-                    "⏰ Search timed out for file: {} (after {}ms)",
-                    file_hash, timeout_ms
-                );
-                warn!("⏰ Timeout occurred - no result received through channel");
-                // Check if this might be due to connectivity issues
-                // let health = self.check_health(5, false).await;
-                // if health.peer_count < 5 {
-                //     warn!(
-                //         "⚠️ Low peer count ({} peers, minimum {}) may affect search reliability",
-                //         health.peer_count, health.min_required
-                //     );
-                // }
-                // if health.bootstrap_failures > 0 {
-                //     warn!(
-                //         "⚠️ Bootstrap failures detected ({}), network connectivity may be degraded",
-                //         health.bootstrap_failures
-                //     );
-                // }
-                Ok(None) // Timeout - file not found
-            }
-        }
+        Ok(None)
     }
 
     pub async fn connect_peer(&self, addr: String) -> Result<(), String> {

@@ -13,9 +13,11 @@
   import { paymentService } from '$lib/services/paymentService';
   import type { FileMetadata } from '$lib/dht';
   import SearchResultCard from './SearchResultCard.svelte';
+  import SearchResultCardSkeleton from './SearchResultCardSkeleton.svelte';
   import { dhtSearchHistory, type SearchHistoryEntry, type SearchStatus } from '$lib/stores/searchHistory';
   import PeerSelectionModal, { type PeerInfo } from './PeerSelectionModal.svelte';
   import PeerSelectionService from '$lib/services/peerSelectionService';
+  import { costFromPricePerMb, pickLowestPricePeer } from '$lib/utils/pricing';
 
   type ToastType = 'success' | 'error' | 'info' | 'warning';
   type ToastPayload = { message: string; type?: ToastType; duration?: number; };
@@ -48,6 +50,8 @@
   const dispatch = createEventDispatcher<{ download: FileMetadata; message: ToastPayload }>();
   const tr = (key: string, params?: Record<string, unknown>) => (get(t) as any)(key, params);
 
+  const DEV = import.meta.env.DEV;
+
   const SEARCH_TIMEOUT_MS = 10_000;
 
   let searchHash = $state('');
@@ -69,6 +73,12 @@
 
   // Peer selection modal state
   let showPeerSelectionModal = $state(false);
+
+  // Debug peer selection modal state
+  $effect(() => {
+    if (!DEV) return;
+    console.log('[DownloadSearchSection] showPeerSelectionModal:', showPeerSelectionModal);
+  });
   let selectedFile = $state<FileMetadata | null>(null);
   let selectedFileIsSeeding = $state(false);
   let peerSelectionMode = $state<'auto' | 'manual'>('auto');
@@ -89,6 +99,29 @@
     providers: [],
     seeders: []
   });
+
+  function syncAvailablePeerOffer(peerId: string, data: { walletAddress?: string; pricePerMb?: number }) {
+    if (!availablePeers || availablePeers.length === 0) return;
+    const idx = availablePeers.findIndex((p) => p.peerId === peerId);
+    if (idx < 0) return;
+
+    const prev = availablePeers[idx];
+    const next: PeerInfo = {
+      ...prev,
+      walletAddress: data.walletAddress ?? prev.walletAddress,
+      price_per_mb:
+        typeof data.pricePerMb === 'number' && Number.isFinite(data.pricePerMb)
+          ? data.pricePerMb
+          : prev.price_per_mb,
+      offerSource:
+        typeof data.pricePerMb === 'number' && Number.isFinite(data.pricePerMb)
+          ? 'seeder'
+          : prev.offerSource,
+    };
+
+    if (next === prev) return;
+    availablePeers = [...availablePeers.slice(0, idx), next, ...availablePeers.slice(idx + 1)];
+  }
 
   // Event listener cleanup functions
   let eventUnlisteners = $state<Array<() => void>>([]);
@@ -138,13 +171,9 @@
 
   onMount(() => {
     document.addEventListener('click', handleClickOutside);
-    console.log('🔍 DownloadSearchSection mounted - Initial state:', {
-      searchMode,
-      searchHash,
-      isSearching,
-      hasSearched,
-      latestStatus
-    });
+    if (DEV) {
+      console.log('[DownloadSearchSection] mounted', { searchMode, isSearching, hasSearched, latestStatus });
+    }
   });
 
   onDestroy(() => {
@@ -204,16 +233,44 @@
     }));
 
     unlisteners.push(await listen('dht_metadata_found', (event: any) => {
-      const { fileName, fileSize, createdAt, mimeType } = event.payload;
+      const { fileHash, fileName, fileSize, createdAt, mimeType } = event.payload;
       progressiveSearchState.basicMetadata = { fileName, fileSize, createdAt, mimeType };
-      console.log('✅ Basic metadata found:', fileName);
+
+      // Immediately populate latestMetadata with basic info so UI updates instantly
+      latestMetadata = {
+        merkleRoot: fileHash,
+        fileHash: fileHash,
+        fileName: fileName,
+        fileSize: fileSize,
+        seeders: progressiveSearchState.providers.length > 0 ? progressiveSearchState.providers : [],
+        createdAt: createdAt,
+        mimeType: mimeType,
+        isEncrypted: false,
+        encryptionMethod: undefined,
+        keyFingerprint: undefined,
+        cids: undefined,
+        isRoot: true,
+        downloadPath: undefined,
+        price: 0,
+        uploaderAddress: undefined,
+        httpSources: undefined,
+        ftpSources: undefined,
+        ed2kSources: undefined,
+        infoHash: undefined
+      };
+
+      latestStatus = 'found';
+      hasSearched = true;
+
+      console.log('✅ Basic metadata found and displayed:', fileName);
       pushMessage(`Found file: ${fileName}`, 'success', 3000);
     }));
 
     // Listen for full file metadata (includes CIDs, HTTP sources, etc.)
-    unlisteners.push(await listen('file_discovered', (event: any) => {
+    // Backend emits this as 'found_file' event with complete FileMetadata
+    unlisteners.push(await listen('found_file', (event: any) => {
       const metadata = event.payload as FileMetadata;
-      console.log('📦 Full metadata discovered:', metadata);
+      console.log('📦 Full metadata discovered via found_file event:', metadata);
       console.log('📦 Metadata has CIDs:', metadata.cids?.length || 0);
       console.log('📦 Metadata has HTTP sources:', metadata.httpSources?.length || 0);
       console.log('📦 Metadata has seeders:', metadata.seeders?.length || 0);
@@ -228,52 +285,118 @@
       };
 
       console.log('✅ Stored full metadata with CIDs:', latestMetadata.cids?.length || 0);
+      console.log('✅ Stored full metadata with seeders:', latestMetadata.seeders?.length || 0);
     }));
 
     unlisteners.push(await listen('providers_found', (event: any) => {
       const { providers, count } = event.payload;
-      progressiveSearchState.providers = providers;
 
-      // Initialize seeder slots
-      progressiveSearchState.seeders = providers.map((peerId: string, index: number) => ({
-        index,
-        peerId,
-        hasGeneralInfo: false,
-        hasFileInfo: false
-      }));
+      // Only update if we have more providers than before (defensive against duplicate/stale events)
+      if (count > progressiveSearchState.providers.length) {
+        progressiveSearchState.providers = providers;
 
-      console.log(`📡 Found ${count} providers:`, providers);
-      console.log('📡 Progressive state providers:', progressiveSearchState.providers);
-      pushMessage(`Found ${count} seeders`, 'info', 2000);
+        // Initialize seeder slots
+        progressiveSearchState.seeders = providers.map((peerId: string, index: number) => ({
+          index,
+          peerId,
+          hasGeneralInfo: false,
+          hasFileInfo: false
+        }));
+
+        console.log(`📡 Found ${count} providers:`, providers);
+        console.log('📡 Progressive state providers:', progressiveSearchState.providers);
+        pushMessage(`Found ${count} seeders`, 'info', 2000);
+      } else {
+        console.log(`⏭️ Ignoring duplicate/stale providers_found event (current: ${progressiveSearchState.providers.length}, new: ${count})`);
+      }
     }));
 
     unlisteners.push(await listen('seeder_general_info', (event: any) => {
-      const { seederIndex, walletAddress, defaultPricePerMb, supportedProtocols } = event.payload;
+      const { seederIndex, walletAddress, defaultPricePerMb } = event.payload;
 
       const seeder = progressiveSearchState.seeders[seederIndex];
       if (seeder) {
         seeder.walletAddress = walletAddress;
         seeder.pricePerMb = defaultPricePerMb;
-        seeder.protocols = supportedProtocols;
         seeder.hasGeneralInfo = true;
+
+        syncAvailablePeerOffer(seeder.peerId, { walletAddress, pricePerMb: defaultPricePerMb });
       }
 
-      console.log(`💰 Seeder ${seederIndex} info: ${walletAddress}`);
+      if (DEV) console.log(`[DownloadSearchSection] seeder_general_info #${seederIndex}`, { walletAddress });
     }));
 
     unlisteners.push(await listen('seeder_file_info', (event: any) => {
-      const { seederIndex, pricePerMb, protocolDetails } = event.payload;
+      const { seederIndex, pricePerMb, supportedProtocols, protocolDetails } = event.payload;
 
       const seeder = progressiveSearchState.seeders[seederIndex];
       if (seeder) {
         if (pricePerMb !== null) {
           seeder.pricePerMb = pricePerMb;
         }
+        seeder.protocols = supportedProtocols;
         seeder.protocolDetails = protocolDetails;
         seeder.hasFileInfo = true;
+
+        syncAvailablePeerOffer(seeder.peerId, { pricePerMb: pricePerMb ?? undefined });
       }
 
-      console.log(`📦 Seeder ${seederIndex} file info received`);
+      if (DEV) console.log(`[DownloadSearchSection] seeder_file_info #${seederIndex}`);
+
+      // If the DHT record didn't include Bitswap CIDs (common when metadata is built progressively),
+      // hydrate them from seeder protocol details so downloads can start.
+      if (latestMetadata && protocolDetails) {
+        const next = { ...latestMetadata } as any;
+        let changed = false;
+
+        // Bitswap requires CIDs; seed them as soon as we learn them.
+        if (
+          (!next.cids || next.cids.length === 0) &&
+          Array.isArray(protocolDetails.cids) &&
+          protocolDetails.cids.length > 0
+        ) {
+          next.cids = protocolDetails.cids;
+          changed = true;
+          // Default to root=true when we only have a root CID list.
+          if (typeof next.isRoot !== 'boolean') {
+            next.isRoot = true;
+            changed = true;
+          }
+        }
+
+        // Fill in other protocol-specific fields opportunistically.
+        if (!next.httpSources && Array.isArray(protocolDetails.httpSources) && protocolDetails.httpSources.length > 0) {
+          next.httpSources = protocolDetails.httpSources;
+          changed = true;
+        }
+        if (!next.ftpSources && Array.isArray(protocolDetails.ftpSources) && protocolDetails.ftpSources.length > 0) {
+          next.ftpSources = protocolDetails.ftpSources;
+          changed = true;
+        }
+        if (!next.ed2kSources && Array.isArray(protocolDetails.ed2kSources) && protocolDetails.ed2kSources.length > 0) {
+          next.ed2kSources = protocolDetails.ed2kSources;
+          changed = true;
+        }
+        if (!next.infoHash && typeof protocolDetails.infoHash === 'string' && protocolDetails.infoHash.trim().length > 0) {
+          next.infoHash = protocolDetails.infoHash;
+          changed = true;
+        }
+        if (!next.trackers && Array.isArray(protocolDetails.trackers) && protocolDetails.trackers.length > 0) {
+          next.trackers = protocolDetails.trackers;
+          changed = true;
+        }
+
+        if (changed) {
+          latestMetadata = next;
+          console.log('✅ Hydrated metadata from seeder_file_info:', {
+            cids: next.cids?.length || 0,
+            httpSources: next.httpSources?.length || 0,
+            ftpSources: next.ftpSources?.length || 0,
+            ed2kSources: next.ed2kSources?.length || 0,
+            infoHash: next.infoHash ? 'set' : 'unset'
+          });
+        }
+      }
     }));
 
     unlisteners.push(await listen('search_complete', (event: any) => {
@@ -284,8 +407,10 @@
       pushMessage(`Search complete! Found ${totalSeeders} seeders`, 'success');
 
       // Build final metadata from progressive state
-      if (progressiveSearchState.basicMetadata) {
+      if (progressiveSearchState.basicMetadata || latestMetadata) {
         buildFinalMetadata();
+      } else {
+        console.warn('⚠️ Search complete but no metadata available');
       }
     }));
 
@@ -297,8 +422,10 @@
       pushMessage(`Partial results: ${partialSeeders} seeders available`, 'warning');
 
       // Build metadata with partial results
-      if (progressiveSearchState.basicMetadata) {
+      if (progressiveSearchState.basicMetadata || latestMetadata) {
         buildFinalMetadata();
+      } else {
+        console.warn('⚠️ Search timeout but no metadata available');
       }
     }));
 
@@ -345,6 +472,23 @@
         isRoot: true,
         price: 0
       };
+    }
+
+    // Final fallback: if the metadata still doesn't include Bitswap CIDs, attempt to hydrate them
+    // from any seeder_file_info protocolDetails we received.
+    if (latestMetadata && (!latestMetadata.cids || latestMetadata.cids.length === 0)) {
+      const firstWithCids = progressiveSearchState.seeders.find((s) =>
+        Array.isArray((s as any).protocolDetails?.cids) && (s as any).protocolDetails.cids.length > 0
+      ) as any;
+
+      if (firstWithCids?.protocolDetails?.cids?.length) {
+        latestMetadata = {
+          ...latestMetadata,
+          cids: firstWithCids.protocolDetails.cids,
+          isRoot: typeof latestMetadata.isRoot === 'boolean' ? latestMetadata.isRoot : true,
+        };
+        console.log('✅ Hydrated missing CIDs from progressive seeder_file_info');
+      }
     }
 
     console.log('✅ Final metadata built with seeders:', latestMetadata.seeders);
@@ -453,20 +597,13 @@
         if (parts.length >= 5) {
           const ed2kHash = parts[4]
           try {
-            // Search DHT using the ED2K hash as the key
-            const metadata = await dhtService.searchFileMetadata(ed2kHash, SEARCH_TIMEOUT_MS)
-            if (metadata) {
-              // Found the file! Show it instead of the placeholder
-              metadata.fileHash = metadata.merkleRoot || ""
-              latestMetadata = metadata
-              latestStatus = 'found'
-              hasSearched = true
-              pushMessage(`Found file: ${metadata.fileName}`, 'success')
-              isSearching = false
-              return
-            }
+            // Search DHT using the ED2K hash as the key (results come via events)
+            await dhtService.searchFileMetadata(ed2kHash, SEARCH_TIMEOUT_MS)
+            // The found_file event will populate latestMetadata if found
+            // If not found, we'll proceed with ED2K download below
+            console.log('Triggered DHT search for ED2K hash:', ed2kHash)
           } catch (error) {
-            console.log('DHT search failed, falling back to ED2K download:', error)
+            console.log('DHT search failed for ED2K hash:', error)
           }
         }
       } else if (searchMode === 'ftp') {
@@ -500,28 +637,13 @@
             }
           }
 
-          // If we have a hash, search DHT for real metadata
+          // If we have a hash, search DHT for real metadata (results come via events)
           if (extractedHash) {
             try {
-              const metadata = await dhtService.searchFileMetadata(extractedHash, SEARCH_TIMEOUT_MS)
-              if (metadata) {
-                // Use real metadata but override FTP sources
-                latestMetadata = {
-                  ...metadata,
-                  ftpSources: [{
-                    url: identifier,
-                    username: ftpUrl.username || undefined,
-                    password: ftpUrl.password || undefined,
-                    supportsResume: true, // Assume true for user-provided FTP URLs
-                    isAvailable: true
-                  }]
-                }
-                latestStatus = 'found'
-                hasSearched = true
-                isSearching = false
-                pushMessage(`Found FTP file: ${fileName}`, 'success')
-                return
-              }
+              await dhtService.searchFileMetadata(extractedHash, SEARCH_TIMEOUT_MS)
+              // The found_file event will populate latestMetadata if found
+              // For FTP, we'll enhance it with FTP sources in the event handler or use fallback below
+              console.log('Triggered DHT search for FTP hash:', extractedHash)
             } catch (error) {
               console.log('DHT search failed for FTP hash, falling back to basic FTP metadata:', error)
             }
@@ -762,30 +884,48 @@
   }
 
   // Helper function to determine available protocols for a file
-  // Files can only be downloaded via the protocol they were uploaded with
+  // Uses seeder-reported protocols from progressive search state
   function getAvailableProtocols(metadata: FileMetadata): Array<{id: string, name: string, description: string, available: boolean}> {
     console.log('🔍 getAvailableProtocols called with metadata:', metadata);
-    console.log('🔍 metadata.seeders:', metadata.seeders);
-    console.log('🔍 metadata.seeders.length:', metadata.seeders?.length);
+    console.log('🔍 progressiveSearchState.seeders:', progressiveSearchState.seeders);
 
-    // Determine which protocol was used for upload based on metadata
+    // Collect all protocols reported by seeders
+    const reportedProtocols = new Set<string>();
+    for (const seeder of progressiveSearchState.seeders) {
+      if (seeder.protocols && seeder.protocols.length > 0) {
+        for (const protocol of seeder.protocols) {
+          reportedProtocols.add(protocol.toLowerCase());
+        }
+      }
+    }
+
+    console.log('🔍 Seeder-reported protocols:', Array.from(reportedProtocols));
+
+    // Also check metadata fields as fallback for backwards compatibility
     const hasInfoHash = !!metadata.infoHash;
     const hasHttpSources = !!(metadata.httpSources && metadata.httpSources.length > 0);
     const hasFtpSources = !!(metadata.ftpSources && metadata.ftpSources.length > 0);
     const hasEd2kSources = !!(metadata.ed2kSources && metadata.ed2kSources.length > 0);
     const hasCids = !!(metadata.cids && metadata.cids.length > 0);
-    const hasSeeders = !!(metadata.seeders && metadata.seeders.length > 0);
 
-    console.log('🔍 Protocol detection:', { hasInfoHash, hasHttpSources, hasFtpSources, hasEd2kSources, hasCids, hasSeeders });
+    console.log('🔍 Metadata fields:', { hasInfoHash, hasHttpSources, hasFtpSources, hasEd2kSources, hasCids });
 
-    // BitSwap is available if there are CIDs and seeders (content-addressed, Merkle-hash based)
-    const isBitSwapAvailable = hasCids && hasSeeders && !hasInfoHash && !hasHttpSources && !hasFtpSources && !hasEd2kSources;
+    // Determine availability: use seeder-reported protocols if available, otherwise fall back to metadata detection
+    const isBitSwapAvailable = reportedProtocols.has('bitswap') || (reportedProtocols.size === 0 && hasCids);
+    const isWebRTCAvailable = reportedProtocols.has('webrtc') || (reportedProtocols.size === 0 && metadata.seeders && metadata.seeders.length > 0 && !hasInfoHash && !hasHttpSources && !hasFtpSources && !hasEd2kSources);
+    const isBitTorrentAvailable = reportedProtocols.has('bittorrent') || (reportedProtocols.size === 0 && hasInfoHash);
+    const isHttpAvailable = reportedProtocols.has('http') || (reportedProtocols.size === 0 && hasHttpSources);
+    const isEd2kAvailable = reportedProtocols.has('ed2k') || (reportedProtocols.size === 0 && hasEd2kSources);
+    const isFtpAvailable = reportedProtocols.has('ftp') || (reportedProtocols.size === 0 && hasFtpSources);
 
-    // WebRTC is available if there are seeders for P2P transfers (no CIDs, generic P2P)
-    const isWebRTCAvailable = hasSeeders && !hasCids && !hasInfoHash && !hasHttpSources && !hasFtpSources && !hasEd2kSources;
-
-    console.log('🔍 BitSwap available:', isBitSwapAvailable);
-    console.log('🔍 WebRTC available:', isWebRTCAvailable);
+    console.log('🔍 Protocol availability:', {
+      bitswap: isBitSwapAvailable,
+      webrtc: isWebRTCAvailable,
+      bittorrent: isBitTorrentAvailable,
+      http: isHttpAvailable,
+      ed2k: isEd2kAvailable,
+      ftp: isFtpAvailable
+    });
 
     return [
       {
@@ -804,33 +944,33 @@
         id: 'http',
         name: 'HTTP',
         description: 'Direct HTTP download',
-        available: hasHttpSources
+        available: isHttpAvailable
       },
       {
         id: 'bittorrent',
         name: 'BitTorrent',
         description: 'BitTorrent protocol',
-        available: hasInfoHash
+        available: isBitTorrentAvailable
       },
       {
         id: 'ed2k',
         name: 'ED2K',
         description: 'ED2K protocol',
-        available: hasEd2kSources
+        available: isEd2kAvailable
       },
       {
         id: 'ftp',
         name: 'FTP',
         description: 'FTP protocol',
-        available: hasFtpSources
+        available: isFtpAvailable
       }
     ];
   }
 
   // Check if current user is seeding this file
-  async function checkIfSeeding(metadata: FileMetadata): Promise<boolean> {
+  function checkIfSeeding(metadata: FileMetadata): boolean {
     try {
-      const currentPeerId = await dhtService.getPeerId();
+      const currentPeerId = dhtService.getPeerId();
       return currentPeerId ? metadata.seeders?.includes(currentPeerId) || false : false;
     } catch (error) {
       console.warn('Failed to check seeding status:', error);
@@ -840,11 +980,19 @@
 
   // Handle file download - show protocol selection modal first if multiple protocols available
   async function handleFileDownload(metadata: FileMetadata) {
+    console.log('🔍 DEBUG: handleFileDownload called in DownloadSearchSection');
+    console.log('🔍 DEBUG: metadata received:', metadata);
+    console.log('🔍 DEBUG: metadata.seeders:', metadata.seeders);
+    console.log('🔍 DEBUG: pendingTorrentType:', pendingTorrentType);
+    console.log('🔍 DEBUG: pendingTorrentIdentifier:', pendingTorrentIdentifier);
+
     // Check if user is seeding this file
-    selectedFileIsSeeding = await checkIfSeeding(metadata);
+    selectedFileIsSeeding = checkIfSeeding(metadata);
+    console.log('🔍 DEBUG: selectedFileIsSeeding:', selectedFileIsSeeding);
 
     // Handle BitTorrent downloads (magnet/torrent) - skip protocol selection, go directly to peer selection
     if (pendingTorrentType && pendingTorrentIdentifier) {
+      console.log('🔍 DEBUG: Handling BitTorrent download - showing peer selection modal');
       selectedFile = metadata;
       selectedProtocol = 'bittorrent';
       showPeerSelectionModal = true;
@@ -854,6 +1002,8 @@
     // Get available protocols for this file
     availableProtocols = getAvailableProtocols(metadata);
     const availableProtocolList = availableProtocols.filter(p => p.available);
+    console.log('🔍 DEBUG: availableProtocols:', availableProtocols);
+    console.log('🔍 DEBUG: availableProtocolList:', availableProtocolList);
 
     // If no protocols available
     if (availableProtocolList.length === 0) {
@@ -871,8 +1021,14 @@
 
   // Proceed with download using selected protocol
   async function proceedWithProtocolSelection(metadata: FileMetadata, protocolId: string) {
+    console.log('🔍 DEBUG: proceedWithProtocolSelection called');
+    console.log('🔍 DEBUG: metadata:', metadata);
+    console.log('🔍 DEBUG: protocolId:', protocolId);
+    console.log('🔍 DEBUG: metadata.seeders:', metadata.seeders);
+    
     // Handle HTTP and ED2K direct downloads (no peer selection)
     if (protocolId === 'http' || protocolId === 'ed2k') {
+      console.log('🔍 DEBUG: Using direct download for protocol:', protocolId);
       await startDirectDownload(metadata, protocolId);
       return;
     }
@@ -912,8 +1068,8 @@
       return;
     }
 
-    // For P2P protocols (WebRTC, BitTorrent) - need peer selection
-    if (protocolId === 'webrtc' || protocolId === 'bittorrent') {
+    // For P2P protocols (WebRTC, BitSwap, BitTorrent) - need peer selection
+    if (protocolId === 'webrtc' || protocolId === 'bitswap' || protocolId === 'bittorrent') {
       // Check if there are any seeders
       if (!metadata.seeders || metadata.seeders.length === 0) {
         pushMessage('No seeders available for this file', 'warning');
@@ -958,8 +1114,12 @@
 
   // Proceed with peer selection for P2P protocols
   async function proceedWithPeerSelection(metadata: FileMetadata) {
-    console.log('👥 proceedWithPeerSelection called with metadata:', metadata);
-    console.log('👥 metadata.seeders:', metadata.seeders);
+    if (DEV) {
+      console.log('[DownloadSearchSection] proceedWithPeerSelection', {
+        fileHash: metadata.fileHash,
+        seeders: metadata.seeders?.length ?? 0,
+      });
+    }
 
     selectedFile = metadata;
     autoSelectionInfo = null;  // Clear previous auto-selection info
@@ -968,31 +1128,38 @@
     try {
       const allMetrics = await PeerSelectionService.getPeerMetrics();
 
-      // Always calculate dynamic price per MB for peer selection
-      let perMbPrice = 0;
+      // Fallback price for peers without offer info yet.
+      let fallbackPerMbPrice = 0.001;
       try {
-        perMbPrice = await paymentService.getDynamicPricePerMB(1.2);
+        fallbackPerMbPrice = await paymentService.getDynamicPricePerMB(1.2);
       } catch (pricingError) {
         console.warn('Failed to get dynamic per MB price, using fallback:', pricingError);
-        perMbPrice = 0.001;
       }
 
-      console.log('👥 Mapping seeders to availablePeers. Seeder count:', metadata.seeders?.length || 0);
       availablePeers = metadata.seeders.map(seederId => {
         const metrics = allMetrics.find(m => m.peer_id === seederId);
+        const seederOffer = progressiveSearchState.seeders.find((s) => s.peerId === seederId);
+        const offerPrice = seederOffer?.pricePerMb;
+        const pricePerMb = typeof offerPrice === 'number' && Number.isFinite(offerPrice)
+          ? offerPrice
+          : fallbackPerMbPrice;
 
         return {
           peerId: seederId,
           latency_ms: metrics?.latency_ms,
           bandwidth_kbps: metrics?.bandwidth_kbps,
           reliability_score: metrics?.reliability_score ?? 0.5,
-          price_per_mb: perMbPrice,
+          price_per_mb: pricePerMb,
+          walletAddress: seederOffer?.walletAddress,
+          offerSource: typeof offerPrice === 'number' ? 'seeder' : 'fallback',
           selected: true,  // All selected by default
           percentage: Math.round(100 / metadata.seeders.length)  // Equal split
         };
       });
 
-      console.log('👥 availablePeers created:', availablePeers);
+      if (DEV) {
+        console.log('[DownloadSearchSection] availablePeers created', availablePeers);
+      }
 
       // If in auto mode, pre-calculate the selection for transparency
       if (peerSelectionMode === 'auto') {
@@ -1160,6 +1327,18 @@
         percentage: p.percentage
       }));
 
+    // Single payee model: choose lowest offer among selected peers.
+    const paymentPeer = pickLowestPricePeer(availablePeers);
+    if (!paymentPeer || !paymentPeer.walletAddress) {
+      pushMessage('Seeder offer info still loading. Please wait a moment and try again.', 'warning');
+      return;
+    }
+
+    const estimatedPaymentTotal = costFromPricePerMb({
+      bytes: selectedFile.fileSize,
+      pricePerMb: paymentPeer.price_per_mb,
+    });
+
     // Log transparency info for auto-selection
     if (peerSelectionMode === 'auto' && autoSelectionInfo) {
       autoSelectionInfo.forEach((info, index) => {
@@ -1184,11 +1363,24 @@
       // P2P download flow (WebRTC, Bitswap)
       
 
-      const fileWithSelectedPeers: FileMetadata & { peerAllocation?: any[]; selectedProtocol?: string } = {
+      const fileWithSelectedPeers: FileMetadata & {
+        peerAllocation?: any[];
+        selectedProtocol?: string;
+        paymentPeerId?: string;
+        paymentPeerWalletAddress?: string;
+        paymentPricePerMb?: number;
+        estimatedPaymentTotal?: number;
+      } = {
         ...selectedFile,
         seeders: selectedPeers,  // Override with selected peers
         peerAllocation,
-        selectedProtocol: selectedProtocol  // Pass the user's protocol selection
+        selectedProtocol: selectedProtocol,  // Pass the user's protocol selection
+        // Keep uploaderAddress aligned with the chosen payment payee for legacy code paths.
+        uploaderAddress: paymentPeer.walletAddress,
+        paymentPeerId: paymentPeer.peerId,
+        paymentPeerWalletAddress: paymentPeer.walletAddress,
+        paymentPricePerMb: paymentPeer.price_per_mb,
+        estimatedPaymentTotal,
       };
 
       // Dispatch to parent (Download.svelte)
@@ -1230,7 +1422,7 @@
       <!-- Search Mode Switcher -->
       <div class="flex gap-2 mb-3 mt-3">
         <select bind:value={searchMode} class="px-3 py-1 text-sm rounded-md border transition-colors bg-muted/50 hover:bg-muted border-border">
-            <option value="merkle_hash">Search by Merkle Hash</option>
+            <option value="merkle_hash">Search by File Hash</option>
             <option value="magnet">Search by Magnet Link</option>
             <option value="torrent">Search by .torrent File</option>
             <option value="ed2k">Search by ED2K Link</option>
@@ -1247,7 +1439,7 @@
               bind:this={torrentFileInput}
               accept=".torrent"
               class="hidden"
-              on:change={handleTorrentFileSelect}
+              onchange={handleTorrentFileSelect}
             />
             <Button
               variant="default"
@@ -1268,7 +1460,7 @@
               id="hash-input"
               bind:value={searchHash}
               placeholder={
-                searchMode === 'merkle_hash' ? 'Enter Merkle root hash (SHA-256)...' :
+                searchMode === 'merkle_hash' ? 'Enter file hash (SHA-256)...' :
                 searchMode === 'magnet' ? 'magnet:?xt=urn:btih:...' :
                 searchMode === 'ed2k' ? 'ed2k://|file|filename|size|hash|/' :
                 searchMode === 'ftp' ? 'ftp://user:pass@server.com/path/file' :
@@ -1286,7 +1478,7 @@
             />
             {#if searchHash}
               <button
-                on:click={clearSearch}
+                onclick={clearSearch}
                 class="absolute right-10 top-1/2 transform -translate-y-1/2 p-1 hover:bg-muted rounded-full transition-colors"
                 type="button"
                 aria-label={tr('download.clearInput')}
@@ -1295,7 +1487,7 @@
               </button>
             {/if}
             <button
-              on:click={toggleHistoryDropdown}
+              onclick={toggleHistoryDropdown}
               class="absolute right-2 top-1/2 transform -translate-y-1/2 p-1 hover:bg-muted rounded-full transition-colors"
               type="button"
               aria-label="Toggle search history"
@@ -1322,16 +1514,17 @@
                 </div>
                 <div class="py-1">
                   {#each historyEntries as entry}
+                    {@const StatusIcon = statusIcon(entry.status)}
                     <button
                       type="button"
                       class="w-full px-3 py-2 text-left hover:bg-muted/60 transition-colors flex items-center justify-between"
-                      on:click={() => selectHistoryEntry(entry)}
+                      onclick={() => selectHistoryEntry(entry)}
                     >
                       <div class="flex items-center gap-2 flex-1 min-w-0">
                         <span class="text-sm font-medium truncate">{entry.hash}</span>
                       </div>
                       <div class="flex items-center gap-2 text-xs text-muted-foreground">
-                        <svelte:component this={statusIcon(entry.status)} class={`h-3 w-3 ${statusClass(entry.status)}`} />
+                        <StatusIcon class={`h-3 w-3 ${statusClass(entry.status)}`} />
                         {#if entry.elapsedMs}
                           <span>{(entry.elapsedMs / 1000).toFixed(1)}s</span>
                         {/if}
@@ -1374,9 +1567,7 @@
       <div class="pt-6 border-t">
         <div class="space-y-4">
             {#if isSearching}
-              <div class="rounded-md border border-dashed border-muted p-5 text-sm text-muted-foreground text-center">
-                {tr('download.search.status.searching')}
-              </div>
+              <SearchResultCardSkeleton />
             {:else if latestStatus === 'found' && latestMetadata}
               <SearchResultCard
                 metadata={latestMetadata}
