@@ -92,8 +92,11 @@
   let peerCount = 0
   let peerCountInterval: ReturnType<typeof setInterval> | undefined
   let chainId: number | null = 98765; // Default, will be fetched from backend
-  // Reactive node address from wallet
-  $: nodeAddress = $wallet.address || ''
+  // Wallet address (account) vs. blockchain node identity (geth node id)
+  let walletAddress = ''
+  $: walletAddress = $wallet.address || ''
+  let nodeAddress = '' // Geth node id (admin_nodeInfo.id)
+  let nodeEnode: string | null = null
   // let copiedNodeAddr = false
   
   // DHT variables
@@ -1132,6 +1135,12 @@
         peerCountInterval = undefined
       }
       peerCount = 0
+      nodeAddress = ''
+      nodeEnode = null
+    }
+
+    if (status.running && !nodeAddress) {
+      void refreshGethNodeInfo()
     }
   }
 
@@ -1233,6 +1242,7 @@
       })
       isGethRunning = true
       startPolling()
+      await refreshGethNodeInfo()
     } catch (error) {
       errorLogger.networkError(`Failed to start Chiral node: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -1254,6 +1264,8 @@
         peerCountInterval = undefined
       }
       peerCount = 0
+      nodeAddress = ''
+      nodeEnode = null
     } catch (error) {
       errorLogger.networkError(`Failed to stop Chiral node: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1277,6 +1289,39 @@
       await navigator.clipboard.writeText(text)
     } catch (e) {
       errorLogger.networkError(`Copy failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  function extractNodeIdFromEnode(enode: string | null | undefined): string | null {
+    if (!enode) return null
+    const prefix = 'enode://'
+    if (!enode.startsWith(prefix)) return null
+    const rest = enode.slice(prefix.length)
+    const at = rest.indexOf('@')
+    if (at === -1) return null
+    const id = rest.slice(0, at).trim()
+    return id.length ? id : null
+  }
+
+  async function refreshGethNodeInfo() {
+    if (!isTauri || !isGethRunning) {
+      nodeAddress = ''
+      nodeEnode = null
+      return
+    }
+
+    try {
+      const info = await invoke<any>('get_geth_node_info')
+      const id = (typeof info?.id === 'string' && info.id.trim().length) ? info.id.trim() : null
+      const enode = (typeof info?.enode === 'string' && info.enode.trim().length) ? info.enode.trim() : null
+
+      nodeEnode = enode
+      nodeAddress = id ?? extractNodeIdFromEnode(enode) ?? ''
+    } catch (error) {
+      errorLogger.networkError(`Failed to fetch geth node info: ${error instanceof Error ? error.message : String(error)}`)
+      if (!nodeAddress) {
+        nodeEnode = null
+      }
     }
   }
 
@@ -1656,7 +1701,7 @@
                     <div class="space-y-1">
                       <span class="text-xs text-muted-foreground uppercase">Node Address</span>
                       <div class="flex items-center gap-2">
-                        <code class="bg-muted px-2 py-1 rounded text-xs font-mono flex-1 truncate" title={nodeAddress}>
+                        <code class="bg-muted px-2 py-1 rounded text-xs font-mono flex-1 truncate" title={nodeEnode ?? nodeAddress}>
                           {nodeAddress || 'Waiting for start...'}
                         </code>
                         {#if nodeAddress}
@@ -2063,9 +2108,9 @@
             <div class="space-y-1">
               <span class="text-xs text-muted-foreground uppercase">Blockchain Address</span>
               <div class="bg-muted/50 border border-border px-3 py-2 rounded-md text-sm font-mono text-foreground flex items-center">
-                <span class="flex-1 truncate" title={nodeAddress}>{nodeAddress || 'Unknown'}</span>
-                {#if nodeAddress}
-                  <Button variant="outline" size="icon" class="h-8 w-8 ml-2" on:click={() => copy(nodeAddress)}>
+                <span class="flex-1 truncate" title={walletAddress}>{walletAddress || 'Unknown'}</span>
+                {#if walletAddress}
+                  <Button variant="outline" size="icon" class="h-8 w-8 ml-2" on:click={() => copy(walletAddress)}>
                     <Clipboard class="h-4 w-4" />
                   </Button>
                 {/if}

@@ -5,7 +5,7 @@
   import Input from '$lib/components/ui/input.svelte';
   import Label from '$lib/components/ui/label.svelte';
   import Button from '$lib/components/ui/button.svelte';
-  import { Search, X, History, RotateCcw, AlertCircle, CheckCircle2, Loader } from 'lucide-svelte';
+  import { Search, X, History, RotateCcw, AlertCircle, CheckCircle2 } from 'lucide-svelte';
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
   import { get } from 'svelte/store';
   import { t } from 'svelte-i18n';
@@ -64,6 +64,34 @@
   let latestMetadata = $state<FileMetadata | null>(null);
   let searchError = $state<string | null>(null);
   let lastSearchDuration = $state(0);
+  let searchStartedAtMs = $state<number | null>(null);
+  let searchCancelTimeoutId = $state<ReturnType<typeof setTimeout> | null>(null);
+  let currentSearchId = $state(0);
+
+  async function cancelSearch() {
+    // Invalidate any in-flight async work
+    currentSearchId += 1;
+
+    if (searchCancelTimeoutId) {
+      clearTimeout(searchCancelTimeoutId);
+      searchCancelTimeoutId = null;
+    }
+
+    isSearching = false;
+
+    // Stop consuming progressive events; backend may still finish its search.
+    await cleanupProgressiveEventListeners();
+
+    // Freeze the UI in whatever state we currently have.
+    if (latestMetadata) {
+      progressiveSearchState.status = 'timeout';
+    } else {
+      progressiveSearchState.status = 'idle';
+      latestStatus = 'pending';
+    }
+
+    pushMessage('Search cancelled', 'info', 2000);
+  }
   let historyEntries = $state<SearchHistoryEntry[]>([]);
   let activeHistoryId = $state<string | null>(null);
   let showHistoryDropdown = $state(false);
@@ -295,13 +323,26 @@
       if (count > progressiveSearchState.providers.length) {
         progressiveSearchState.providers = providers;
 
-        // Initialize seeder slots
-        progressiveSearchState.seeders = providers.map((peerId: string, index: number) => ({
-          index,
-          peerId,
-          hasGeneralInfo: false,
-          hasFileInfo: false
-        }));
+        // Initialize/update seeder slots (preserve previously loaded info by peerId)
+        const prevByPeer = new Map(progressiveSearchState.seeders.map((s) => [s.peerId, s] as const));
+        progressiveSearchState.seeders = providers.map((peerId: string, index: number) => {
+          const prev = prevByPeer.get(peerId);
+          if (prev) return { ...prev, index };
+          return {
+            index,
+            peerId,
+            hasGeneralInfo: false,
+            hasFileInfo: false
+          };
+        });
+
+        // If basic metadata is already shown, update seeders immediately (don't wait for seeder info)
+        if (latestMetadata && progressiveSearchState.status === 'searching') {
+          latestMetadata = {
+            ...latestMetadata,
+            seeders: providers,
+          };
+        }
 
         console.log(`📡 Found ${count} providers:`, providers);
         console.log('📡 Progressive state providers:', progressiveSearchState.providers);
@@ -402,6 +443,11 @@
     unlisteners.push(await listen('search_complete', (event: any) => {
       const { totalSeeders, durationMs } = event.payload;
       progressiveSearchState.status = 'complete';
+      if (typeof durationMs === 'number' && Number.isFinite(durationMs)) {
+        lastSearchDuration = durationMs;
+      } else if (typeof searchStartedAtMs === 'number') {
+        lastSearchDuration = Math.round(performance.now() - searchStartedAtMs);
+      }
 
       console.log(`✅ Search complete: ${totalSeeders} seeders in ${durationMs}ms`);
       pushMessage(`Search complete! Found ${totalSeeders} seeders`, 'success');
@@ -417,6 +463,9 @@
     unlisteners.push(await listen('search_timeout', (event: any) => {
       const { partialSeeders, missingCount } = event.payload;
       progressiveSearchState.status = 'timeout';
+      if (typeof searchStartedAtMs === 'number') {
+        lastSearchDuration = Math.round(performance.now() - searchStartedAtMs);
+      }
 
       console.warn(`⚠️ Search timeout: ${partialSeeders} complete, ${missingCount} missing`);
       pushMessage(`Partial results: ${partialSeeders} seeders available`, 'warning');
@@ -505,6 +554,10 @@
       console.warn('⚠️ Search already in progress, ignoring duplicate call')
       return
     }
+
+    currentSearchId += 1;
+    const searchId = currentSearchId;
+
     isSearching = true
     console.log('✅ Search started, isSearching now:', isSearching)
 
@@ -761,6 +814,7 @@
     searchError = null;
 
     const startedAt = performance.now();
+    searchStartedAtMs = startedAt;
 
     try {
       // Setup progressive event listeners
@@ -780,13 +834,40 @@
       activeHistoryId = entry.id;
 
       // Initiate progressive search (non-blocking)
-      await dhtService.searchFileMetadata(trimmed, SEARCH_TIMEOUT_MS);
+      void dhtService.searchFileMetadata(trimmed, SEARCH_TIMEOUT_MS).catch((error) => {
+        // Ignore late failures from a canceled/stale search
+        if (searchId !== currentSearchId) return;
+
+        const message = error instanceof Error ? error.message : tr('download.search.status.unknownError');
+        const elapsed = Math.round(performance.now() - startedAt);
+        lastSearchDuration = elapsed;
+        latestStatus = 'error';
+        searchError = message;
+
+        if (searchMode === 'merkle_hash' && activeHistoryId) {
+          dhtSearchHistory.updateEntry(activeHistoryId, {
+            status: 'error',
+            errorMessage: message,
+            elapsedMs: elapsed,
+          });
+        }
+
+        console.error('Search failed:', error);
+        pushMessage(`${tr('download.search.status.errorNotification')}: ${message}`, 'error', 6000);
+
+        isSearching = false;
+        void cleanupProgressiveEventListeners();
+      });
 
       // Note: The search will now progress via events
       // The final metadata will be built in buildFinalMetadata() when search_complete or search_timeout fires
 
       // Fallback timeout: reset isSearching after 15 seconds if no completion event received
-      setTimeout(() => {
+      if (searchCancelTimeoutId) {
+        clearTimeout(searchCancelTimeoutId);
+      }
+      searchCancelTimeoutId = setTimeout(() => {
+        if (searchId !== currentSearchId) return;
         if (isSearching && progressiveSearchState.status === 'searching') {
           console.warn('⚠️ Frontend timeout - no completion event received from backend');
           isSearching = false;
@@ -1547,14 +1628,14 @@
           </div>
         {/if}
         <Button
-          on:click={searchForFile}
-          disabled={(searchMode !== 'torrent' && !searchHash.trim()) || (searchMode === 'torrent' && !torrentFileName) || isSearching}
+          on:click={isSearching ? cancelSearch : searchForFile}
+          disabled={!isSearching && ((searchMode !== 'torrent' && !searchHash.trim()) || (searchMode === 'torrent' && !torrentFileName))}
           class="h-10 px-6"
-          title={isSearching ? 'Search in progress...' : (searchMode !== 'torrent' && !searchHash.trim()) ? 'Enter a search hash' : (searchMode === 'torrent' && !torrentFileName) ? 'Select a torrent file' : 'Search'}
+          title={isSearching ? 'Cancel search' : (searchMode !== 'torrent' && !searchHash.trim()) ? 'Enter a search hash' : (searchMode === 'torrent' && !torrentFileName) ? 'Select a torrent file' : 'Search'}
         >
           {#if isSearching}
-            <Loader class="h-4 w-4 mr-2 animate-spin" />
-            {tr('download.search.status.searching')}
+            <X class="h-4 w-4 mr-2" />
+            {tr('actions.cancel')}
           {:else}
             <Search class="h-4 w-4 mr-2" />
             {tr('download.search.button')}
@@ -1566,9 +1647,7 @@
     {#if hasSearched}
       <div class="pt-6 border-t">
         <div class="space-y-4">
-            {#if isSearching}
-              <SearchResultCardSkeleton />
-            {:else if latestStatus === 'found' && latestMetadata}
+            {#if latestStatus === 'found' && latestMetadata}
               <SearchResultCard
                 metadata={latestMetadata}
                 isLoading={progressiveSearchState.status === 'searching'}
@@ -1577,9 +1656,15 @@
                 on:copy={handleCopy}
                 on:download={(event: any) => handleFileDownload(event.detail)}
               />
-              <p class="text-xs text-muted-foreground">
-                {tr('download.search.status.completedIn', { values: { seconds: (lastSearchDuration / 1000).toFixed(1) } })}
-              </p>
+              {#if progressiveSearchState.status === 'searching'}
+                <p class="text-xs text-muted-foreground">Searching for more peers...</p>
+              {:else if (progressiveSearchState.status === 'complete' || progressiveSearchState.status === 'timeout') && lastSearchDuration > 0}
+                <p class="text-xs text-muted-foreground">
+                  {tr('download.search.status.completedIn', { values: { seconds: (lastSearchDuration / 1000).toFixed(1) } })}
+                </p>
+              {/if}
+            {:else if isSearching}
+              <SearchResultCardSkeleton />
             {:else if latestStatus === 'not_found'}
               <div class="text-center py-8">
                 {#if searchError}

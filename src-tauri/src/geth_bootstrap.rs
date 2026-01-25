@@ -157,7 +157,7 @@ pub fn get_bootstrap_nodes() -> Vec<BootstrapNode> {
             supports_discv5: true,
         },
         BootstrapNode {
-            enode: "enode://f35e9211207e3e73ac063db816d613a7ee27978b7339277fa8b22d7dd74005a053314a3f678b6d5e36968ee65a66dd370b589b00efe361635aa7da211abcba82@129.80.7.212:30303".to_string(),
+            enode: "enode://816aafd4138ba0bacee1b849a20a4e19e4c6e809bdacd13eaf8eb04d986cf02d9f17616c71cfa5d37c2f7b41531bcff88d8c85405584ac0391011f1bd57fee39@129.80.7.212:30303".to_string(),
             description: "Totoro, oracle cloud".to_string(),
             region: "US East".to_string(),
             priority: 2,
@@ -168,7 +168,7 @@ pub fn get_bootstrap_nodes() -> Vec<BootstrapNode> {
             enode: "enode://b3ead5f07d0dbeda56023435a7c05877d67b055df3a8bf18f3d5f7c56873495cd4de5cf031ae9052827c043c12f1d30704088c79fb539c96834bfa74b78bf80b@20.85.124.187:30303".to_string(),
             description: "Secondary US Bootstrap Node (Azure West)".to_string(),
             region: "US West".to_string(),
-            priority: 2,
+            priority: 3,
             supports_discv5: true,
         },
         // Backup node - same region as primary for redundancy
@@ -178,7 +178,7 @@ pub fn get_bootstrap_nodes() -> Vec<BootstrapNode> {
             enode: "enode://ae987db6399b50addb75d7822bfad9b4092fbfd79cbfe97e6864b1f17d3e8fcd8e9e190ad109572c1439230fa688a9837e58f0b1ad7c0dc2bc6e4ab328f3991e@130.245.173.105:30304".to_string(),
             description: "Backup US Bootstrap Node (Stony Brook Alt Port)".to_string(),
             region: "US East".to_string(),
-            priority: 3,
+            priority: 4,
             supports_discv5: false,
         },
     ]

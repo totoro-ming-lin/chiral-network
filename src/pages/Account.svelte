@@ -676,14 +676,6 @@
     walletService.initialize().then(async () => {
       await loadKeystoreAccountsList();
 
-      // Try to hydrate accurate totals from a cached snapshot before triggering
-      // an expensive full-chain scan.
-      try {
-        await walletService.hydrateAccurateTotalsFromCache();
-      } finally {
-        accurateTotalsCacheChecked = true;
-      }
-
       // Fetch chain ID from backend
       if (isTauri) {
         try {
@@ -733,22 +725,17 @@
   let didAutoCalculateAccurateTotals = false;
   let lastAccurateTotalsAddress: string | null = null;
   let accurateTotalsError: string | null = null;
-  let accurateTotalsCacheChecked = false;
 
   // Reset auto-trigger when account changes
   $: if ($etcAccount?.address && $etcAccount.address !== lastAccurateTotalsAddress) {
     lastAccurateTotalsAddress = $etcAccount.address;
     didAutoCalculateAccurateTotals = false;
     accurateTotalsError = null;
-
-    // Prevent showing totals from a different account.
-    accurateTotals.set(null);
   }
 
   $: if (
     $etcAccount &&
     isGethRunning &&
-    accurateTotalsCacheChecked &&
     !$accurateTotals &&
     !$isCalculatingAccurateTotals &&
     !didAutoCalculateAccurateTotals

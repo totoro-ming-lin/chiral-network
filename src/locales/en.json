@@ -1716,7 +1716,9 @@
     },
     "blocks": {
       "latest": "Latest Blocks",
-      "noBlocks": "No blocks found"
+      "noBlocks": "No blocks found",
+      "syncingTitle": "Syncing blocks…",
+      "syncingSubtitle": "Your node is still syncing. Recent blocks may not be available until sync completes."
     },
     "sync": {
       "syncing": "Syncing",
@@ -1724,7 +1726,8 @@
       "highest": "Highest Block",
       "remaining": "Remaining",
       "eta": "ETA",
-      "complete": "Sync Complete"
+      "complete": "Sync Complete",
+      "inProgress": "Sync in progress"
     },
     "search": {
       "title": "Search Blockchain",

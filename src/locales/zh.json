@@ -1563,7 +1563,9 @@
     },
     "blocks": {
       "latest": "最新区块",
-      "noBlocks": "未找到区块"
+      "noBlocks": "未找到区块",
+      "syncingTitle": "正在同步区块...",
+      "syncingSubtitle": "你的节点仍在同步中。在同步完成之前，最新区块可能无法显示。"
     },
     "sync": {
       "syncing": "同步中",
@@ -1571,7 +1573,8 @@
       "highest": "最高区块",
       "remaining": "剩余",
       "eta": "预计时间",
-      "complete": "同步完成"
+      "complete": "同步完成",
+      "inProgress": "同步进行中"
     },
     "search": {
       "title": "搜索区块链",

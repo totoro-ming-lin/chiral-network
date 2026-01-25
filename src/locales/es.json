@@ -1547,7 +1547,9 @@
     },
     "blocks": {
       "latest": "Bloques recientes",
-      "noBlocks": "No se encontraron bloques"
+      "noBlocks": "No se encontraron bloques",
+      "syncingTitle": "Sincronizando bloques...",
+      "syncingSubtitle": "Tu nodo todavia esta sincronizando. Los bloques recientes pueden no estar disponibles hasta que termine la sincronizacion."
     },
     "sync": {
       "syncing": "Sincronizando",
@@ -1555,7 +1557,8 @@
       "highest": "Bloque más alto",
       "remaining": "Restante",
       "eta": "ETA",
-      "complete": "Sincronización completa"
+      "complete": "Sincronización completa",
+      "inProgress": "Sincronizacion en curso"
     },
     "search": {
       "title": "Buscar en la blockchain",

@@ -433,6 +433,16 @@ async fn create_chiral_account(state: State<'_, AppState>) -> Result<EthAccount,
         *active_key = Some(account.private_key.clone());
     }
 
+    // Default mining rewards to the active wallet address.
+    {
+        let mut miner_address = state.miner_address.lock().await;
+        *miner_address = Some(account.address.clone());
+    }
+    {
+        let mut current_address = CURRENT_MINER_ADDRESS.lock().await;
+        *current_address = Some(account.address.clone());
+    }
+
     Ok(account)
 }
 
@@ -453,6 +463,16 @@ async fn import_chiral_account(
     {
         let mut active_key = state.active_account_private_key.lock().await;
         *active_key = Some(account.private_key.clone());
+    }
+
+    // Default mining rewards to the active wallet address.
+    {
+        let mut miner_address = state.miner_address.lock().await;
+        *miner_address = Some(account.address.clone());
+    }
+    {
+        let mut current_address = CURRENT_MINER_ADDRESS.lock().await;
+        *current_address = Some(account.address.clone());
     }
 
     Ok(account)
@@ -960,7 +980,13 @@ async fn download_geth_binary(
 #[tauri::command]
 async fn set_miner_address(state: State<'_, AppState>, address: String) -> Result<(), String> {
     let mut miner_address = state.miner_address.lock().await;
-    *miner_address = Some(address);
+    *miner_address = Some(address.clone());
+
+    // Keep the mining monitor's view in sync even if mining is started elsewhere.
+    {
+        let mut current_address = CURRENT_MINER_ADDRESS.lock().await;
+        *current_address = Some(address);
+    }
     Ok(())
 }
 
@@ -1405,12 +1431,35 @@ async fn start_mining_monitor(app: tauri::AppHandle, data_dir: String) -> Result
                             if line.contains("Successfully sealed new block") {
                                 // 🎉 WE MINED A BLOCK! 🎉
                                 // Get the current mining address and increment the counter for that address
-                                if let Some(miner_address) =
-                                    CURRENT_MINER_ADDRESS.lock().await.clone()
-                                {
+                                if let Some(miner_address) = CURRENT_MINER_ADDRESS.lock().await.clone() {
                                     increment_mined_blocks(miner_address).await;
                                 } else {
-                                    println!("⚠️  Block mined but no current miner address set!");
+                                    // Mining may have been started outside the UI command path.
+                                    // Try to infer the miner address from the node's coinbase.
+                                    match ethereum::get_coinbase().await {
+                                        Ok(coinbase)
+                                            if coinbase.to_lowercase()
+                                                != "0x0000000000000000000000000000000000000000" =>
+                                        {
+                                            {
+                                                let mut current_address =
+                                                    CURRENT_MINER_ADDRESS.lock().await;
+                                                *current_address = Some(coinbase.clone());
+                                            }
+                                            increment_mined_blocks(coinbase).await;
+                                        }
+                                        Ok(_) => {
+                                            println!(
+                                                "⚠️  Block mined but node coinbase/etherbase is not set!"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            println!(
+                                                "⚠️  Block mined but could not determine miner address: {}",
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
 
                                 // Emit event to frontend - that's it!
@@ -10223,37 +10272,9 @@ fn main() {
                 });
             }
 
-            // Start DHT event pump with the real app handle
-            {
-                let app_handle = app.handle().clone();
-                let dht_clone_for_pump = {
-                    if let Some(state) = app_handle.try_state::<AppState>() {
-                        if let Ok(dht_guard) = state.dht.try_lock() {
-                            dht_guard.clone()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(dht_service) = dht_clone_for_pump {
-                    let proxies_arc_for_pump = Arc::new(Mutex::new(Vec::new()));
-                    let relay_reputation_arc_for_pump =
-                        Arc::new(Mutex::new(std::collections::HashMap::new()));
-
-                    tauri::async_runtime::spawn(async move {
-                        pump_dht_events(
-                            app_handle,
-                            dht_service,
-                            proxies_arc_for_pump,
-                            relay_reputation_arc_for_pump,
-                        )
-                        .await;
-                    });
-                }
-            }
+            // NOTE: DHT events are already pumped inside start_dht_node().
+            // Starting a second pump here can drain and drop events (notably progressive search events),
+            // which causes the frontend to timeout waiting for search_complete/search_timeout.
 
             // Set app handle on bandwidth controller for event emission
             {

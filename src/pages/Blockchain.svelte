@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, getContext } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { get } from 'svelte/store';
   import { t } from 'svelte-i18n';
   import { fade } from 'svelte/transition';
   import { goto } from '@mateothegreat/svelte5-router';
@@ -112,11 +113,19 @@
       console.log('Current block number:', currentBlockNumber);
       networkStats.totalBlocks = currentBlockNumber;
 
+      // During snap sync, eth_blockNumber can temporarily return 0 while eth_syncing reports progress.
+      // Fall back to sync status (if available) to avoid misleading "no blocks" messaging.
       if (currentBlockNumber === 0) {
-        console.log('No blocks mined yet. Is Geth running? Is mining active?');
-        showToast(tr('toasts.blockchain.noBlocks'), 'info');
-        latestBlocks = [];
-        return;
+        const sync = get(gethSyncStatus);
+        if (sync?.current_block && sync.current_block > 0) {
+          currentBlockNumber = sync.current_block;
+          networkStats.totalBlocks = currentBlockNumber;
+        } else {
+          console.log('No blocks mined yet. Is Geth running? Is mining active?');
+          showToast(tr('toasts.blockchain.noBlocks'), 'info');
+          latestBlocks = [];
+          return;
+        }
       }
 
       // Fetch last 10 blocks
@@ -364,10 +373,19 @@
 
   // Format time remaining
   function formatTimeRemaining(seconds: number | null): string {
-    if (seconds === null || seconds === 0) return 'Complete';
+    if (seconds === null) return '—';
+    if (seconds <= 0) return '0s';
     if (seconds < 60) return `${Math.round(seconds)}s`;
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
     return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  }
+
+  function formatTimeRemainingWithCompletion(
+    seconds: number | null,
+    blocksRemaining: number
+  ): string {
+    if (blocksRemaining === 0) return 'Complete';
+    return formatTimeRemaining(seconds);
   }
 
   // Refresh data
@@ -452,12 +470,11 @@
             <span class="text-muted-foreground">{tr('blockchain.sync.remaining')}:</span> {$gethSyncStatus.blocks_remaining.toLocaleString()} blocks
           </div>
           <div>
-            <span class="text-muted-foreground">{tr('blockchain.sync.eta')}:</span> {formatTimeRemaining($gethSyncStatus.estimated_seconds_remaining)}
+            <span class="text-muted-foreground">{tr('blockchain.sync.eta')}:</span>
+            {formatTimeRemainingWithCompletion($gethSyncStatus.estimated_seconds_remaining, $gethSyncStatus.blocks_remaining)}
           </div>
         </div>
-        <p class="text-xs text-blue-600 mt-2">
-          ⏳ {tr('blockchain.sync.complete')}
-        </p>
+        <p class="text-xs text-blue-600 mt-2">⏳ {tr('blockchain.sync.inProgress')}</p>
       </div>
     </div>
   {/if}
@@ -595,17 +612,26 @@
           </div>
         {:else if latestBlocks.length === 0}
           <div class="text-center py-8">
-            <p class="text-gray-900 mb-4 font-medium">
-              {tr('blockchain.blocks.noBlocks')}
-            </p>
-            <p class="text-gray-700 text-sm mb-4">
-              No blocks have been mined yet. To create blocks:
-            </p>
-            <ol class="text-left text-gray-700 text-sm max-w-md mx-auto space-y-2 mb-4">
-              <li>1. Start the Chiral node (Network page)</li>
-              <li>2. Start mining (Mining page)</li>
-              <li>3. Wait for blocks to be mined</li>
-            </ol>
+            {#if $gethSyncStatus?.syncing}
+              <p class="text-gray-900 mb-2 font-medium">
+                {tr('blockchain.blocks.syncingTitle')}
+              </p>
+              <p class="text-gray-700 text-sm max-w-md mx-auto">
+                {tr('blockchain.blocks.syncingSubtitle')}
+              </p>
+            {:else}
+              <p class="text-gray-900 mb-4 font-medium">
+                {tr('blockchain.blocks.noBlocks')}
+              </p>
+              <p class="text-gray-700 text-sm mb-4">
+                No blocks have been mined yet. To create blocks:
+              </p>
+              <ol class="text-left text-gray-700 text-sm max-w-md mx-auto space-y-2 mb-4">
+                <li>1. Start the Chiral node (Network page)</li>
+                <li>2. Start mining (Mining page)</li>
+                <li>3. Wait for blocks to be mined</li>
+              </ol>
+            {/if}
           </div>
         {:else}
           <div class="space-y-3">
