@@ -18,7 +18,7 @@
   import { walletService } from '$lib/wallet';
   import TemporaryAccountWarning from '$lib/components/TemporaryAccountWarning.svelte';
   import { showToast } from '$lib/toast';
-  import { gethSyncStatus } from '$lib/services/gethService';
+  import { gethSyncStatus, gethTransition } from '$lib/services/gethService';
   import { dhtService } from '$lib/dht';
   type TranslateParams = { values?: Record<string, unknown>; default?: string };
   // const tr = (key: string, params?: TranslateParams) => get(t)(key, params);
@@ -1684,6 +1684,18 @@
           </div>
         </div>
       {/if}
+
+      {#if $gethTransition === 'stopping'}
+        <div class="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 mt-2">
+          <div class="flex items-center gap-2">
+            <RefreshCw class="h-4 w-4 text-amber-600 animate-spin flex-shrink-0" />
+            <div>
+              <p class="text-sm font-medium text-amber-800">{$t('mining.node.shuttingDown.title')}</p>
+              <p class="text-xs text-amber-700 mt-1">{$t('mining.node.shuttingDown.subtitle')}</p>
+            </div>
+          </div>
+        </div>
+      {/if}
       {#if !isGethRunning}
         <div class="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-3 mt-2">
           <div class="flex items-center gap-2">
@@ -2614,5 +2626,3 @@
     </Card>
   </div>
 {/if}
-
-

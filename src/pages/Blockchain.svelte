@@ -25,7 +25,7 @@
     AlertCircle
   } from 'lucide-svelte';
   import { showToast } from '$lib/toast';
-  import { gethStatus, gethSyncStatus } from '$lib/services/gethService';
+  import { gethStatus, gethSyncStatus, gethTransition, type SyncStatus } from '$lib/services/gethService';
   import { diagnosticLogger } from '$lib/diagnostics/logger';
 
   const tr = (k: string, params?: Record<string, any>): string => $t(k, params);
@@ -49,6 +49,10 @@
   let latestBlocks: BlockInfo[] = [];
   let currentBlockNumber = 0;
   let isLoadingBlocks = false;
+
+  let lastKnownGethStatus: 'running' | 'stopped' = 'stopped';
+
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
   // Search state
   type SearchResult =
@@ -103,7 +107,6 @@
       const gethRunning = await invoke<boolean>('is_geth_running');
       if (!gethRunning) {
         console.log('Geth is not running, skipping blockchain queries');
-        latestBlocks = [];
         return;
       }
 
@@ -116,15 +119,25 @@
       // During snap sync, eth_blockNumber can temporarily return 0 while eth_syncing reports progress.
       // Fall back to sync status (if available) to avoid misleading "no blocks" messaging.
       if (currentBlockNumber === 0) {
-        const sync = get(gethSyncStatus);
-        if (sync?.current_block && sync.current_block > 0) {
-          currentBlockNumber = sync.current_block;
+        const syncFromStore = get(gethSyncStatus);
+        const syncFromRpc = await invoke<SyncStatus>('get_blockchain_sync_status').catch(() => null);
+        const inferredBlock =
+          (syncFromStore?.current_block ?? 0) ||
+          (typeof syncFromRpc?.current_block === 'number' ? syncFromRpc.current_block : 0);
+
+        if (inferredBlock > 0) {
+          currentBlockNumber = inferredBlock;
           networkStats.totalBlocks = currentBlockNumber;
         } else {
-          console.log('No blocks mined yet. Is Geth running? Is mining active?');
-          showToast(tr('toasts.blockchain.noBlocks'), 'info');
-          latestBlocks = [];
-          return;
+          // RPC can briefly return 0 during startup; retry a few times before giving up.
+          for (let attempt = 0; attempt < 4 && currentBlockNumber === 0; attempt++) {
+            await sleep(600);
+            currentBlockNumber = await invoke<number>('get_current_block').catch(() => 0);
+            if (currentBlockNumber > 0) {
+              networkStats.totalBlocks = currentBlockNumber;
+              break;
+            }
+          }
         }
       }
 
@@ -158,7 +171,9 @@
       }
 
       diagnosticLogger.debug('BLOCKCHAIN', 'Fetched blocks', { count: blocks.length });
-      latestBlocks = blocks;
+      if (blocks.length > 0) {
+        latestBlocks = blocks;
+      }
     } catch (error: unknown) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       diagnosticLogger.error('BLOCKCHAIN', 'Failed to fetch blocks', { error: errorMsg });
@@ -399,6 +414,7 @@
   }
 
   onMount(() => {
+    lastKnownGethStatus = $gethStatus;
     fetchLatestBlocks();
     fetchTxpool();
     fetchNetworkStats();
@@ -416,6 +432,19 @@
 
     return () => clearInterval(interval);
   });
+
+  // When Geth is (re)started, fetch blocks immediately (avoid waiting for the 30s interval).
+  $: if ($gethStatus === 'running' && lastKnownGethStatus !== 'running') {
+    lastKnownGethStatus = 'running';
+    // No toast here; this is an automatic refresh.
+    fetchLatestBlocks();
+    fetchTxpool();
+    fetchNetworkStats();
+  }
+
+  $: if ($gethStatus !== 'running' && lastKnownGethStatus === 'running') {
+    lastKnownGethStatus = 'stopped';
+  }
 </script>
 
 <div class="space-y-6">
@@ -436,6 +465,18 @@
   </div>
 
   <!-- Warning Banner: Geth Not Running -->
+  {#if $gethTransition === 'stopping'}
+    <div class="bg-amber-500/10 border border-amber-500/20 rounded-lg p-4">
+      <div class="flex items-center gap-3">
+        <RefreshCw class="h-5 w-5 text-amber-600 animate-spin flex-shrink-0" />
+        <div>
+          <p class="text-sm font-medium text-amber-800">{tr('blockchain.node.shuttingDown.title')}</p>
+          <p class="text-xs text-amber-700 mt-1">{tr('blockchain.node.shuttingDown.subtitle')}</p>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if $gethStatus !== 'running'}
     <div class="bg-yellow-500/10 border border-yellow-500/20 rounded-lg p-4">
       <div class="flex items-center gap-3">

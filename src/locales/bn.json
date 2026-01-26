@@ -1071,6 +1071,12 @@
     "off": "বন্ধ",
     "refresh": "রিফ্রেশ",
     "clear": "সাফ করুন",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "সলো মাইনিং",
       "pool1": "ChiralPool #1",
@@ -1655,6 +1661,12 @@
       "noBlocks": "কোনো ব্লক পাওয়া যায়নি",
       "syncingTitle": "ব্লক সিঙ্ক হচ্ছে...",
       "syncingSubtitle": "আপনার নোড এখনও সিঙ্ক হচ্ছে। সিঙ্ক সম্পন্ন না হওয়া পর্যন্ত সাম্প্রতিক ব্লক দেখা নাও যেতে পারে।"
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "সিঙ্ক হচ্ছে",

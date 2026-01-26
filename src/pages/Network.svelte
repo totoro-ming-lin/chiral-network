@@ -16,7 +16,13 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
   import { dhtService, type DhtHealth as DhtHealthSnapshot, type NatConfidence, type NatReachabilityState } from '$lib/dht'
-  import { getStatus as fetchGethStatus, type GethStatus } from '$lib/services/gethService'
+  import {
+    getStatus as fetchGethStatus,
+    type GethStatus,
+    gethTransition,
+    markGethStarting,
+    markGethStopping
+  } from '$lib/services/gethService'
   import { resetConnectionAttempts } from '$lib/dhtHelpers'
   import { relayErrorService } from '$lib/services/relayErrorService'
   import { Clipboard } from "lucide-svelte"
@@ -1221,6 +1227,7 @@
     }
 
     isStartingNode = true
+    markGethStarting()
     try {
       // Check if in client mode (forced OR NAT-based)
       let isClientMode = $settings.pureClientMode;
@@ -1256,6 +1263,7 @@
       return
     }
 
+    markGethStopping()
     try {
       await invoke('stop_geth_node')
       isGethRunning = false
@@ -1644,13 +1652,30 @@
                 <Server class="h-5 w-5 text-primary" />
                 Blockchain Node
               </h3>
-              <Badge variant={isGethRunning ? 'default' : 'secondary'} class={isGethRunning ? 'bg-emerald-600' : ''}>
-                {isGethRunning ? 'Running' : !isGethInstalled ? 'Not Installed' : 'Stopped'}
+              <Badge
+                variant={isGethRunning ? 'default' : 'secondary'}
+                class={
+                  isGethRunning
+                    ? 'bg-emerald-600'
+                    : $gethTransition === 'starting'
+                      ? 'bg-blue-600'
+                      : $gethTransition === 'stopping'
+                        ? 'bg-amber-600'
+                        : ''
+                }
+              >
+                {#if $gethTransition === 'starting'}
+                  Starting…
+                {:else if $gethTransition === 'stopping'}
+                  Shutting down…
+                {:else}
+                  {isGethRunning ? 'Running' : !isGethInstalled ? 'Not Installed' : 'Stopped'}
+                {/if}
               </Badge>
             </div>
 
             <div class="space-y-6">
-              {#if !isGethInstalled}
+              {#if !isGethInstalled && $gethTransition === 'idle'}
                 <div class="text-center py-6 space-y-4">
                   <p class="text-muted-foreground text-sm">The Chiral blockchain node is required for transaction validation and mining.</p>
                   <Button on:click={downloadGeth} disabled={isDownloading}>
@@ -1670,7 +1695,7 @@
                     <Button
                       class="flex-1"
                       variant={isGethRunning ? "secondary" : "default"}
-                      disabled={isGethRunning || isStartingNode}
+                      disabled={isGethRunning || isStartingNode || $gethTransition !== 'idle'}
                       on:click={startGethNode}
                     >
                       {#if isStartingNode}
@@ -1682,12 +1707,30 @@
                     <Button 
                       class="flex-1" 
                       variant="destructive"
-                      disabled={!isGethRunning}
+                      disabled={!isGethRunning || $gethTransition !== 'idle'}
                       on:click={stopGethNode}
                     >
-                      <Square class="h-4 w-4 mr-2" /> Stop Node
+                      {#if $gethTransition === 'stopping'}
+                        <RefreshCw class="h-4 w-4 mr-2 animate-spin" /> Stopping…
+                      {:else if $gethTransition === 'starting'}
+                        <RefreshCw class="h-4 w-4 mr-2 animate-spin" /> Starting…
+                      {:else}
+                        <Square class="h-4 w-4 mr-2" /> Stop Node
+                      {/if}
                     </Button>
                   </div>
+
+                  {#if $gethTransition === 'starting'}
+                    <div class="rounded-lg border border-blue-500/20 bg-blue-500/10 p-3 text-sm text-blue-800">
+                      The node is starting up. This may take a few seconds while RPC becomes available.
+                    </div>
+                  {/if}
+
+                  {#if $gethTransition === 'stopping'}
+                    <div class="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800">
+                      The node is shutting down. This may take a few seconds while it flushes chain data.
+                    </div>
+                  {/if}
 
                   <div class="pt-2 border-t space-y-3">
                     <div class="flex justify-between text-sm">

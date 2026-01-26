@@ -1072,6 +1072,12 @@
     "off": "बंद",
     "refresh": "अपडेट करें",
     "clear": "साफ़ करें",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "सोलो माइनिंग",
       "pool1": "ChiralPool #1",
@@ -1656,6 +1662,12 @@
       "noBlocks": "कोई ब्लॉक नहीं मिला",
       "syncingTitle": "ब्लॉक सिंक हो रहे हैं...",
       "syncingSubtitle": "आपका नोड अभी भी सिंक हो रहा है। सिंक पूरा होने तक हाल के ब्लॉक उपलब्ध नहीं हो सकते।"
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "सिंक हो रहा है",

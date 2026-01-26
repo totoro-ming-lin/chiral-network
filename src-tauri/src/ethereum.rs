@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
 use tokio::sync::Mutex;
 use url::Url;
@@ -406,28 +406,17 @@ impl GethProcess {
             .arg("*")
             .arg("--syncmode")
             .arg("snap") // Always use snap mode (light mode doesn't work for private networks)
-            // Sync performance optimizations
-            .arg("--cache")
-            .arg("2048") // Increase cache to 2GB for faster sync (default is 1024)
-            .arg("--cache.database")
-            .arg("60") // 60% of cache for database
-            .arg("--cache.trie")
-            .arg("30") // 30% for trie cache
-            .arg("--cache.gc")
-            .arg("10") // 10% for garbage collection
             .arg("--maxpeers")
             .arg("100") // Increase peer connections for faster sync (was 50)
             // P2P discovery settings
             .arg("--port")
             .arg("30303") // P2P listening port
+            .arg("--ethash.dagsinmem")
+            .arg("0")
             // Network address configuration
             .arg("--nat")
             .arg("any")
             // Snapshot sync acceleration
-            .arg("--snapshot")
-            .arg("--state.scheme")
-            .arg("hash") // Use hash-based state scheme for better performance
-            // Enable transaction pool gossip to propagate transactions across network
             .arg("--txpool.globalslots")
             .arg("16384") // Increase tx pool size for network-wide transactions
             .arg("--txpool.globalqueue")
@@ -446,11 +435,12 @@ impl GethProcess {
             .arg("--miner.gasprice")
             .arg("0")
             // Recommend transactions for mining (include pending txs)
-            .arg("--miner.recommit")
-            .arg("500ms"); // Re-create the mining block every 500ms to include new transactions faster
-                           // Limit transaction lookup to reduce storage (partial blockchain sync)
-                           // .arg("--txlookuplimit")
-                           // .arg(if pure_client_mode { "100" } else { "10000" }); // Pure-client: 100 blocks, Normal: 10000 blocks
+            // .arg("--miner.recommit")
+            // .arg("500ms") // Re-create the mining block every 500ms to include new transactions faster
+            //    Limit transaction lookup to reduce storage (partial blockchain sync)
+            .arg("--txlookuplimit")
+            .arg("0");
+        // .arg(if pure_client_mode { "100" } else { "10000" }); // Pure-client: 100 blocks, Normal: 10000 blocks
 
         // Add this line to set a shorter IPC path
         cmd.arg("--ipcpath").arg("/tmp/chiral-geth.ipc");
@@ -516,15 +506,38 @@ impl GethProcess {
     pub fn stop(&mut self) -> Result<(), String> {
         // First try to kill the tracked child process
         if let Some(mut child) = self.child.take() {
-            // Try to kill the process
-            match child.kill() {
-                Ok(_) => {
-                    // Wait for the process to actually exit
-                    let _ = child.wait();
+            // IMPORTANT: Prefer a graceful shutdown (SIGTERM) so Geth can flush its DB.
+            // Child::kill() sends SIGKILL on Unix which can roll back recent data.
+            #[cfg(unix)]
+            {
+                let pid = child.id();
+                let _ = Command::new("kill")
+                    .arg("-15")
+                    .arg(pid.to_string())
+                    .output();
+
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_status)) => break,
+                        Ok(None) => {
+                            if Instant::now() >= deadline {
+                                let _ =
+                                    Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                                let _ = child.wait();
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        Err(_) => break,
+                    }
                 }
-                Err(_) => {
-                    // Process was already dead or couldn't be killed
-                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+                let _ = child.wait();
             }
         }
 
@@ -555,7 +568,7 @@ impl GethProcess {
                 .output();
 
             // Give Geth time to gracefully shut down
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
 
         Ok(())
@@ -1365,8 +1378,7 @@ pub async fn get_block_number() -> Result<u64, String> {
                 let result = &syncing_json["result"];
                 if result.is_object() {
                     if let Some(current_hex) = result.get("currentBlock").and_then(|v| v.as_str()) {
-                        if let Ok(n) =
-                            u64::from_str_radix(current_hex.trim_start_matches("0x"), 16)
+                        if let Ok(n) = u64::from_str_radix(current_hex.trim_start_matches("0x"), 16)
                         {
                             return Ok(n);
                         }

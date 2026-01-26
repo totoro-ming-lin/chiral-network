@@ -157,7 +157,7 @@ pub fn get_bootstrap_nodes() -> Vec<BootstrapNode> {
             supports_discv5: true,
         },
         BootstrapNode {
-            enode: "enode://816aafd4138ba0bacee1b849a20a4e19e4c6e809bdacd13eaf8eb04d986cf02d9f17616c71cfa5d37c2f7b41531bcff88d8c85405584ac0391011f1bd57fee39@129.80.7.212:30303".to_string(),
+            enode: "enode://59ac1c9a439b6ba18ee270fc9db7ddd3b7c4ed398cda46d55f7189357349854fc5ced0dcf7b33d35faefacce40431f0ad473dd4108993b7cb074fcaa7465120e@129.80.7.212:30303".to_string(),
             description: "Totoro, oracle cloud".to_string(),
             region: "US East".to_string(),
             priority: 2,

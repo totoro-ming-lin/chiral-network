@@ -957,6 +957,12 @@
     "off": "꺼짐",
     "refresh": "새로고침",
     "clear": "지우기",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "솔로 채굴",
       "pool1": "카이럴풀 #1",
@@ -1537,6 +1543,12 @@
       "noBlocks": "블록을 찾을 수 없습니다",
       "syncingTitle": "블록 동기화 중...",
       "syncingSubtitle": "노드가 아직 동기화 중입니다. 동기화가 완료될 때까지 최신 블록이 표시되지 않을 수 있습니다."
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "동기화 중",

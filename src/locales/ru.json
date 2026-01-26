@@ -1071,6 +1071,12 @@
     "off": "ВЫКЛ",
     "refresh": "Обновить",
     "clear": "Очистить",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "Соло-майнинг",
       "pool1": "ChiralPool #1",
@@ -1549,6 +1555,12 @@
       "noBlocks": "Блоки не найдены",
       "syncingTitle": "Идет синхронизация блоков...",
       "syncingSubtitle": "Ваш узел все еще синхронизируется. Последние блоки могут быть недоступны до завершения синхронизации."
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "Синхронизация",

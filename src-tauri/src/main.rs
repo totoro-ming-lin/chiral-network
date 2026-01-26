@@ -480,6 +480,7 @@ async fn import_chiral_account(
 
 #[tauri::command]
 async fn start_geth_node(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     data_dir: String,
     rpc_url: Option<String>,
@@ -490,8 +491,14 @@ async fn start_geth_node(
     let rpc_url = rpc_url.unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     *state.rpc_url.lock().await = rpc_url.clone();
 
+    // Resolve relative data_dir to a persistent per-user location.
+    // Using the executable directory breaks in production builds (app bundle is read-only)
+    // and can make it look like sync progress isn't being saved.
+    let data_path = resolve_geth_data_dir(&app, &data_dir)?;
+    let data_dir_abs = data_path.to_string_lossy().into_owned();
+
     geth.start(
-        &data_dir,
+        &data_dir_abs,
         miner_address.as_deref(),
         pure_client_mode.unwrap_or(false),
     )?;
@@ -953,7 +960,7 @@ async fn get_network_chain_id() -> Result<u64, String> {
 
 #[tauri::command]
 async fn is_geth_running(state: State<'_, AppState>) -> Result<bool, String> {
-    let geth = state.geth.lock().await;
+    let mut geth = state.geth.lock().await;
     Ok(geth.is_running())
 }
 
@@ -1214,6 +1221,7 @@ async fn get_miner_diagnostics(state: State<'_, AppState>) -> Result<serde_json:
 
 #[tauri::command]
 async fn start_miner(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     address: String,
     threads: u32,
@@ -1255,7 +1263,9 @@ Fix: restart your Geth with `--miner.etherbase <YOUR_ADDRESS>` (or run a Geth bu
             warn!(
                 "miner_setEtherbase not supported, restarting managed geth with miner address..."
             );
-            restart_geth_and_wait(&state, &data_dir).await?;
+            let data_path = resolve_geth_data_dir(&app, &data_dir)?;
+            let data_dir_abs = data_path.to_string_lossy().into_owned();
+            restart_geth_and_wait(&state, &data_dir_abs).await?;
 
             // Try mining again without setting etherbase (it's set via command line now)
             let rpc_url = state.rpc_url.lock().await.clone();
@@ -1324,7 +1334,7 @@ async fn get_blockchain_sync_status(
     state: State<'_, AppState>,
 ) -> Result<ethereum::SyncStatus, String> {
     // Only query sync status if Geth is actually running
-    let geth = state.geth.lock().await;
+    let mut geth = state.geth.lock().await;
     if !geth.is_running() {
         return Err("Geth node is not running".to_string());
     }
@@ -1362,13 +1372,15 @@ async fn get_block_details_by_number(
 }
 
 #[tauri::command]
-async fn get_miner_logs(data_dir: String, lines: usize) -> Result<Vec<String>, String> {
-    get_mining_logs(&data_dir, lines)
+async fn get_miner_logs(app: tauri::AppHandle, data_dir: String, lines: usize) -> Result<Vec<String>, String> {
+    let data_path = resolve_geth_data_dir(&app, &data_dir)?;
+    get_mining_logs(&data_path.to_string_lossy(), lines)
 }
 
 #[tauri::command]
-async fn get_miner_performance(data_dir: String) -> Result<(u64, f64), String> {
-    get_mining_performance(&data_dir).await
+async fn get_miner_performance(app: tauri::AppHandle, data_dir: String) -> Result<(u64, f64), String> {
+    let data_path = resolve_geth_data_dir(&app, &data_dir)?;
+    get_mining_performance(&data_path.to_string_lossy()).await
 }
 
 #[tauri::command]
@@ -1380,17 +1392,7 @@ async fn start_mining_monitor(app: tauri::AppHandle, data_dir: String) -> Result
     // Store the last position we read from
     static LAST_POSITION: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
-    // Resolve data directory
-    let exe_dir = std::env::current_exe()
-        .map_err(|e| format!("Failed to get exe path: {}", e))?
-        .parent()
-        .ok_or("Failed to get exe dir")?
-        .to_path_buf();
-    let data_path = if Path::new(&data_dir).is_absolute() {
-        PathBuf::from(&data_dir)
-    } else {
-        exe_dir.join(&data_dir)
-    };
+    let data_path = resolve_geth_data_dir(&app, &data_dir)?;
     let log_path = data_path.join("geth.log");
 
     tokio::spawn(async move {
@@ -7267,19 +7269,20 @@ struct GethStatusPayload {
     last_updated: u64,
 }
 
-fn resolve_geth_data_dir(data_dir: &str) -> Result<PathBuf, String> {
+fn resolve_geth_data_dir(app: &tauri::AppHandle, data_dir: &str) -> Result<PathBuf, String> {
     let dir = PathBuf::from(data_dir);
     if dir.is_absolute() {
         return Ok(dir);
     }
 
-    let exe_dir = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?
-        .parent()
-        .ok_or_else(|| "Failed to determine executable directory".to_string())?
-        .to_path_buf();
+    // Use app data dir so blockchain data persists across launches and works in production builds.
+    // (App bundles are typically read-only, so resolving relative paths against the exe dir breaks.)
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?;
 
-    Ok(exe_dir.join(dir))
+    Ok(base.join(dir))
 }
 
 fn read_last_lines(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
@@ -7344,6 +7347,7 @@ async fn get_geth_node_info() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 async fn get_geth_status(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     data_dir: Option<String>,
     log_lines: Option<usize>,
@@ -7352,7 +7356,7 @@ async fn get_geth_status(
     let data_dir_value = data_dir.unwrap_or_else(|| DEFAULT_GETH_DATA_DIR.to_string());
 
     let running = {
-        let geth = state.geth.lock().await;
+        let mut geth = state.geth.lock().await;
         geth.is_running()
     };
 
@@ -7361,7 +7365,7 @@ async fn get_geth_status(
     let installed = geth_path.exists();
     let binary_path = installed.then(|| geth_path.to_string_lossy().into_owned());
 
-    let data_path = resolve_geth_data_dir(&data_dir_value)?;
+    let data_path = resolve_geth_data_dir(&app, &data_dir_value)?;
     let data_dir_exists = data_path.exists();
     let log_path = data_path.join("geth.log");
     let log_available = log_path.exists();
@@ -10004,17 +10008,21 @@ fn main() {
             }
 
             // Also remove the lock file if it exists
-            let lock_file = std::path::Path::new(DEFAULT_GETH_DATA_DIR).join("LOCK");
-            if lock_file.exists() {
-                println!("Removing stale LOCK file: {:?}", lock_file);
-                let _ = std::fs::remove_file(&lock_file);
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                let lock_file = app_data_dir.join(DEFAULT_GETH_DATA_DIR).join("LOCK");
+                if lock_file.exists() {
+                    println!("Removing stale LOCK file: {:?}", lock_file);
+                    let _ = std::fs::remove_file(&lock_file);
+                }
             }
 
             // Remove geth.ipc file if it exists (another common lock point)
-            let ipc_file = std::path::Path::new(DEFAULT_GETH_DATA_DIR).join("geth.ipc");
-            if ipc_file.exists() {
-                println!("Removing stale IPC file: {:?}", ipc_file);
-                let _ = std::fs::remove_file(&ipc_file);
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                let ipc_file = app_data_dir.join(DEFAULT_GETH_DATA_DIR).join("geth.ipc");
+                if ipc_file.exists() {
+                    println!("Removing stale IPC file: {:?}", ipc_file);
+                    let _ = std::fs::remove_file(&ipc_file);
+                }
             }
 
             let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;

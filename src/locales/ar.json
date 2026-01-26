@@ -1071,6 +1071,12 @@
     "off": "إيقاف",
     "refresh": "تحديث",
     "clear": "مسح",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "تعدين منفرد",
       "pool1": "ChiralPool #1",
@@ -1655,6 +1661,12 @@
       "noBlocks": "لم يتم العثور على كتل",
       "syncingTitle": "جارٍ مزامنة الكتل...",
       "syncingSubtitle": "لا يزال عقدك قيد المزامنة. قد لا تتوفر أحدث الكتل حتى تكتمل المزامنة."
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "جارٍ المزامنة",
