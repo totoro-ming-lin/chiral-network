@@ -587,6 +587,21 @@
     "testWallet": {
       "header": "Apenas para Testes",
       "button": "Criar Carteira de Teste"
+    },
+    "wizard": {
+      "existingWallets": "Suas Carteiras Salvas",
+      "loadingWallets": "Carregando carteiras...",
+      "enterPassword": "Digite a senha da carteira",
+      "unlockWallet": "Desbloquear Carteira",
+      "unlockSuccess": "Carteira desbloqueada com sucesso",
+      "orCreateImport": "Ou",
+      "walletName": "Nome da Carteira (opcional)",
+      "walletNamePlaceholder": "ex. Carteira Principal"
+    },
+    "errors": {
+      "loadKeystoreFailed": "Falha ao carregar carteiras salvas",
+      "passwordRequired": "Senha obrigatória",
+      "incorrectPassword": "Senha incorreta ou keystore corrompido"
     }
   },
   "transfer": {
@@ -1826,7 +1841,9 @@
       "messageSent": "Mensagem de teste enviada: {message}",
       "sendError": "Falha ao enviar mensagem: {error}",
       "gethInstalled": "Geth já está instalado",
-      "gethDownloadError": "Falha ao baixar o Geth: {error}"
+      "gethDownloadError": "Falha ao baixar o Geth: {error}",
+      "gethReinitSuccess": "Dados do blockchain reinicializados para a nova rede",
+      "gethReinitError": "Falha ao reinicializar os dados do blockchain: {error}"
     },
     "download": {
       "payment": {

@@ -764,7 +764,8 @@ $: canShowLockAction = !showFirstRunWizard;
 
                 await invoke('start_geth_node', {
                   dataDir: './bin/geth-data',
-                  pureClientMode: isClientMode  // Combined: forced OR NAT-based
+                  pureClientMode: isClientMode,  // Combined: forced OR NAT-based
+                  allowStartAnyway: true,
                 });
 
                 // Update geth status

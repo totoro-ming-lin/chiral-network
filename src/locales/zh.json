@@ -459,6 +459,21 @@
     "testWallet": {
       "header": "仅用于测试",
       "button": "创建测试钱包"
+    },
+    "wizard": {
+      "existingWallets": "您保存的钱包",
+      "loadingWallets": "正在加载钱包...",
+      "enterPassword": "输入钱包密码",
+      "unlockWallet": "解锁钱包",
+      "unlockSuccess": "钱包解锁成功",
+      "orCreateImport": "或",
+      "walletName": "钱包名称（可选）",
+      "walletNamePlaceholder": "例如：主钱包"
+    },
+    "errors": {
+      "loadKeystoreFailed": "加载保存的钱包失败",
+      "passwordRequired": "需要密码",
+      "incorrectPassword": "密码错误或密钥库已损坏"
     }
   },
   "transfer": {
@@ -1737,7 +1752,9 @@
       "messageSent": "已发送测试消息：{message}",
       "sendError": "发送消息失败：{error}",
       "gethInstalled": "Geth 已安装",
-      "gethDownloadError": "下载 Geth 失败：{error}"
+      "gethDownloadError": "下载 Geth 失败：{error}",
+      "gethReinitSuccess": "已为新网络重新初始化区块链数据",
+      "gethReinitError": "重新初始化区块链数据失败：{error}"
     },
     "download": {
       "payment": {

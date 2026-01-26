@@ -586,6 +586,21 @@
     "testWallet": {
       "header": "للاختبار فقط",
       "button": "إنشاء محفظة اختبار"
+    },
+    "wizard": {
+      "existingWallets": "محافظك المحفوظة",
+      "loadingWallets": "جاري تحميل المحافظ...",
+      "enterPassword": "أدخل كلمة مرور المحفظة",
+      "unlockWallet": "فتح المحفظة",
+      "unlockSuccess": "تم فتح المحفظة بنجاح",
+      "orCreateImport": "أو",
+      "walletName": "اسم المحفظة (اختياري)",
+      "walletNamePlaceholder": "مثال: المحفظة الرئيسية"
+    },
+    "errors": {
+      "loadKeystoreFailed": "فشل تحميل المحافظ المحفوظة",
+      "passwordRequired": "كلمة المرور مطلوبة",
+      "incorrectPassword": "كلمة مرور غير صحيحة أو مخزن مفاتيح تالف"
     }
   },
   "transfer": {
@@ -1825,7 +1840,9 @@
       "messageSent": "تم إرسال رسالة اختبار: {message}",
       "sendError": "فشل إرسال الرسالة: {error}",
       "gethInstalled": "Geth مثبت بالفعل",
-      "gethDownloadError": "فشل تنزيل Geth: {error}"
+      "gethDownloadError": "فشل تنزيل Geth: {error}",
+      "gethReinitSuccess": "تمت إعادة تهيئة بيانات البلوك تشين للشبكة الجديدة",
+      "gethReinitError": "فشلت إعادة تهيئة بيانات البلوك تشين: {error}"
     },
     "download": {
       "payment": {

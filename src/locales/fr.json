@@ -586,6 +586,21 @@
     "testWallet": {
       "header": "Pour Tests Uniquement",
       "button": "Créer un Portefeuille de Test"
+    },
+    "wizard": {
+      "existingWallets": "Vos Portefeuilles Enregistrés",
+      "loadingWallets": "Chargement des portefeuilles...",
+      "enterPassword": "Entrez le mot de passe du portefeuille",
+      "unlockWallet": "Déverrouiller le Portefeuille",
+      "unlockSuccess": "Portefeuille déverrouillé avec succès",
+      "orCreateImport": "Ou",
+      "walletName": "Nom du Portefeuille (facultatif)",
+      "walletNamePlaceholder": "ex. Portefeuille Principal"
+    },
+    "errors": {
+      "loadKeystoreFailed": "Échec du chargement des portefeuilles enregistrés",
+      "passwordRequired": "Mot de passe requis",
+      "incorrectPassword": "Mot de passe incorrect ou trousseau de clés corrompu"
     }
   },
   "transfer": {
@@ -1825,7 +1840,9 @@
       "messageSent": "Message de test envoyé : {message}",
       "sendError": "Impossible d’envoyer le message : {error}",
       "gethInstalled": "Geth est déjà installé",
-      "gethDownloadError": "Échec du téléchargement de Geth : {error}"
+      "gethDownloadError": "Échec du téléchargement de Geth : {error}",
+      "gethReinitSuccess": "Données blockchain réinitialisées pour le nouveau réseau",
+      "gethReinitError": "Échec de la réinitialisation des données blockchain : {error}"
     },
     "download": {
       "payment": {

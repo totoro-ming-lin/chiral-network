@@ -621,6 +621,29 @@
     "testWallet": {
       "header": "For Testing Only",
       "button": "Create Test Wallet"
+    },
+    "wizard": {
+      "existingWallets": "Your Saved Wallets",
+      "loadingWallets": "Loading wallets...",
+      "unlockSuccess": "Wallet loaded successfully",
+      "orCreateImport": "Or",
+      "walletName": "Wallet Name (optional)",
+      "walletNamePlaceholder": "e.g., Main Wallet",
+      "deleteWallet": "Delete wallet",
+      "deleteConfirm": "Delete wallet \"{name}\"? This cannot be undone.",
+      "deleteSuccess": "Wallet deleted successfully"
+    },
+    "switcher": {
+      "title": "Switch Wallet",
+      "switchWallet": "Switch",
+      "current": "Current",
+      "deleteWallet": "Delete wallet",
+      "deleteConfirm": "Delete wallet {address}? This cannot be undone."
+    },
+    "errors": {
+      "loadKeystoreFailed": "Failed to load saved wallets",
+      "loadFailed": "Failed to load wallet. It may have been saved with a password.",
+      "deleteFailed": "Failed to delete wallet"
     }
   },
   "transfer": {
@@ -1797,6 +1820,13 @@
       "transaction": {
         "confirmed": "Transaction confirmed! {amount} CN sent to {address}... (Block {block})",
         "failed": "Transaction failed in block {block}. Your funds were not sent."
+      },
+      "switcher": {
+        "switchSuccess": "Switched to wallet successfully",
+        "switchError": "Failed to switch wallet",
+        "deleteSuccess": "Wallet deleted successfully",
+        "deleteError": "Failed to delete wallet",
+        "cannotDeleteActive": "Cannot delete the currently active wallet"
       }
     },
     "account": {
@@ -1890,7 +1920,9 @@
       "messageSent": "Test message sent: {message}",
       "sendError": "Failed to send message: {error}",
       "gethInstalled": "Geth is already installed",
-      "gethDownloadError": "Failed to download Geth: {error}"
+      "gethDownloadError": "Failed to download Geth: {error}",
+      "gethReinitSuccess": "Reinitialized blockchain data for the new network",
+      "gethReinitError": "Failed to reinitialize blockchain data: {error}"
     },
     "download": {
       "payment": {

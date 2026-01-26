@@ -485,6 +485,8 @@ async fn start_geth_node(
     data_dir: String,
     rpc_url: Option<String>,
     pure_client_mode: Option<bool>,
+    allow_reinit: Option<bool>,
+    allow_start_anyway: Option<bool>,
 ) -> Result<(), String> {
     let mut geth = state.geth.lock().await;
     let miner_address = state.miner_address.lock().await;
@@ -497,12 +499,46 @@ async fn start_geth_node(
     let data_path = resolve_geth_data_dir(&app, &data_dir)?;
     let data_dir_abs = data_path.to_string_lossy().into_owned();
 
+    let allow_reinit = allow_reinit.unwrap_or(false);
+    let allow_start_anyway = allow_start_anyway.unwrap_or(false);
+
+    let compatibility = ethereum::check_geth_data_compatibility(&data_path)?;
+    let mut network_id_override: Option<u64> = None;
+
+    match compatibility.status {
+        ethereum::GethDataCompatibilityStatus::Ok | ethereum::GethDataCompatibilityStatus::Missing => {}
+        ethereum::GethDataCompatibilityStatus::Mismatch
+        | ethereum::GethDataCompatibilityStatus::Unknown
+        | ethereum::GethDataCompatibilityStatus::Corrupted => {
+            if allow_reinit {
+                ethereum::purge_geth_chain_data_preserve_keystore(&data_path)?;
+            } else if allow_start_anyway {
+                network_id_override = compatibility.detected_chain_id;
+            } else {
+                return Err(format!(
+                    "GETH_MIGRATION_REQUIRED:{}",
+                    serde_json::to_string(&compatibility).unwrap_or_default()
+                ));
+            }
+        }
+    }
+
     geth.start(
         &data_dir_abs,
         miner_address.as_deref(),
         pure_client_mode.unwrap_or(false),
+        network_id_override,
     )?;
     Ok(())
+}
+
+#[tauri::command]
+async fn check_geth_data_compatibility(
+    app: tauri::AppHandle,
+    data_dir: String,
+) -> Result<ethereum::GethDataCompatibility, String> {
+    let data_path = resolve_geth_data_dir(&app, &data_dir)?;
+    ethereum::check_geth_data_compatibility(&data_path)
 }
 
 #[tauri::command]
@@ -955,7 +991,7 @@ async fn get_network_peer_count() -> Result<u32, String> {
 
 #[tauri::command]
 async fn get_network_chain_id() -> Result<u64, String> {
-    Ok(get_chain_id())
+    ethereum::get_chain_id().await
 }
 
 #[tauri::command]
@@ -1124,7 +1160,15 @@ async fn restart_geth_and_wait(state: &State<'_, AppState>, data_dir: &str) -> R
         let mut geth = state.geth.lock().await;
         let miner_address = state.miner_address.lock().await;
         info!("Restarting Geth with miner address: {:?}", miner_address);
-        geth.start(data_dir, miner_address.as_deref(), false)?; // Use normal snap sync mode
+        let network_id_override = ethereum::check_geth_data_compatibility(std::path::Path::new(data_dir))
+            .ok()
+            .and_then(|c| match c.status {
+                ethereum::GethDataCompatibilityStatus::Mismatch
+                | ethereum::GethDataCompatibilityStatus::Unknown
+                | ethereum::GethDataCompatibilityStatus::Corrupted => c.detected_chain_id,
+                _ => None,
+            });
+        geth.start(data_dir, miner_address.as_deref(), false, network_id_override)?; // Use normal snap sync mode
     }
 
     // Wait for Geth to become responsive
@@ -8900,7 +8944,7 @@ async fn run_interactive_mode(
     // Optionally start geth
     let geth_process = if args.enable_geth {
         let mut geth = ethereum::GethProcess::new();
-        geth.start(&args.geth_data_dir, args.miner_address.as_deref(), false)?; // pure_client_mode: false
+        geth.start(&args.geth_data_dir, args.miner_address.as_deref(), false, None)?; // pure_client_mode: false
         Some(geth)
     } else {
         None
@@ -8966,7 +9010,7 @@ async fn run_tui_mode(mut args: headless::CliArgs) -> Result<(), Box<dyn std::er
     // Optionally start geth
     let geth_process = if args.enable_geth {
         let mut geth = ethereum::GethProcess::new();
-        geth.start(&args.geth_data_dir, args.miner_address.as_deref(), false)?;
+        geth.start(&args.geth_data_dir, args.miner_address.as_deref(), false, None)?;
         Some(geth)
     } else {
         None
@@ -9586,6 +9630,7 @@ fn main() {
             check_payment_notifications,
             get_network_peer_count,
             get_network_chain_id,
+            check_geth_data_compatibility,
             start_geth_node,
             stop_geth_node,
             save_account_to_keystore,

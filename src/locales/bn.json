@@ -586,6 +586,21 @@
     "testWallet": {
       "header": "শুধুমাত্র পরীক্ষার জন্য",
       "button": "টেস্ট ওয়ালেট তৈরি করুন"
+    },
+    "wizard": {
+      "existingWallets": "আপনার সংরক্ষিত ওয়ালেট",
+      "loadingWallets": "ওয়ালেট লোড হচ্ছে...",
+      "enterPassword": "ওয়ালেট পাসওয়ার্ড লিখুন",
+      "unlockWallet": "ওয়ালেট আনলক করুন",
+      "unlockSuccess": "ওয়ালেট সফলভাবে আনলক করা হয়েছে",
+      "orCreateImport": "অথবা",
+      "walletName": "ওয়ালেটের নাম (ঐচ্ছিক)",
+      "walletNamePlaceholder": "যেমন: প্রধান ওয়ালেট"
+    },
+    "errors": {
+      "loadKeystoreFailed": "সংরক্ষিত ওয়ালেট লোড করতে ব্যর্থ",
+      "passwordRequired": "পাসওয়ার্ড প্রয়োজন",
+      "incorrectPassword": "ভুল পাসওয়ার্ড বা ক্ষতিগ্রস্ত কীস্টোর"
     }
   },
   "transfer": {
@@ -1825,7 +1840,9 @@
       "messageSent": "পরীক্ষামূলক বার্তা পাঠানো হয়েছে: {message}",
       "sendError": "বার্তা পাঠাতে ব্যর্থ: {error}",
       "gethInstalled": "Geth ইতিমধ্যেই ইনস্টল করা আছে",
-      "gethDownloadError": "Geth ডাউনলোড ব্যর্থ: {error}"
+      "gethDownloadError": "Geth ডাউনলোড ব্যর্থ: {error}",
+      "gethReinitSuccess": "নতুন নেটওয়ার্কের জন্য ব্লকচেইন ডেটা পুনরায় ইনিশিয়ালাইজ করা হয়েছে",
+      "gethReinitError": "ব্লকচেইন ডেটা পুনরায় ইনিশিয়ালাইজ করতে ব্যর্থ: {error}"
     },
     "download": {
       "payment": {

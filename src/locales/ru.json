@@ -567,6 +567,21 @@
     "testWallet": {
       "header": "Только для Тестирования",
       "button": "Создать Тестовый Кошелек"
+    },
+    "wizard": {
+      "existingWallets": "Ваши Сохраненные Кошельки",
+      "loadingWallets": "Загрузка кошельков...",
+      "enterPassword": "Введите пароль кошелька",
+      "unlockWallet": "Разблокировать Кошелек",
+      "unlockSuccess": "Кошелек успешно разблокирован",
+      "orCreateImport": "Или",
+      "walletName": "Название Кошелька (необязательно)",
+      "walletNamePlaceholder": "например, Основной Кошелек"
+    },
+    "errors": {
+      "loadKeystoreFailed": "Не удалось загрузить сохраненные кошельки",
+      "passwordRequired": "Требуется пароль",
+      "incorrectPassword": "Неверный пароль или поврежденное хранилище ключей"
     }
   },
   "transfer": {
@@ -1720,7 +1735,9 @@
       "messageSent": "Тестовое сообщение отправлено: {message}",
       "sendError": "Не удалось отправить сообщение: {error}",
       "gethInstalled": "Geth уже установлен",
-      "gethDownloadError": "Не удалось загрузить Geth: {error}"
+      "gethDownloadError": "Не удалось загрузить Geth: {error}",
+      "gethReinitSuccess": "Данные блокчейна переинициализированы для новой сети",
+      "gethReinitError": "Не удалось переинициализировать данные блокчейна: {error}"
     },
     "download": {
       "payment": {

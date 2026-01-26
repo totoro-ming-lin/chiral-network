@@ -68,7 +68,7 @@
   let searchCancelTimeoutId = $state<ReturnType<typeof setTimeout> | null>(null);
   let currentSearchId = $state(0);
 
-  async function cancelSearch() {
+  async function stopActiveSearch() {
     // Invalidate any in-flight async work
     currentSearchId += 1;
 
@@ -81,6 +81,10 @@
 
     // Stop consuming progressive events; backend may still finish its search.
     await cleanupProgressiveEventListeners();
+  }
+
+  export async function cancelSearch() {
+    await stopActiveSearch();
 
     // Freeze the UI in whatever state we currently have.
     if (latestMetadata) {
@@ -91,6 +95,34 @@
     }
 
     pushMessage('Search cancelled', 'info', 2000);
+  }
+
+  export async function handleFileNotFound(fileHash: string) {
+    const expectedHash = progressiveSearchState.fileHash ?? searchHash.trim();
+    if (!expectedHash || expectedHash !== fileHash) return;
+
+    const startedAt = searchStartedAtMs;
+    await stopActiveSearch();
+
+    if (typeof startedAt === 'number') {
+      lastSearchDuration = Math.round(performance.now() - startedAt);
+    }
+
+    progressiveSearchState.status = 'idle';
+    latestMetadata = null;
+    latestStatus = 'not_found';
+    hasSearched = true;
+    searchError = null;
+
+    if (searchMode === 'merkle_hash' && activeHistoryId) {
+      dhtSearchHistory.updateEntry(activeHistoryId, {
+        status: 'not_found',
+        errorMessage: tr('download.search.status.notFoundDetail'),
+        elapsedMs: lastSearchDuration > 0 ? lastSearchDuration : undefined,
+      });
+    }
+
+    pushMessage(tr('download.search.status.notFoundNotification'), 'warning', 6000);
   }
   let historyEntries = $state<SearchHistoryEntry[]>([]);
   let activeHistoryId = $state<string | null>(null);

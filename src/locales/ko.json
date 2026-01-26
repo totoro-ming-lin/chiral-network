@@ -459,6 +459,21 @@
     "testWallet": {
       "header": "테스트 전용",
       "button": "테스트 지갑 생성"
+    },
+    "wizard": {
+      "existingWallets": "저장된 지갑",
+      "loadingWallets": "지갑을 불러오는 중...",
+      "enterPassword": "지갑 비밀번호 입력",
+      "unlockWallet": "지갑 잠금 해제",
+      "unlockSuccess": "지갑 잠금 해제 성공",
+      "orCreateImport": "또는",
+      "walletName": "지갑 이름 (선택사항)",
+      "walletNamePlaceholder": "예: 주 지갑"
+    },
+    "errors": {
+      "loadKeystoreFailed": "저장된 지갑을 불러오는데 실패했습니다",
+      "passwordRequired": "비밀번호가 필요합니다",
+      "incorrectPassword": "비밀번호가 틀렸거나 키스토어가 손상되었습니다"
     }
   },
   "transfer": {
@@ -1708,7 +1723,9 @@
       "messageSent": "테스트 메시지를 보냈습니다: {message}",
       "sendError": "메시지를 보내지 못했습니다: {error}",
       "gethInstalled": "Geth가 이미 설치되어 있습니다",
-      "gethDownloadError": "Geth 다운로드에 실패했습니다: {error}"
+      "gethDownloadError": "Geth 다운로드에 실패했습니다: {error}",
+      "gethReinitSuccess": "새 네트워크를 위해 블록체인 데이터가 다시 초기화되었습니다",
+      "gethReinitError": "블록체인 데이터를 다시 초기화하지 못했습니다: {error}"
     },
     "download": {
       "payment": {

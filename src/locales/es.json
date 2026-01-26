@@ -459,6 +459,21 @@
     "testWallet": {
       "header": "Solo para Pruebas",
       "button": "Crear Billetera de Prueba"
+    },
+    "wizard": {
+      "existingWallets": "Tus Billeteras Guardadas",
+      "loadingWallets": "Cargando billeteras...",
+      "enterPassword": "Ingresa la contraseña de la billetera",
+      "unlockWallet": "Desbloquear Billetera",
+      "unlockSuccess": "Billetera desbloqueada con éxito",
+      "orCreateImport": "O",
+      "walletName": "Nombre de Billetera (opcional)",
+      "walletNamePlaceholder": "ej., Billetera Principal"
+    },
+    "errors": {
+      "loadKeystoreFailed": "Error al cargar billeteras guardadas",
+      "passwordRequired": "Se requiere contraseña",
+      "incorrectPassword": "Contraseña incorrecta o keystore corrupto"
     }
   },
   "transfer": {
@@ -1721,7 +1736,9 @@
       "messageSent": "Mensaje de prueba enviado: {message}",
       "sendError": "No se pudo enviar el mensaje: {error}",
       "gethInstalled": "Geth ya está instalado",
-      "gethDownloadError": "No se pudo descargar Geth: {error}"
+      "gethDownloadError": "No se pudo descargar Geth: {error}",
+      "gethReinitSuccess": "Se reinicializaron los datos de blockchain para la nueva red",
+      "gethReinitError": "No se pudieron reinicializar los datos de blockchain: {error}"
     },
     "download": {
       "payment": {

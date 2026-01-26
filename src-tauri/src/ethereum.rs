@@ -7,6 +7,7 @@ use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha3::{Digest, Keccak256};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -25,6 +26,290 @@ use url::Url;
 /// Block reward in Chiral - the amount awarded for mining a block.
 /// This is the single source of truth for block rewards throughout the codebase.
 pub const BLOCK_REWARD: f64 = 2.0;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GethDataCompatibilityStatus {
+    Ok,
+    Missing,
+    Mismatch,
+    Unknown,
+    Corrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GethDataCompatibility {
+    pub status: GethDataCompatibilityStatus,
+    pub expected_chain_id: u64,
+    pub expected_genesis_sha256: String,
+    pub detected_chain_id: Option<u64>,
+    pub detected_genesis_sha256: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GethDataMarker {
+    chain_id: u64,
+    genesis_sha256: String,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn resolve_genesis_path() -> Result<PathBuf, String> {
+    // Use the project directory as base for genesis.json
+    let project_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or("Failed to get project dir")?
+            .to_path_buf()
+    } else {
+        std::env::current_exe()
+            .map_err(|e| format!("Failed to get exe path: {}", e))?
+            .parent()
+            .ok_or("Failed to get parent dir")?
+            .parent()
+            .ok_or("Failed to get parent dir")?
+            .parent()
+            .ok_or("Failed to get parent dir")?
+            .to_path_buf()
+    };
+
+    // Resolve genesis.json path robustly across:
+    // - dev builds (repo root)
+    // - release/headless builds (binary under src-tauri/target/release/)
+    // - custom deployments (env override)
+    let genesis_candidates: Vec<PathBuf> = {
+        let mut v = Vec::new();
+        if let Ok(p) = std::env::var("CHIRAL_GENESIS_PATH") {
+            if !p.trim().is_empty() {
+                v.push(PathBuf::from(p.trim()));
+            }
+        }
+        v.push(project_dir.join("genesis.json"));
+        if let Some(parent) = project_dir.parent() {
+            v.push(parent.join("genesis.json"));
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            v.push(cwd.join("genesis.json"));
+        }
+        v
+    };
+
+    genesis_candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "genesis.json not found. Tried: {}. You can override with CHIRAL_GENESIS_PATH=/path/to/genesis.json",
+                genesis_candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn expected_genesis_hash() -> Result<String, String> {
+    let genesis_path = resolve_genesis_path()?;
+    let bytes = std::fs::read(&genesis_path)
+        .map_err(|e| format!("Failed to read genesis.json ({}): {}", genesis_path.display(), e))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn marker_path(data_path: &Path) -> PathBuf {
+    data_path.join(".chiral_network.json")
+}
+
+fn read_marker(data_path: &Path) -> Option<GethDataMarker> {
+    let path = marker_path(data_path);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<GethDataMarker>(&content).ok()
+}
+
+fn write_marker(data_path: &Path, marker: &GethDataMarker) {
+    let path = marker_path(data_path);
+    if let Ok(content) = serde_json::to_string_pretty(marker) {
+        let _ = std::fs::write(path, content);
+    }
+}
+
+fn read_legacy_chain_id_marker(data_path: &Path) -> Option<u64> {
+    let chain_id_marker = data_path.join("geth").join(".chain_id");
+    let content = std::fs::read_to_string(chain_id_marker).ok()?;
+    content.trim().parse::<u64>().ok()
+}
+
+fn detect_corruption_from_logs(data_path: &Path) -> bool {
+    let log_path = data_path.join("geth.log");
+    if !log_path.exists() {
+        return false;
+    }
+
+    let Ok(file) = File::open(&log_path) else {
+        return false;
+    };
+    let reader = BufReader::new(file);
+    let all_lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+    let lines: Vec<String> = all_lines.iter().rev().take(80).cloned().collect();
+
+    for line in &lines {
+        if line.contains("database corruption")
+            || (line.contains("FATAL") && line.contains("chaindata"))
+            || (line.contains("corrupted") && line.contains("database"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn purge_geth_chain_data_preserve_keystore(data_path: &Path) -> Result<(), String> {
+    let keystore_dir = data_path.join("keystore");
+    let keystore_backup = data_path.join(".keystore_backup");
+    if keystore_dir.exists() {
+        if keystore_backup.exists() {
+            let _ = std::fs::remove_dir_all(&keystore_backup);
+        }
+        std::fs::rename(&keystore_dir, &keystore_backup)
+            .map_err(|e| format!("Failed to move keystore for backup: {}", e))?;
+    }
+
+    let geth_dir = data_path.join("geth");
+    if geth_dir.exists() {
+        std::fs::remove_dir_all(&geth_dir)
+            .map_err(|e| format!("Failed to remove geth chain data: {}", e))?;
+    }
+
+    if keystore_backup.exists() {
+        std::fs::rename(&keystore_backup, &keystore_dir)
+            .map_err(|e| format!("Failed to restore keystore: {}", e))?;
+    }
+
+    Ok(())
+}
+
+pub fn init_geth_datadir_with_current_genesis(
+    geth_path: &Path,
+    data_path: &Path,
+) -> Result<(), String> {
+    let genesis_path = resolve_genesis_path()?;
+    let expected_sha = expected_genesis_hash()?;
+
+    let init_output = Command::new(geth_path)
+        .arg("--datadir")
+        .arg(data_path)
+        .arg("init")
+        .arg(&genesis_path)
+        .output()
+        .map_err(|e| format!("Failed to initialize genesis: {}", e))?;
+
+    if !init_output.status.success() {
+        return Err(format!(
+            "Failed to init genesis: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        ));
+    }
+
+    let marker = GethDataMarker {
+        chain_id: *CHAIN_ID,
+        genesis_sha256: expected_sha,
+    };
+    write_marker(data_path, &marker);
+    Ok(())
+}
+
+pub fn check_geth_data_compatibility(data_path: &Path) -> Result<GethDataCompatibility, String> {
+    let expected_chain_id = *CHAIN_ID;
+    let expected_genesis_sha256 = expected_genesis_hash()?;
+
+    // Fresh install: nothing to validate.
+    if !data_path.join("geth").exists() {
+        return Ok(GethDataCompatibility {
+            status: GethDataCompatibilityStatus::Missing,
+            expected_chain_id,
+            expected_genesis_sha256,
+            detected_chain_id: None,
+            detected_genesis_sha256: None,
+            message: "No existing chain data found; initialization required.".to_string(),
+        });
+    }
+
+    if detect_corruption_from_logs(data_path) {
+        return Ok(GethDataCompatibility {
+            status: GethDataCompatibilityStatus::Corrupted,
+            expected_chain_id,
+            expected_genesis_sha256,
+            detected_chain_id: None,
+            detected_genesis_sha256: None,
+            message: "Existing chain data appears corrupted.".to_string(),
+        });
+    }
+
+    if let Some(marker) = read_marker(data_path) {
+        if marker.chain_id == expected_chain_id {
+            return Ok(GethDataCompatibility {
+                status: GethDataCompatibilityStatus::Ok,
+                expected_chain_id,
+                expected_genesis_sha256,
+                detected_chain_id: Some(marker.chain_id),
+                detected_genesis_sha256: Some(marker.genesis_sha256),
+                message: "Chain ID matches expected network.".to_string(),
+            });
+        }
+
+        return Ok(GethDataCompatibility {
+            status: GethDataCompatibilityStatus::Mismatch,
+            expected_chain_id,
+            expected_genesis_sha256,
+            detected_chain_id: Some(marker.chain_id),
+            detected_genesis_sha256: Some(marker.genesis_sha256),
+            message: format!(
+                "Existing chain data is for chain ID {}, expected {}.",
+                marker.chain_id, expected_chain_id
+            ),
+        });
+    }
+
+    // Legacy marker (chainId only).
+    if let Some(stored_chain_id) = read_legacy_chain_id_marker(data_path) {
+        if stored_chain_id != expected_chain_id {
+            return Ok(GethDataCompatibility {
+                status: GethDataCompatibilityStatus::Mismatch,
+                expected_chain_id,
+                expected_genesis_sha256,
+                detected_chain_id: Some(stored_chain_id),
+                detected_genesis_sha256: None,
+                message: format!(
+                    "Existing chain data is for chain ID {}, expected {}.",
+                    stored_chain_id, expected_chain_id
+                ),
+            });
+        }
+        return Ok(GethDataCompatibility {
+            status: GethDataCompatibilityStatus::Ok,
+            expected_chain_id,
+            expected_genesis_sha256,
+            detected_chain_id: Some(stored_chain_id),
+            detected_genesis_sha256: None,
+            message: "Chain ID matches expected network (legacy install).".to_string(),
+        });
+    }
+
+    Ok(GethDataCompatibility {
+        status: GethDataCompatibilityStatus::Unknown,
+        expected_chain_id,
+        expected_genesis_sha256,
+        detected_chain_id: None,
+        detected_genesis_sha256: None,
+        message: "Could not verify existing chain data fingerprint.".to_string(),
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -144,27 +429,37 @@ impl GethProcess {
         Ok(exe_dir.join(dir))
     }
 
-    /// Validate that existing Geth data directory has the correct chain ID
-    fn validate_chain_id(&self, data_path: &Path, expected_chain_id: u64) -> Result<(), String> {
-        // Create a marker file to track which chain ID this data directory was initialized with
-        let chain_id_marker = data_path.join("geth").join(".chain_id");
+    fn init_with_genesis(
+        &self,
+        geth_path: &Path,
+        data_path: &Path,
+        genesis_path: &Path,
+        expected_genesis_sha256: &str,
+    ) -> Result<(), String> {
+        let init_output = Command::new(geth_path)
+            .arg("--datadir")
+            .arg(data_path)
+            .arg("init")
+            .arg(genesis_path)
+            .output()
+            .map_err(|e| format!("Failed to initialize genesis: {}", e))?;
 
-        if chain_id_marker.exists() {
-            if let Ok(content) = std::fs::read_to_string(&chain_id_marker) {
-                if let Ok(stored_chain_id) = content.trim().parse::<u64>() {
-                    if stored_chain_id == expected_chain_id {
-                        return Ok(()); // Chain ID matches
-                    } else {
-                        return Err(format!("Existing blockchain data is for chain ID {}, but expected {}. Will reinitialize.", stored_chain_id, expected_chain_id));
-                    }
-                }
-            }
+        if !init_output.status.success() {
+            return Err(format!(
+                "Failed to init genesis: {}",
+                String::from_utf8_lossy(&init_output.stderr)
+            ));
         }
 
-        // If no marker file exists, we can't be sure about the chain ID
-        // To be safe, we'll assume it's wrong and force reinitialization
-        // This prevents the chain ID mismatch issue from happening again
-        Err(format!("Could not verify chain ID of existing blockchain data. Will reinitialize to ensure correctness."))
+        write_marker(
+            data_path,
+            &GethDataMarker {
+                chain_id: *CHAIN_ID,
+                genesis_sha256: expected_genesis_sha256.to_string(),
+            },
+        );
+
+        Ok(())
     }
 
     pub fn start(
@@ -172,6 +467,7 @@ impl GethProcess {
         data_dir: &str,
         miner_address: Option<&str>,
         pure_client_mode: bool,
+        network_id_override: Option<u64>,
     ) -> Result<(), String> {
         // Check if we already have a tracked child process
         if self.child.is_some() {
@@ -243,140 +539,24 @@ impl GethProcess {
             return Err("Geth binary not found. Please download it first.".to_string());
         }
 
-        // Use the project directory as base for genesis.json
-        let project_dir = if cfg!(debug_assertions) {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .ok_or("Failed to get project dir")?
-                .to_path_buf()
-        } else {
-            std::env::current_exe()
-                .map_err(|e| format!("Failed to get exe path: {}", e))?
-                .parent()
-                .ok_or("Failed to get parent dir")?
-                .parent()
-                .ok_or("Failed to get parent dir")?
-                .parent()
-                .ok_or("Failed to get parent dir")?
-                .to_path_buf()
-        };
-
-        // Resolve genesis.json path robustly across:
-        // - dev builds (repo root)
-        // - release/headless builds (binary under src-tauri/target/release/)
-        // - custom deployments (env override)
-        let genesis_candidates: Vec<PathBuf> = {
-            let mut v = Vec::new();
-            if let Ok(p) = std::env::var("CHIRAL_GENESIS_PATH") {
-                if !p.trim().is_empty() {
-                    v.push(PathBuf::from(p.trim()));
-                }
-            }
-            // Common locations
-            v.push(project_dir.join("genesis.json"));
-            if let Some(parent) = project_dir.parent() {
-                v.push(parent.join("genesis.json")); // repo root when project_dir == src-tauri
-            }
-            if let Ok(cwd) = std::env::current_dir() {
-                v.push(cwd.join("genesis.json"));
-            }
-            v
-        };
-
-        let genesis_path = genesis_candidates
-            .iter()
-            .find(|p| p.exists())
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "genesis.json not found. Tried: {}. You can override with CHIRAL_GENESIS_PATH=/path/to/genesis.json",
-                    genesis_candidates
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
+        let genesis_path = resolve_genesis_path()?;
 
         // Resolve data directory relative to the executable dir if it's relative
         let data_path = self.resolve_data_dir(data_dir)?;
 
-        // Check if we need to initialize or reinitialize blockchain
-        let needs_init = !data_path.join("geth").exists();
-        let mut needs_reinit = false;
+        // Check compatibility (do not auto-purge here; UI/command layer decides).
+        let compatibility = check_geth_data_compatibility(&data_path)?;
 
-        // Check if existing blockchain data has wrong chain ID
-        if !needs_init {
-            if let Err(chain_mismatch) = self.validate_chain_id(&data_path, *CHAIN_ID) {
-                eprintln!("⚠️  Chain ID mismatch detected: {}", chain_mismatch);
-                eprintln!("⚠️  Existing blockchain data is for wrong chain, will reinitialize...");
-                needs_reinit = true;
-            }
-        }
-
-        // Check for blockchain corruption by looking at recent logs
-        if !needs_init {
-            let log_path = data_path.join("geth.log");
-            if log_path.exists() {
-                // Read last 50 lines of log to check for corruption errors
-                if let Ok(file) = File::open(&log_path) {
-                    let reader = BufReader::new(file);
-                    let all_lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-                    let lines: Vec<String> = all_lines.iter().rev().take(50).cloned().collect();
-
-                    // Look for signs of ACTUAL blockchain corruption (not normal operations)
-                    for line in &lines {
-                        if line.contains("database corruption")
-                            || line.contains("FATAL") && line.contains("chaindata")
-                            || line.contains("corrupted") && line.contains("database")
-                        {
-                            eprintln!("⚠️  Detected corrupted blockchain, will reinitialize...");
-                            needs_reinit = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove corrupted blockchain data if needed
-        if needs_reinit {
-            let geth_dir = data_path.join("geth");
-            if geth_dir.exists() {
-                eprintln!("Removing corrupted blockchain data...");
-                std::fs::remove_dir_all(&geth_dir)
-                    .map_err(|e| format!("Failed to remove corrupted blockchain: {}", e))?;
-            }
-        }
-
-        // Initialize with genesis if needed
-        if needs_init || needs_reinit {
+        // Initialize with genesis if needed (fresh install).
+        if matches!(compatibility.status, GethDataCompatibilityStatus::Missing) {
             eprintln!("Initializing blockchain with genesis block...");
-            let init_output = Command::new(&geth_path)
-                .arg("--datadir")
-                .arg(&data_path)
-                .arg("init")
-                .arg(&genesis_path)
-                .output()
-                .map_err(|e| format!("Failed to initialize genesis: {}", e))?;
-
-            if !init_output.status.success() {
-                return Err(format!(
-                    "Failed to init genesis: {}",
-                    String::from_utf8_lossy(&init_output.stderr)
-                ));
-            }
-
-            // Write a marker file to track which chain ID this data directory was initialized with
-            let chain_id_marker = data_path.join("geth").join(".chain_id");
-            if let Err(e) = std::fs::write(&chain_id_marker, CHAIN_ID.to_string()) {
-                eprintln!("Warning: Failed to write chain ID marker file: {}", e);
-            }
-
-            eprintln!(
-                "✅ Blockchain initialized successfully with chain ID {}",
-                *CHAIN_ID
-            );
+            self.init_with_genesis(
+                &geth_path,
+                &data_path,
+                &genesis_path,
+                &compatibility.expected_genesis_sha256,
+            )?;
+            eprintln!("✅ Blockchain initialized successfully with chain ID {}", *CHAIN_ID);
         }
 
         // Get bootstrap nodes - use cached/fallback to avoid blocking startup
@@ -392,7 +572,11 @@ impl GethProcess {
         cmd.arg("--datadir")
             .arg(&data_path)
             .arg("--networkid")
-            .arg(NETWORK_CONFIG.network_id.to_string())
+            .arg(
+                network_id_override
+                    .unwrap_or(NETWORK_CONFIG.network_id)
+                    .to_string(),
+            )
             .arg("--bootnodes")
             .arg(bootstrap_enode)
             .arg("--http")
@@ -607,7 +791,7 @@ pub async fn start_geth_with_health_check(
     }
 
     // Start Geth (it will use the fallback bootstrap string if health check found issues)
-    geth.start(data_dir, miner_address, false)?; // Use normal snap sync mode
+    geth.start(data_dir, miner_address, false, None)?; // Use normal snap sync mode
 
     Ok(health_report)
 }

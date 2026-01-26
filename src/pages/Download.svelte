@@ -40,6 +40,8 @@
 
   const tr = (k: string, params?: Record<string, any>) => $t(k, params)
 
+  let downloadSearchSectionRef: InstanceType<typeof DownloadSearchSection> | null = null
+
  // Auto-detect protocol based on file metadata
   let detectedProtocol: 'WebRTC' | 'Bitswap' | undefined = undefined
   let torrentDownloads = new Map<string, any>();
@@ -547,6 +549,14 @@
         // Listen for DHT errors (like missing CIDs)
         const unlistenDhtError = await listen('dht_event', (event) => {
           const eventStr = event.payload as string;
+
+          if (eventStr.startsWith('file_not_found:')) {
+            const fileHash = eventStr.substring('file_not_found:'.length).trim();
+            // Stop the in-flight search UI (spinner, timeouts, progressive listeners)
+            downloadSearchSectionRef?.handleFileNotFound?.(fileHash);
+            return;
+          }
+
           if (eventStr.startsWith('error:')) {
             const errorMsg = eventStr.substring(6); // Remove 'error:' prefix
             errorLogger.dhtInitError(errorMsg);
@@ -2834,6 +2844,7 @@ async function loadAndResumeDownloads() {
     <!-- Chiral DHT Search Section with integrated BitTorrent -->
     <div class="border-b">
       <DownloadSearchSection
+        bind:this={downloadSearchSectionRef}
         on:download={(event) => handleSearchDownload(event.detail)}
         on:message={handleSearchMessage}
       />
