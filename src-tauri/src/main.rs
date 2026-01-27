@@ -506,7 +506,8 @@ async fn start_geth_node(
     let mut network_id_override: Option<u64> = None;
 
     match compatibility.status {
-        ethereum::GethDataCompatibilityStatus::Ok | ethereum::GethDataCompatibilityStatus::Missing => {}
+        ethereum::GethDataCompatibilityStatus::Ok
+        | ethereum::GethDataCompatibilityStatus::Missing => {}
         ethereum::GethDataCompatibilityStatus::Mismatch
         | ethereum::GethDataCompatibilityStatus::Unknown
         | ethereum::GethDataCompatibilityStatus::Corrupted => {
@@ -1160,15 +1161,21 @@ async fn restart_geth_and_wait(state: &State<'_, AppState>, data_dir: &str) -> R
         let mut geth = state.geth.lock().await;
         let miner_address = state.miner_address.lock().await;
         info!("Restarting Geth with miner address: {:?}", miner_address);
-        let network_id_override = ethereum::check_geth_data_compatibility(std::path::Path::new(data_dir))
-            .ok()
-            .and_then(|c| match c.status {
-                ethereum::GethDataCompatibilityStatus::Mismatch
-                | ethereum::GethDataCompatibilityStatus::Unknown
-                | ethereum::GethDataCompatibilityStatus::Corrupted => c.detected_chain_id,
-                _ => None,
-            });
-        geth.start(data_dir, miner_address.as_deref(), false, network_id_override)?; // Use normal snap sync mode
+        let network_id_override =
+            ethereum::check_geth_data_compatibility(std::path::Path::new(data_dir))
+                .ok()
+                .and_then(|c| match c.status {
+                    ethereum::GethDataCompatibilityStatus::Mismatch
+                    | ethereum::GethDataCompatibilityStatus::Unknown
+                    | ethereum::GethDataCompatibilityStatus::Corrupted => c.detected_chain_id,
+                    _ => None,
+                });
+        geth.start(
+            data_dir,
+            miner_address.as_deref(),
+            false,
+            network_id_override,
+        )?; // Use normal snap sync mode
     }
 
     // Wait for Geth to become responsive
@@ -1416,13 +1423,20 @@ async fn get_block_details_by_number(
 }
 
 #[tauri::command]
-async fn get_miner_logs(app: tauri::AppHandle, data_dir: String, lines: usize) -> Result<Vec<String>, String> {
+async fn get_miner_logs(
+    app: tauri::AppHandle,
+    data_dir: String,
+    lines: usize,
+) -> Result<Vec<String>, String> {
     let data_path = resolve_geth_data_dir(&app, &data_dir)?;
     get_mining_logs(&data_path.to_string_lossy(), lines)
 }
 
 #[tauri::command]
-async fn get_miner_performance(app: tauri::AppHandle, data_dir: String) -> Result<(u64, f64), String> {
+async fn get_miner_performance(
+    app: tauri::AppHandle,
+    data_dir: String,
+) -> Result<(u64, f64), String> {
     let data_path = resolve_geth_data_dir(&app, &data_dir)?;
     get_mining_performance(&data_path.to_string_lossy()).await
 }
@@ -1477,7 +1491,9 @@ async fn start_mining_monitor(app: tauri::AppHandle, data_dir: String) -> Result
                             if line.contains("Successfully sealed new block") {
                                 // 🎉 WE MINED A BLOCK! 🎉
                                 // Get the current mining address and increment the counter for that address
-                                if let Some(miner_address) = CURRENT_MINER_ADDRESS.lock().await.clone() {
+                                if let Some(miner_address) =
+                                    CURRENT_MINER_ADDRESS.lock().await.clone()
+                                {
                                     increment_mined_blocks(miner_address).await;
                                 } else {
                                     // Mining may have been started outside the UI command path.
@@ -4043,19 +4059,21 @@ async fn upload_file_to_network(
         .map_err(|e| format!("Failed to get file size: {}", e))?
         .len();
 
-    let dont_need_to_copy_protocols = vec!["BitSwap", "WebRTC"];
+    // Normalize protocol for robust matching (tests/users may send different casing like "Bitswap", "BitSwap", "BITSWAP").
+    let protocol_upper = protocol.as_deref().unwrap_or("").trim().to_uppercase();
+    let dont_need_to_copy_protocols = vec!["BITSWAP", "WEBRTC"];
     let mut file_path = file_path.clone();
 
     // Handle protocol-specific uploads
     if let Some(protocol_name) = &protocol {
-        if !dont_need_to_copy_protocols.contains(&protocol_name.as_str()) {
+        if !dont_need_to_copy_protocols.contains(&protocol_upper.as_str()) {
             // handle if error
             file_path = copy_file_to_temp(file_path.clone())
                 .await
                 .map_err(|e| format!("Failed to copy file to temp: {}", e))?;
         }
 
-        match protocol_name.as_str() {
+        match protocol_upper.as_str() {
             "HTTP" => {
                 let permanent_path = state.http_server_state.storage_dir.join(&file_hash);
                 // Move/rename temp file to permanent storage instead of copying
@@ -4077,7 +4095,7 @@ async fn upload_file_to_network(
                     })
                     .await;
             }
-            "BitTorrent" => {
+            "BITTORRENT" => {
                 // Check if file exists before attempting to seed
                 if !std::path::Path::new(&file_path).exists() {
                     error!(
@@ -4408,7 +4426,7 @@ async fn upload_file_to_network(
                 println!("✅ FTP upload complete - file available at: {}", ftp_url);
                 return Ok(());
             }
-            "Bitswap" | "bitswap" | "BitSwap" => {
+            "Bitswap" | "bitswap" | "BitSwap" | "BITSWAP" => {
                 // Use streaming upload for Bitswap to handle large files
                 println!(
                     "📡 Using streaming Bitswap upload for protocol: {}",
@@ -4528,6 +4546,12 @@ async fn upload_file_to_network(
                             return Err("DHT not running".into());
                         }
 
+                        // Include our peer id as a seeder so downloaders know which peer to request blocks from.
+                        let local_peer_id = match &dht_opt {
+                            Some(dht) => dht.get_peer_id().await,
+                            None => String::new(),
+                        };
+
                         // Create minimal metadata (without file_data to avoid DHT size limits)
                         let created_at = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -4583,7 +4607,11 @@ async fn upload_file_to_network(
                             file_name: session.file_name.clone(),
                             file_size: session.file_size,
                             file_data: vec![], // Empty - data is stored in Bitswap blocks
-                            seeders: vec![],
+                            seeders: if local_peer_id.is_empty() {
+                                vec![]
+                            } else {
+                                vec![local_peer_id.clone()]
+                            },
                             created_at,
                             mime_type: None,
                             is_encrypted: false,
@@ -4604,6 +4632,14 @@ async fn upload_file_to_network(
                             manifest: Some(manifest_json),
                             encryption: None,
                         };
+
+                        info!(
+                            "📡 Bitswap publish metadata: merkle_root={} root_cid={} cids={:?} seeders={:?}",
+                            merkle_root,
+                            root_cid,
+                            metadata.cids,
+                            metadata.seeders
+                        );
 
                         // Publish merged metadata to DHT
                         if let Some(dht) = dht_opt {
@@ -5523,7 +5559,7 @@ fn parse_ed2k_link(ed2k_link: String) -> Result<Ed2kSourceInfo, String> {
 #[tauri::command]
 async fn download_blocks_from_network(
     state: State<'_, AppState>,
-    file_metadata: FileMetadata,
+    mut file_metadata: FileMetadata,
     download_path: String,
 ) -> Result<(), String> {
     info!(
@@ -5542,6 +5578,64 @@ async fn download_blocks_from_network(
     };
 
     if let Some(dht) = dht {
+        // Bitswap downloads require a root CID list in metadata.
+        // In real networks the DHT record can become visible before all fields (like `cids`) are populated.
+        // Best-effort: re-fetch metadata a few times to see if `cids` arrives; otherwise fail fast with a clear error.
+        let has_cids = file_metadata
+            .cids
+            .as_ref()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false);
+        if !has_cids {
+            for _ in 0..10 {
+                if let Ok(Some(refreshed)) = dht
+                    .synchronous_search_metadata(file_metadata.merkle_root.clone(), 1_500)
+                    .await
+                {
+                    if refreshed
+                        .cids
+                        .as_ref()
+                        .map(|c| !c.is_empty())
+                        .unwrap_or(false)
+                    {
+                        info!(
+                            "🔽 Refreshed metadata now has cids for {}: {:?}",
+                            file_metadata.merkle_root, refreshed.cids
+                        );
+                        file_metadata.cids = refreshed.cids;
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        let has_cids = file_metadata
+            .cids
+            .as_ref()
+            .map(|c| !c.is_empty())
+            .unwrap_or(false);
+        if !has_cids {
+            return Err(format!(
+                "Bitswap download requires metadata.cids (root CID). DHT record for '{}' has no cids; re-upload with an updated uploader node or ensure Bitswap publishing writes cids.",
+                file_metadata.merkle_root
+            ));
+        }
+
+        // If the metadata record doesn't list seeders yet, fall back to provider discovery.
+        // This allows Bitswap to work even when the uploader's DHT record hasn't populated `seeders`.
+        if file_metadata.seeders.is_empty() {
+            let providers = dht.get_seeders_for_file(&file_metadata.merkle_root).await;
+            if !providers.is_empty() {
+                info!(
+                    "🔽 Bitswap metadata had 0 seeders; using {} providers for {}",
+                    providers.len(),
+                    file_metadata.merkle_root
+                );
+                file_metadata.seeders = providers;
+            }
+        }
+
         info!("🔽 DHT node is running, calling dht.download_file");
         dht.download_file(file_metadata, download_path).await
     } else {
@@ -8944,7 +9038,12 @@ async fn run_interactive_mode(
     // Optionally start geth
     let geth_process = if args.enable_geth {
         let mut geth = ethereum::GethProcess::new();
-        geth.start(&args.geth_data_dir, args.miner_address.as_deref(), false, None)?; // pure_client_mode: false
+        geth.start(
+            &args.geth_data_dir,
+            args.miner_address.as_deref(),
+            false,
+            None,
+        )?; // pure_client_mode: false
         Some(geth)
     } else {
         None
@@ -9010,7 +9109,12 @@ async fn run_tui_mode(mut args: headless::CliArgs) -> Result<(), Box<dyn std::er
     // Optionally start geth
     let geth_process = if args.enable_geth {
         let mut geth = ethereum::GethProcess::new();
-        geth.start(&args.geth_data_dir, args.miner_address.as_deref(), false, None)?;
+        geth.start(
+            &args.geth_data_dir,
+            args.miner_address.as_deref(),
+            false,
+            None,
+        )?;
         Some(geth)
     } else {
         None
