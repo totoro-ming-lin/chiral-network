@@ -820,7 +820,6 @@ fn construct_file_metadata_from_json_simple(
             .get("manifest")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        encryption: None, // Not included in DHT records
     }
 }
 
@@ -1992,16 +1991,11 @@ async fn run_dht_node(
                                         // Bitswap download path (requires cids + enabled bitswap handler)
                                         // --------------------------------------------------------------------
                                         let enable_bitswap = std::env::var("CHIRAL_ENABLE_BITSWAP").ok().is_some()
-                                            || std::env::var("CHIRAL_E2E_API_PORT").ok().is_some();
+                                            || std::env::var("CHIRAL_E2E_API_PORT").ok().is_some()|| file_metadata.cids.is_some();
 
                                         if enable_bitswap {
                                             if let Some(cids) = &file_metadata.cids {
                                                 if !cids.is_empty() {
-                                                    if file_metadata.seeders.is_empty() {
-                                                        let _ = event_tx.send(DhtEvent::Error("No seeders found".to_string())).await;
-                                                        continue;
-                                                    }
-
                                                     // Set the target path so the bitswap handler can write to disk.
                                                     file_metadata.download_path = Some(download_path.clone());
 
@@ -6835,7 +6829,6 @@ impl DhtService {
             trackers: None,
             ed2k_sources: None,
             manifest: None,
-            encryption: None,
         })
     }
 
@@ -6923,9 +6916,8 @@ impl DhtService {
         cache.get(file_hash).cloned()
     }
 
-    /// Internal helper for tests: trigger search and poll cache
-    #[cfg(test)]
-    async fn synchronous_search_metadata(
+    /// Trigger search and poll cache until metadata is available.
+    pub async fn synchronous_search_metadata(
         &self,
         file_hash: String,
         timeout_ms: u64,

@@ -9,6 +9,7 @@ use tokio::time::{timeout, Duration};
 use tracing::{debug, info, warn};
 
 use crate::dht::models::FileMetadata;
+use crate::encryption::EncryptedAesKeyBundle;
 
 /// General seeder info (topic: seeder/{peerID})
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +39,10 @@ pub struct ProtocolDetails {
     pub ed2k_sources: Option<Vec<Ed2kSourceInfo>>,
     pub info_hash: Option<String>,
     pub trackers: Option<Vec<String>>,
-    pub encryption: Option<EncryptionInfo>,
+    pub is_encrypted: bool,
+    pub encryption_method: Option<String>,
+    pub key_fingerprint: Option<String>,
+    pub encrypted_key_bundle: Option<EncryptedAesKeyBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,12 +73,6 @@ pub struct Ed2kSourceInfo {
     pub sources: Option<Vec<String>>,
     pub timeout: Option<u64>,
     pub chunk_hashes: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptionInfo {
-    pub algorithm: String,
-    pub key_derivation: String,
 }
 
 /// Complete metadata combining GossipSub data from a single seeder
@@ -355,10 +353,10 @@ impl From<FileMetadata> for ProtocolDetails {
             }),
             info_hash: metadata.info_hash,
             trackers: metadata.trackers,
-            encryption: metadata.encryption.as_ref().map(|e| EncryptionInfo {
-                algorithm: e.algorithm.clone(),
-                key_derivation: e.key_derivation.clone(),
-            }),
+            is_encrypted: metadata.is_encrypted,
+            encryption_method: metadata.encryption_method,
+            key_fingerprint: metadata.key_fingerprint,
+            encrypted_key_bundle: metadata.encrypted_key_bundle,
         }
     }
 }

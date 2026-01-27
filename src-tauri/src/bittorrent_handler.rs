@@ -1879,7 +1879,6 @@ impl BitTorrentHandler {
             parent_hash: None,
             download_path: None,
             manifest: Some(manifest_json),
-            encryption: None,
         };
 
         // Publish to DHT

@@ -971,6 +971,16 @@
   });
 
   async function openFileDialog() {
+    console.log("[UPLOAD] openFileDialog called");
+    console.log("[UPLOAD] Selected protocol:", selectedProtocol);
+    if (selectedProtocol === "FTP") {
+      console.log("[UPLOAD] FTP configuration:");
+      console.log("[UPLOAD]   - FTP URL:", ftpUrl);
+      console.log("[UPLOAD]   - Username:", ftpUsername || "anonymous");
+      console.log("[UPLOAD]   - Use FTPS:", ftpUseFTPS);
+      console.log("[UPLOAD]   - Passive mode:", ftpPassiveMode);
+    }
+
     // Verify backend has active account before proceeding
     if (isTauri) {
       try {
@@ -1055,12 +1065,16 @@
   }
 
   async function addFilesFromPaths(paths: string[]) {
+    console.log("[UPLOAD] addFilesFromPaths called with", paths.length, "file(s)");
+    console.log("[UPLOAD] Selected protocol:", selectedProtocol);
+
     // Fallback: Force reset isUploading after 30 seconds to prevent UI from being stuck
     const forceResetTimeout = setTimeout(() => {
       console.log(`[UPLOAD] Force resetting isUploading due to timeout`);
       isUploading = false;
       showToast("Upload timed out - please try again", "error");
     }, 30000);
+    console.log("[UPLOAD] 30-second timeout failsafe armed");
 
     // STEP 1: Verify backend has active account before proceeding
     if (isTauri) {
@@ -1119,9 +1133,13 @@
     for (const filePath of paths) {
       try {
         const fileName = filePath.replace(/^.*[\\/]/, "") || "";
+        console.log("[UPLOAD] Processing file:", fileName);
+        console.log("[UPLOAD] File path:", filePath);
 
         // Get file size to calculate price
+        console.log("[UPLOAD] Getting file size...");
         const fileSize = await invoke<number>("get_file_size", { filePath });
+        console.log("[UPLOAD] File size:", fileSize, "bytes");
         const price = await calculateFilePrice(fileSize);
 
         // Handle BitTorrent differently - create and seed torrent
@@ -1153,11 +1171,21 @@
         // Handle FTP upload to external server
         if (selectedProtocol === "FTP" && ftpUrl) {
           try {
+            console.log("[FTP_UPLOAD_FRONTEND] Starting FTP upload for file:", fileName);
+            console.log("[FTP_UPLOAD_FRONTEND] File path:", filePath);
+            console.log("[FTP_UPLOAD_FRONTEND] FTP URL:", ftpUrl);
+            console.log("[FTP_UPLOAD_FRONTEND] Username:", ftpUsername || "anonymous");
+            console.log("[FTP_UPLOAD_FRONTEND] Use FTPS:", ftpUseFTPS);
+            console.log("[FTP_UPLOAD_FRONTEND] Passive mode:", ftpPassiveMode);
+
             // Show upload in progress toast
             showToast(
               `Uploading ${fileName} to FTP server...`,
               "info"
             );
+
+            console.log("[FTP_UPLOAD_FRONTEND] Invoking backend upload_to_external_ftp command...");
+            const startTime = Date.now();
 
             // Upload file to external FTP server
             const uploadedUrl = await invoke<string>('upload_to_external_ftp', {
@@ -1169,7 +1197,12 @@
               passiveMode: ftpPassiveMode,
             });
 
+            const duration = Date.now() - startTime;
+            console.log("[FTP_UPLOAD_FRONTEND] Backend returned successfully after", duration, "ms");
+            console.log("[FTP_UPLOAD_FRONTEND] Uploaded URL:", uploadedUrl);
+
             // Create file entry with FTP URL
+            console.log("[FTP_UPLOAD_FRONTEND] Creating file entry for uploaded file...");
             const ftpFile = {
               id: `ftp-${Date.now()}-${Math.random()}`,
               name: fileName,
@@ -1185,7 +1218,10 @@
               protocol: "FTP" as const,
             };
 
+            console.log("[FTP_UPLOAD_FRONTEND] Updating files store...");
             files.update(f => [...f, ftpFile]);
+
+            console.log("[FTP_UPLOAD_FRONTEND] ===== FTP UPLOAD SUCCESSFUL =====");
             showToast(
               `${fileName} uploaded to FTP server successfully`,
               "success"
@@ -1193,7 +1229,10 @@
             addedCount++;
             continue; // Skip the normal Chiral upload flow
           } catch (error) {
-            console.error("FTP upload failed:", error);
+            console.error("[FTP_UPLOAD_FRONTEND] ===== FTP UPLOAD FAILED =====");
+            console.error("[FTP_UPLOAD_FRONTEND] Error:", error);
+            console.error("[FTP_UPLOAD_FRONTEND] Error type:", typeof error);
+            console.error("[FTP_UPLOAD_FRONTEND] Error details:", JSON.stringify(error, null, 2));
             showToast(
               `FTP upload failed: ${error}`,
               "error"

@@ -509,7 +509,6 @@ async fn api_upload_generate(
             info_hash: None,
             trackers: None,
             manifest: None,
-            encryption: None,
         };
 
         if let Err(e) = state.dht.publish_file(meta, None).await {
@@ -662,7 +661,6 @@ async fn api_upload_generate(
             info_hash: None,
             trackers: None,
             manifest: Some(manifest_json),
-            encryption: None,
         };
 
         if let Err(e) = state.dht.publish_file(meta, None).await {
@@ -887,7 +885,6 @@ async fn api_upload_generate(
             info_hash: None,
             trackers: None,
             manifest: Some(manifest_json),
-            encryption: None,
         };
         if let Err(e) = state.dht.publish_file(meta, None).await {
             return (
@@ -961,7 +958,6 @@ async fn api_upload_generate(
             info_hash: None,
             trackers: None,
             manifest: None,
-            encryption: None,
         };
 
         if let Err(e) = state.dht.publish_file(meta, None).await {
@@ -1637,5 +1633,4 @@ async fn api_tx_receipt(
             .into_response(),
     }
 }
-
 

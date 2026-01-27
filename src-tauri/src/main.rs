@@ -4168,7 +4168,6 @@ async fn upload_file_to_network(
                             ed2k_sources: None,
                             download_path: None,
                             manifest: None,
-                            encryption: None,
                         };
 
                         // Publish merged metadata to DHT for discoverability
@@ -4276,7 +4275,6 @@ async fn upload_file_to_network(
                             }]),
                             download_path: None,
                             manifest: manifest_json,
-                            encryption: None,
                         };
 
                         // Publish merged metadata to DHT for discoverability
@@ -4409,7 +4407,6 @@ async fn upload_file_to_network(
                     ed2k_sources: None,
                     manifest: Some(manifest_json),
                     download_path: None,
-                    encryption: None,
                 };
 
                 let dht = {
@@ -4630,7 +4627,6 @@ async fn upload_file_to_network(
                             trackers: None,
                             ed2k_sources: None,
                             manifest: Some(manifest_json),
-                            encryption: None,
                         };
 
                         info!(
@@ -4770,7 +4766,6 @@ async fn upload_file_to_network(
                             ed2k_sources: None,
                             download_path: None,
                             manifest: Some(manifest_json),
-                            encryption: None,
                         };
 
                         dht.publish_file(metadata.clone(), None).await?;
@@ -5110,25 +5105,38 @@ async fn upload_to_external_ftp(
     use suppaftp::types::FileType;
     use suppaftp::Mode;
 
+    println!("[FTP_UPLOAD] Starting FTP upload");
+    println!("[FTP_UPLOAD] File path: {}", file_path);
+    println!("[FTP_UPLOAD] FTP URL: {}", ftp_url);
+    println!("[FTP_UPLOAD] Username: {:?}", username.as_deref().unwrap_or("anonymous"));
+    println!("[FTP_UPLOAD] Use FTPS: {}", use_ftps);
+    println!("[FTP_UPLOAD] Passive mode: {}", passive_mode);
+
     // Read the file
+    println!("[FTP_UPLOAD] Opening file...");
     let mut file =
         std::fs::File::open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
 
+    println!("[FTP_UPLOAD] Reading file into memory...");
     let mut file_data = Vec::new();
     file.read_to_end(&mut file_data)
         .map_err(|e| format!("Failed to read file: {}", e))?;
+    println!("[FTP_UPLOAD] File read complete. Size: {} bytes", file_data.len());
 
     // Parse URL to get host, port, and remote path
+    println!("[FTP_UPLOAD] Parsing FTP URL...");
     let parsed = url::Url::parse(&ftp_url).map_err(|e| format!("Invalid URL: {}", e))?;
     let host = parsed.host_str().ok_or("Invalid FTP URL: no host")?;
     let port = parsed.port().unwrap_or(21);
     let remote_path = parsed.path();
+    println!("[FTP_UPLOAD] Parsed - Host: {}, Port: {}, Remote path: {}", host, port, remote_path);
 
     // Get filename from local path
     let file_name = std::path::Path::new(&file_path)
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("Invalid file path")?;
+    println!("[FTP_UPLOAD] Local filename: {}", file_name);
 
     // Construct the full remote path
     let full_remote_path = if remote_path.ends_with('/') {
@@ -5136,84 +5144,114 @@ async fn upload_to_external_ftp(
     } else {
         format!("{}/{}", remote_path, file_name)
     };
+    println!("[FTP_UPLOAD] Full remote path: {}", full_remote_path);
 
     // Upload based on FTPS setting
     if use_ftps {
         use suppaftp::{NativeTlsConnector, NativeTlsFtpStream};
 
+        println!("[FTP_UPLOAD] Using FTPS (secure) connection");
+
         // Create TLS connector
+        println!("[FTP_UPLOAD] Creating TLS connector...");
         let tls_connector = NativeTlsConnector::from(
             native_tls::TlsConnector::new()
                 .map_err(|e| format!("Failed to create TLS connector: {}", e))?,
         );
 
         // Connect to FTPS server
+        let connect_addr = format!("{}:{}", host, port);
+        println!("[FTP_UPLOAD] Connecting to FTPS server at {}...", connect_addr);
+        println!("[FTP_UPLOAD] NOTE: No timeout configured - this may hang indefinitely!");
         let mut ftp_stream = NativeTlsFtpStream::connect_secure_implicit(
-            format!("{}:{}", host, port),
+            connect_addr,
             tls_connector,
             host,
         )
         .map_err(|e| format!("Failed to connect to FTPS server: {}", e))?;
+        println!("[FTP_UPLOAD] FTPS connection established!");
 
         // Set passive mode
         if passive_mode {
+            println!("[FTP_UPLOAD] Setting passive mode...");
             ftp_stream.set_mode(Mode::Passive);
         }
 
         // Login
         let user = username.as_deref().unwrap_or("anonymous");
         let pass = password.as_deref().unwrap_or("");
+        println!("[FTP_UPLOAD] Logging in as '{}'...", user);
         ftp_stream
             .login(user, pass)
             .map_err(|e| format!("FTPS login failed: {}", e))?;
+        println!("[FTP_UPLOAD] Login successful!");
 
         // Set binary mode
+        println!("[FTP_UPLOAD] Setting binary transfer mode...");
         ftp_stream
             .transfer_type(FileType::Binary)
             .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
         // Upload file
+        println!("[FTP_UPLOAD] Starting file upload to {}...", full_remote_path);
         let mut reader = std::io::Cursor::new(file_data);
         ftp_stream
             .put_file(&full_remote_path, &mut reader)
             .map_err(|e| format!("Failed to upload file: {}", e))?;
+        println!("[FTP_UPLOAD] File upload complete!");
 
         // Quit connection
+        println!("[FTP_UPLOAD] Closing FTPS connection...");
         ftp_stream
             .quit()
             .map_err(|e| format!("Failed to quit FTPS session: {}", e))?;
+        println!("[FTP_UPLOAD] FTPS connection closed successfully");
     } else {
+        println!("[FTP_UPLOAD] Using regular FTP (insecure) connection");
+
         // Connect to regular FTP server
-        let mut ftp_stream = FtpStream::connect(format!("{}:{}", host, port))
+        let connect_addr = format!("{}:{}", host, port);
+        println!("[FTP_UPLOAD] Connecting to FTP server at {}...", connect_addr);
+        println!("[FTP_UPLOAD] NOTE: No timeout configured - this may hang indefinitely!");
+        let mut ftp_stream = FtpStream::connect(connect_addr)
             .map_err(|e| format!("Failed to connect to FTP server: {}", e))?;
+        println!("[FTP_UPLOAD] FTP connection established!");
 
         // Set passive mode
         if passive_mode {
+            println!("[FTP_UPLOAD] Setting passive mode...");
             ftp_stream.set_mode(Mode::Passive);
         }
 
         // Login
         let user = username.as_deref().unwrap_or("anonymous");
         let pass = password.as_deref().unwrap_or("");
+        println!("[FTP_UPLOAD] Logging in as '{}'...", user);
         ftp_stream
             .login(user, pass)
             .map_err(|e| format!("FTP login failed: {}", e))?;
+        println!("[FTP_UPLOAD] Login successful!");
 
         // Set binary mode
+        println!("[FTP_UPLOAD] Setting binary transfer mode...");
         ftp_stream
             .transfer_type(FileType::Binary)
             .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
         // Upload file
+        println!("[FTP_UPLOAD] Starting file upload to {}...", full_remote_path);
         let mut reader = std::io::Cursor::new(file_data);
         ftp_stream
             .put_file(&full_remote_path, &mut reader)
             .map_err(|e| format!("Failed to upload file: {}", e))?;
+        println!("[FTP_UPLOAD] File upload complete!");
 
         // Quit connection
+        println!("[FTP_UPLOAD] Closing FTP connection...");
         ftp_stream
             .quit()
             .map_err(|e| format!("Failed to quit FTP session: {}", e))?;
+        println!("[FTP_UPLOAD] FTP connection closed successfully");
     }
 
     // Construct the full FTP URL to return
@@ -5223,6 +5261,9 @@ async fn upload_to_external_ftp(
         parsed.authority(),
         full_remote_path
     );
+
+    println!("[FTP_UPLOAD] Upload complete! Uploaded URL: {}", uploaded_url);
+    println!("[FTP_UPLOAD] ===== FTP UPLOAD SUCCESSFUL =====");
 
     Ok(uploaded_url)
 }
