@@ -184,7 +184,7 @@ pub struct FileMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "infoHash")]
     pub info_hash: Option<String>,
 
-    /// A list of BitTorrent tracker URLs.
+    /// A list of BitTorrent tracker URLs.print("".center(50, "-"))
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trackers: Option<Vec<String>>,
 
@@ -193,17 +193,6 @@ pub struct FileMetadata {
     /// instead of placeholder hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<String>,
-
-    /// Additional encryption details (algorithm, key derivation method)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption: Option<EncryptionDetails>,
-}
-
-/// Additional encryption information for GossipSub
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptionDetails {
-    pub algorithm: String,
-    pub key_derivation: String,
 }
 
 /// Minimal DHT record - discovery data only
