@@ -468,7 +468,9 @@
       "unlockSuccess": "钱包解锁成功",
       "orCreateImport": "或",
       "walletName": "钱包名称（可选）",
-      "walletNamePlaceholder": "例如：主钱包"
+      "walletNamePlaceholder": "例如：主钱包",
+      "passwordOptional": "密码（可选）",
+      "passwordPlaceholder": "如无密码可留空"
     },
     "errors": {
       "loadKeystoreFailed": "加载保存的钱包失败",

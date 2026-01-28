@@ -595,7 +595,9 @@
       "unlockSuccess": "تم فتح المحفظة بنجاح",
       "orCreateImport": "أو",
       "walletName": "اسم المحفظة (اختياري)",
-      "walletNamePlaceholder": "مثال: المحفظة الرئيسية"
+      "walletNamePlaceholder": "مثال: المحفظة الرئيسية",
+      "passwordOptional": "كلمة المرور (اختياري)",
+      "passwordPlaceholder": "اتركه فارغًا إذا لم يوجد"
     },
     "errors": {
       "loadKeystoreFailed": "فشل تحميل المحافظ المحفوظة",

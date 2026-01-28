@@ -509,11 +509,8 @@ $: canShowLockAction = !showFirstRunWizard;
             }
           }
 
-          // Show wizard if no account AND no keystore files exist
-          // (Don't rely on first-run flag since user may have cleared data)
-          if (!hasAccount && !hasKeystoreFiles) {
-            showAuthWizard.set(true);
-          }
+          // Always show wallet selector on startup
+          showAuthWizard.set(true);
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
           diagnosticLogger.warn('APP', 'Failed to check first-run status', { error: errorMsg });

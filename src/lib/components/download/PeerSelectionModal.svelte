@@ -11,6 +11,12 @@
     selected: boolean;
     percentage: number;
   }
+
+  export interface SeederDetails {
+    peerId: string;
+    protocols?: string[];
+    protocolDetails?: any;
+  }
 </script>
 
 <script lang="ts">
@@ -31,9 +37,17 @@
   export let isTorrent = false; // Flag to indicate torrent download (no peer selection needed)
   export let availableProtocols: Array<{id: string, name: string, description: string, available: boolean}> = [];
   export let isSeeding = false; // Flag to indicate if user is seeding this file
+  export let seederDetails: SeederDetails[] = [];
 
   // Filter to only available protocols for display
   $: validProtocols = availableProtocols.filter(p => p.available);
+
+  // Check if a peer supports the selected protocol
+  function peerSupportsProtocol(peerId: string, protocol: string): boolean {
+    const seeder = seederDetails.find(s => s.peerId === peerId);
+    if (!seeder || !seeder.protocols) return false;
+    return seeder.protocols.some(p => p.toLowerCase() === protocol.toLowerCase());
+  }
 
   const dispatch = createEventDispatcher<{
     confirm: void;
@@ -234,7 +248,8 @@
               </thead>
               <tbody>
                 {#each peers as peer}
-                  <tr class="border-t hover:bg-muted/50 transition-colors {mode === 'auto' ? 'bg-muted/30' : ''}">
+                  {@const supportsProtocol = peerSupportsProtocol(peer.peerId, protocol)}
+                  <tr class="border-t transition-colors {mode === 'auto' ? 'bg-muted/30' : ''} {supportsProtocol ? 'hover:bg-muted/50' : 'opacity-40'}" title={supportsProtocol ? '' : `This peer does not support ${protocol.toUpperCase()}`}>
                     {#if mode === 'manual'}
                       <td class="p-3">
                         <label class="sr-only" for="peer-select-{peer.peerId.slice(0, 12)}">Select peer {peer.peerId.slice(0, 12)}...</label>
@@ -243,14 +258,18 @@
                           type="checkbox"
                           checked={peer.selected}
                           on:change={() => togglePeer(peer.peerId)}
-                          class="h-4 w-4 rounded border-gray-300 text-primary focus:ring-2 focus:ring-primary cursor-pointer"
+                          disabled={!supportsProtocol}
+                          class="h-4 w-4 rounded border-gray-300 text-primary focus:ring-2 focus:ring-primary {supportsProtocol ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'}"
                         />
                       </td>
                     {/if}
                     <td class="p-3">
                       <div class="flex items-center gap-2">
-                        <div class="h-2 w-2 rounded-full bg-emerald-500"></div>
+                        <div class="h-2 w-2 rounded-full {supportsProtocol ? 'bg-emerald-500' : 'bg-gray-400'}"></div>
                         <code class="font-mono text-sm">{peer.peerId.slice(0, 12)}...</code>
+                        {#if !supportsProtocol}
+                          <span class="text-xs text-muted-foreground">(no {protocol.toUpperCase()})</span>
+                        {/if}
                       </div>
                     </td>
                     <td class="p-3">

@@ -14,8 +14,11 @@ use crate::encryption::EncryptedAesKeyBundle;
 /// General seeder info (topic: seeder/{peerID})
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeederGeneralInfo {
+    #[serde(rename = "peerId")]
     pub peer_id: String,
+    #[serde(rename = "walletAddress")]
     pub wallet_address: String,
+    #[serde(rename = "defaultPricePerMb")]
     pub default_price_per_mb: f64,
     pub timestamp: u64,
 }
@@ -23,34 +26,105 @@ pub struct SeederGeneralInfo {
 /// File-specific info (topic: seeder/{peerID}/file/{fileHash})
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeederFileInfo {
+    #[serde(rename = "peerId")]
     pub peer_id: String,
+    #[serde(rename = "fileHash")]
     pub file_hash: String,
+    #[serde(rename = "pricePerMb")]
     pub price_per_mb: Option<f64>, // Overrides default if set
+    #[serde(rename = "supportedProtocols")]
     pub supported_protocols: Vec<String>,
+    #[serde(rename = "protocolDetails")]
     pub protocol_details: ProtocolDetails,
     pub timestamp: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Protocol-specific details, grouped by protocol type
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProtocolDetails {
-    pub cids: Option<Vec<String>>,
-    pub http_sources: Option<Vec<HttpSourceInfo>>,
-    pub ftp_sources: Option<Vec<FtpSourceInfo>>,
-    pub ed2k_sources: Option<Vec<Ed2kSourceInfo>>,
-    pub info_hash: Option<String>,
-    pub trackers: Option<Vec<String>>,
-    pub is_encrypted: bool,
-    pub encryption_method: Option<String>,
-    pub key_fingerprint: Option<String>,
-    pub encrypted_key_bundle: Option<EncryptedAesKeyBundle>,
+    // Protocol-specific details (only populated for supported protocols)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpProtocolDetails>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ftp: Option<FtpProtocolDetails>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ed2k: Option<Ed2kProtocolDetails>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bittorrent: Option<BitTorrentProtocolDetails>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitswap: Option<BitswapProtocolDetails>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webrtc: Option<WebRtcProtocolDetails>,
+
+    // Common encryption (applies to all protocols)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionDetails>,
+}
+
+/// HTTP Protocol Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpProtocolDetails {
+    pub sources: Vec<HttpSourceInfo>,
+}
+
+/// FTP Protocol Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtpProtocolDetails {
+    pub sources: Vec<FtpSourceInfo>,
+}
+
+/// ED2K Protocol Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ed2kProtocolDetails {
+    pub sources: Vec<Ed2kSourceInfo>,
+}
+
+/// BitTorrent Protocol Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BitTorrentProtocolDetails {
+    #[serde(rename = "infoHash")]
+    pub info_hash: String,
+    pub trackers: Vec<String>,
+}
+
+/// BitSwap/IPFS Protocol Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BitswapProtocolDetails {
+    pub cids: Vec<String>,
+    #[serde(rename = "isRoot")]
+    pub is_root: bool,
+}
+
+/// WebRTC Protocol Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebRtcProtocolDetails {
+    pub enabled: bool,
+}
+
+/// Common Encryption Details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionDetails {
+    pub method: String,
+    #[serde(rename = "keyFingerprint")]
+    pub key_fingerprint: String,
+    #[serde(rename = "encryptedKeyBundle")]
+    pub encrypted_key_bundle: EncryptedAesKeyBundle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpSourceInfo {
     pub url: String,
+    #[serde(rename = "authHeader")]
     pub auth_header: Option<String>,
+    #[serde(rename = "verifySsl")]
     pub verify_ssl: bool,
     pub headers: Option<Vec<(String, String)>>,
+    #[serde(rename = "timeoutSecs")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -58,20 +132,37 @@ pub struct HttpSourceInfo {
 pub struct FtpSourceInfo {
     pub url: String,
     pub username: Option<String>,
+    #[serde(rename = "encryptedPassword")]
+    pub encrypted_password: Option<String>, // Encrypted with file hash as key
+    #[serde(rename = "passiveMode")]
+    pub passive_mode: bool,
+    #[serde(rename = "useFtps")]
+    pub use_ftps: bool,
+    #[serde(rename = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+    #[serde(rename = "supportsResume")]
     pub supports_resume: bool,
+    #[serde(rename = "fileSize")]
     pub file_size: u64,
+    #[serde(rename = "lastChecked")]
     pub last_checked: Option<u64>,
+    #[serde(rename = "isAvailable")]
     pub is_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ed2kSourceInfo {
+    #[serde(rename = "serverUrl")]
     pub server_url: String,
+    #[serde(rename = "fileHash")]
     pub file_hash: String,
+    #[serde(rename = "fileSize")]
     pub file_size: u64,
+    #[serde(rename = "fileName")]
     pub file_name: Option<String>,
     pub sources: Option<Vec<String>>,
     pub timeout: Option<u64>,
+    #[serde(rename = "chunkHashes")]
     pub chunk_hashes: Option<Vec<String>>,
 }
 
@@ -308,55 +399,122 @@ pub fn derive_protocols(metadata: &FileMetadata) -> Vec<String> {
 
 impl From<FileMetadata> for ProtocolDetails {
     fn from(metadata: FileMetadata) -> Self {
+        // Build HTTP protocol details if HTTP sources exist
+        let http = metadata.http_sources.and_then(|sources| {
+            if sources.is_empty() {
+                None
+            } else {
+                Some(HttpProtocolDetails {
+                    sources: sources
+                        .into_iter()
+                        .map(|s| HttpSourceInfo {
+                            url: s.url,
+                            auth_header: s.auth_header,
+                            verify_ssl: s.verify_ssl,
+                            headers: s.headers,
+                            timeout_secs: s.timeout_secs,
+                        })
+                        .collect(),
+                })
+            }
+        });
+
+        // Build FTP protocol details if FTP sources exist
+        let ftp = metadata.ftp_sources.and_then(|sources| {
+            if sources.is_empty() {
+                None
+            } else {
+                Some(FtpProtocolDetails {
+                    sources: sources
+                        .into_iter()
+                        .map(|s| FtpSourceInfo {
+                            url: s.url,
+                            username: s.username,
+                            encrypted_password: None, // Not set when converting from FileMetadata
+                            passive_mode: true,       // Default to passive mode
+                            use_ftps: false,          // Default to regular FTP
+                            timeout_secs: Some(30),   // Default timeout
+                            supports_resume: s.supports_resume,
+                            file_size: s.file_size,
+                            last_checked: s.last_checked,
+                            is_available: s.is_available,
+                        })
+                        .collect(),
+                })
+            }
+        });
+
+        // Build ED2K protocol details if ED2K sources exist
+        let ed2k = metadata.ed2k_sources.and_then(|sources| {
+            if sources.is_empty() {
+                None
+            } else {
+                Some(Ed2kProtocolDetails {
+                    sources: sources
+                        .into_iter()
+                        .map(|s| Ed2kSourceInfo {
+                            server_url: s.server_url,
+                            file_hash: s.file_hash,
+                            file_size: s.file_size,
+                            file_name: s.file_name,
+                            sources: s.sources,
+                            timeout: s.timeout,
+                            chunk_hashes: s.chunk_hashes,
+                        })
+                        .collect(),
+                })
+            }
+        });
+
+        // Build BitTorrent protocol details if info_hash exists
+        let bittorrent = metadata.info_hash.map(|info_hash| BitTorrentProtocolDetails {
+            info_hash,
+            trackers: metadata.trackers.unwrap_or_default(),
+        });
+
+        // Build BitSwap protocol details if CIDs exist
+        let bitswap = metadata.cids.and_then(|cids| {
+            if cids.is_empty() {
+                None
+            } else {
+                Some(BitswapProtocolDetails {
+                    cids: cids.into_iter().map(|cid| cid.to_string()).collect(),
+                    is_root: metadata.is_root,
+                })
+            }
+        });
+
+        // Build WebRTC protocol details (enabled by default for peer-to-peer transfers)
+        let webrtc = Some(WebRtcProtocolDetails { enabled: true });
+
+        // Build encryption details if file is encrypted
+        let encryption = if metadata.is_encrypted {
+            match (
+                metadata.encryption_method,
+                metadata.key_fingerprint,
+                metadata.encrypted_key_bundle,
+            ) {
+                (Some(method), Some(key_fingerprint), Some(encrypted_key_bundle)) => {
+                    Some(EncryptionDetails {
+                        method,
+                        key_fingerprint,
+                        encrypted_key_bundle,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         Self {
-            cids: metadata
-                .cids
-                .map(|cids| cids.into_iter().map(|cid| cid.to_string()).collect()),
-            http_sources: metadata.http_sources.map(|sources| {
-                sources
-                    .into_iter()
-                    .map(|s| HttpSourceInfo {
-                        url: s.url,
-                        auth_header: s.auth_header,
-                        verify_ssl: s.verify_ssl,
-                        headers: s.headers,
-                        timeout_secs: s.timeout_secs,
-                    })
-                    .collect()
-            }),
-            ftp_sources: metadata.ftp_sources.map(|sources| {
-                sources
-                    .into_iter()
-                    .map(|s| FtpSourceInfo {
-                        url: s.url,
-                        username: s.username,
-                        supports_resume: s.supports_resume,
-                        file_size: s.file_size,
-                        last_checked: s.last_checked,
-                        is_available: s.is_available,
-                    })
-                    .collect()
-            }),
-            ed2k_sources: metadata.ed2k_sources.map(|sources| {
-                sources
-                    .into_iter()
-                    .map(|s| Ed2kSourceInfo {
-                        server_url: s.server_url,
-                        file_hash: s.file_hash,
-                        file_size: s.file_size,
-                        file_name: s.file_name,
-                        sources: s.sources,
-                        timeout: s.timeout,
-                        chunk_hashes: s.chunk_hashes,
-                    })
-                    .collect()
-            }),
-            info_hash: metadata.info_hash,
-            trackers: metadata.trackers,
-            is_encrypted: metadata.is_encrypted,
-            encryption_method: metadata.encryption_method,
-            key_fingerprint: metadata.key_fingerprint,
-            encrypted_key_bundle: metadata.encrypted_key_bundle,
+            http,
+            ftp,
+            ed2k,
+            bittorrent,
+            bitswap,
+            webrtc,
+            encryption,
         }
     }
 }

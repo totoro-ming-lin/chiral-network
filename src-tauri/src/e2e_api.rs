@@ -745,8 +745,18 @@ async fn api_upload_generate(
         file_hash.clone()
     } else if protocol_upper == "BITTORRENT" {
         // Seed the file via the protocol manager to obtain a magnet link (contains info_hash).
-        let seeding = match app_state
-            .protocol_manager
+        let protocol_manager = { app_state.protocol_manager.lock().await.as_ref().cloned() };
+        let Some(protocol_manager) = protocol_manager else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::http_server::ErrorResponse {
+                    error: "Protocol manager is not running".to_string(),
+                }),
+            )
+                .into_response();
+        };
+
+        let seeding = match protocol_manager
             .seed(
                 "bittorrent",
                 std::path::PathBuf::from(&tmp_path),
@@ -1038,20 +1048,22 @@ async fn api_upload_generate(
             uploader_address,
             torrent_base64: if protocol_upper == "BITTORRENT" {
                 let app_state = state.app.state::<crate::AppState>();
-                app_state
-                    .bittorrent_handler
-                    .get_seeded_torrent_bytes(&published_key)
-                    .await
-                    .map(|bytes| general_purpose::STANDARD.encode(bytes))
+                let bt = { app_state.bittorrent_handler.lock().await.as_ref().cloned() };
+                match bt {
+                    Some(bt) => bt
+                        .get_seeded_torrent_bytes(&published_key)
+                        .await
+                        .map(|bytes| general_purpose::STANDARD.encode(bytes)),
+                    None => None,
+                }
             } else {
                 None
             },
             bittorrent_port: if protocol_upper == "BITTORRENT" {
                 let app_state = state.app.state::<crate::AppState>();
-                app_state
-                    .bittorrent_handler
-                    .rqbit_session()
-                    .tcp_listen_port()
+                let bt = { app_state.bittorrent_handler.lock().await.as_ref().cloned() };
+                bt.map(|bt| bt.rqbit_session().tcp_listen_port())
+                    .flatten()
             } else {
                 None
             },
@@ -1345,10 +1357,19 @@ async fn api_download(
                     } else if protocol_upper_for_task == "BITTORRENT" {
                         // BitTorrent: download via bittorrent handler (magnet), then copy the completed file into
                         // the E2E output path so verification/polling is consistent across protocols.
-                        let bt = app_handle_for_task
-                            .state::<crate::AppState>()
-                            .bittorrent_handler
-                            .clone();
+                        let bt = {
+                            let app_state = app_handle_for_task.state::<crate::AppState>();
+                            let bt_opt = app_state
+                                .bittorrent_handler
+                                .lock()
+                                .await
+                                .as_ref()
+                                .cloned();
+                            bt_opt
+                        };
+                        let Some(bt) = bt else {
+                            return Err("BitTorrent handler is not running".to_string());
+                        };
 
                         let expected_info_hash = meta_for_task
                             .info_hash

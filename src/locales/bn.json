@@ -595,7 +595,9 @@
       "unlockSuccess": "ওয়ালেট সফলভাবে আনলক করা হয়েছে",
       "orCreateImport": "অথবা",
       "walletName": "ওয়ালেটের নাম (ঐচ্ছিক)",
-      "walletNamePlaceholder": "যেমন: প্রধান ওয়ালেট"
+      "walletNamePlaceholder": "যেমন: প্রধান ওয়ালেট",
+      "passwordOptional": "পাসওয়ার্ড (ঐচ্ছিক)",
+      "passwordPlaceholder": "না থাকলে খালি রাখুন"
     },
     "errors": {
       "loadKeystoreFailed": "সংরক্ষিত ওয়ালেট লোড করতে ব্যর্থ",

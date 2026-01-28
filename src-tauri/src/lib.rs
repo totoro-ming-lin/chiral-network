@@ -32,6 +32,7 @@ pub mod ftp_server;
 pub mod peer_selection;
 pub mod peer_cache;
 pub mod webrtc_service;
+pub mod protocol_manager;
 
 // Required modules for encryption and keystore functionality
 pub mod encryption;

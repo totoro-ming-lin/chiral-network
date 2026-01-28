@@ -596,7 +596,9 @@
       "unlockSuccess": "Carteira desbloqueada com sucesso",
       "orCreateImport": "Ou",
       "walletName": "Nome da Carteira (opcional)",
-      "walletNamePlaceholder": "ex. Carteira Principal"
+      "walletNamePlaceholder": "ex. Carteira Principal",
+      "passwordOptional": "Senha (opcional)",
+      "passwordPlaceholder": "Deixe vazio se não houver"
     },
     "errors": {
       "loadKeystoreFailed": "Falha ao carregar carteiras salvas",

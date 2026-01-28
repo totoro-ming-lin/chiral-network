@@ -468,7 +468,9 @@
       "unlockSuccess": "지갑 잠금 해제 성공",
       "orCreateImport": "또는",
       "walletName": "지갑 이름 (선택사항)",
-      "walletNamePlaceholder": "예: 주 지갑"
+      "walletNamePlaceholder": "예: 주 지갑",
+      "passwordOptional": "비밀번호 (선택사항)",
+      "passwordPlaceholder": "없으면 비워 두세요"
     },
     "errors": {
       "loadKeystoreFailed": "저장된 지갑을 불러오는데 실패했습니다",

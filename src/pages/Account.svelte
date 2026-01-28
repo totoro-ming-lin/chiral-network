@@ -46,7 +46,8 @@
   import { validatePrivateKeyFormat, RateLimiter } from '$lib/utils/validation'
 
   // Wallet utilities
-  import { getWalletName, removeWalletName } from '$lib/utils/walletNameCache'
+  import { getWalletName, setWalletName, removeWalletName } from '$lib/utils/walletNameCache'
+  import { saveWalletMetadata, touchWalletLastUsed } from '$lib/utils/walletCache'
   import { getCachedBalance, setCachedBalance, formatRelativeTime } from '$lib/utils/keystoreBalanceCache'
 
   // Check if running in Tauri environment
@@ -67,6 +68,10 @@
   let privateKeyVisible = false
   let showPending = false
   let importPrivateKey = ''
+  let importWalletName = ''
+  let importWalletPassword = ''
+  let createWalletName = ''
+  let createWalletPassword = ''
   type ImportedWalletSnapshot = WalletExportSnapshot & { transactions?: Transaction[] };
   let importedSnapshot: ImportedWalletSnapshot | null = null
   let isCreatingAccount = false
@@ -81,6 +86,8 @@
   let isLoadingFromKeystore = false;
   let keystoreLoadMessage = '';
   let rememberKeystorePassword = false;
+  let showKeystorePasswordPrompt = false;
+  let keystorePasswordPromptError = '';
 
   // Rate limiter for keystore unlock (5 attempts per minute)
   const keystoreRateLimiter = new RateLimiter(5, 60000);
@@ -94,6 +101,14 @@
   // Wallet switcher state
   let showWalletSwitcher = false
   let isSwitchingWallet = false
+  let quickSwitchAccount = ''
+  let quickSwitchOptions: { value: string; label: string }[] = []
+  let switcherPasswordInput = ''
+  let switcherPasswordError = ''
+  let pendingSwitcherAddress: string | null = null
+  let showSwitcherPasswordPrompt = false
+  let pendingSwitcherDeleteAddress: string | null = null
+  let showSwitcherDeleteConfirm = false
   let keystoreBalances = new Map<string, { balance: string; timestamp: number }>()
   let keystoreNames = new Map<string, string>()
   type HDAccountItem = { index: number; change: number; address: string; label?: string; privateKeyHex?: string };
@@ -329,12 +344,8 @@
       const currentGasFee = gasEstimate?.gasPrices[selectedGasOption]?.fee ?? 0;
       const totalCost = inputValue + currentGasFee;
 
-      if (isNaN(inputValue) || inputValue <= 0) {
+      if (isNaN(inputValue) || inputValue < 0) {
         validationWarning = tr('errors.amount.invalid');
-        isAmountValid = false;
-        sendAmount = 0;
-      } else if (inputValue < 0.01) {
-        validationWarning = tr('errors.amount.min', { min: '0.01' });
         isAmountValid = false;
         sendAmount = 0;
       } else if (totalCost > $wallet.balance) {
@@ -381,6 +392,14 @@
   
   // Prepare options for the DropDown component
   $: keystoreOptions = keystoreAccounts.map(acc => ({ value: acc, label: acc }));
+  $: quickSwitchOptions = keystoreAccounts.map(address => ({
+    value: address,
+    label: getWalletOptionLabel(address)
+  }));
+
+  $: if ($etcAccount?.address) {
+    quickSwitchAccount = $etcAccount.address
+  }
 
   // When logged out, if a keystore account is selected, try to load its saved password.
   $: if (!$etcAccount && selectedKeystoreAccount) {
@@ -508,7 +527,7 @@
   }
   
   function handleSendClick() {
-    if (!isAddressValid || !isAmountValid || sendAmount <= 0) return
+    if (!isAddressValid || !isAmountValid || sendAmount < 0) return
 
     if (isConfirming) {
       // Cancel if user taps again during countdown
@@ -546,7 +565,7 @@
   }
 
   async function sendTransaction() {
-    if (!isAddressValid || !isAmountValid || sendAmount <= 0) return
+    if (!isAddressValid || !isAmountValid || sendAmount < 0) return
     
     try {
       await walletService.sendTransaction(recipientAddress, sendAmount)
@@ -714,6 +733,24 @@
   try {
     const account = await walletService.createAccount()
 
+    if (createWalletName.trim()) {
+      setWalletName(account.address, createWalletName.trim())
+    }
+
+    saveWalletMetadata(account.address, {
+      name: createWalletName.trim() || undefined,
+      source: 'create'
+    })
+
+    try {
+      await walletService.saveToKeystore(createWalletPassword, {
+        address: account.address,
+        private_key: account.private_key
+      })
+    } catch (error) {
+      console.warn('Failed to save created wallet to keystore:', error)
+    }
+
     wallet.update(w => ({
       ...w,
       address: account.address,
@@ -737,6 +774,8 @@
     )
     alert(tr('errors.createAccount', { error: String(error) }))
   } finally {
+    createWalletName = ''
+    createWalletPassword = ''
     isCreatingAccount = false
   }
 }
@@ -796,6 +835,24 @@
     isImportingAccount = true
     try {
       const account = await walletService.importAccount(importPrivateKey)
+
+      if (importWalletName.trim()) {
+        setWalletName(account.address, importWalletName.trim())
+      }
+
+      saveWalletMetadata(account.address, {
+        name: importWalletName.trim() || undefined,
+        source: 'import'
+      })
+
+      try {
+        await walletService.saveToKeystore(importWalletPassword, {
+          address: account.address,
+          private_key: account.private_key
+        })
+      } catch (error) {
+        console.warn('Failed to save imported wallet to keystore:', error)
+      }
       if (importedSnapshot) {
         const snapshot = importedSnapshot;
         if (typeof snapshot.balance === 'number') {
@@ -816,6 +873,8 @@
         pendingTransactions: 0
       }))
       importPrivateKey = ''
+      importWalletName = ''
+      importWalletPassword = ''
       importedSnapshot = null
 
 
@@ -927,7 +986,7 @@
   function closeMnemonicWizard() {
     showMnemonicWizard = false;
   }
-  async function completeMnemonicWizard(ev: { mnemonic: string, passphrase: string, account: { address: string, privateKeyHex: string, index: number, change: number }, name?: string }) {
+  async function completeMnemonicWizard(ev: { mnemonic: string, passphrase: string, account: { address: string, privateKeyHex: string, index: number, change: number }, name?: string, password?: string }) {
     showMnemonicWizard = false;
     hdMnemonic = ev.mnemonic;
     hdPassphrase = ev.passphrase || '';
@@ -947,6 +1006,20 @@
     // set as active (frontend)
     etcAccount.set({ address: ev.account.address, private_key: privateKeyWithPrefix });
     wallet.update(w => ({ ...w, address: ev.account.address }));
+    if (ev.name) {
+      setWalletName(ev.account.address, ev.name)
+    }
+
+    saveWalletMetadata(ev.account.address, { name: ev.name, source: mnemonicMode === 'create' ? 'create' : 'import' })
+
+    try {
+      await walletService.saveToKeystore(ev.password ?? '', {
+        address: ev.account.address,
+        private_key: privateKeyWithPrefix
+      })
+    } catch (error) {
+      console.warn('Failed to save mnemonic wallet to keystore:', error)
+    }
     if (isGethRunning) { await fetchBalance(); }
   }
   function onHDAccountsChange(updated: HDAccountItem[]) {
@@ -1018,17 +1091,30 @@
     return name || formatAddressShort(address)
   }
 
+  function getWalletOptionLabel(address: string): string {
+    const name = keystoreNames.get(address.toLowerCase())
+    if (name) {
+      return `${name} (${formatAddressShort(address)})`
+    }
+    return formatAddressShort(address)
+  }
+
+  function isPasswordError(error: unknown): boolean {
+    const message = String(error).toLowerCase()
+    return message.includes('password') || message.includes('decrypt') || message.includes('keystore')
+  }
+
   // Switch to a different wallet
-  async function switchToWallet(address: string) {
+  async function switchToWallet(address: string, password: string, allowPrompt = false): Promise<boolean> {
     if (address.toLowerCase() === $etcAccount?.address.toLowerCase()) {
       showWalletSwitcher = false
-      return
+      return true
     }
 
     isSwitchingWallet = true
 
     try {
-      const account = await walletService.loadFromKeystore(address, '') // Use empty password (auto-saved wallets)
+      const account = await walletService.loadFromKeystore(address, password)
 
       wallet.update(w => ({
         ...w,
@@ -1055,18 +1141,50 @@
 
       // Note: Accurate totals will auto-calculate via reactive statement when address changes
 
+      touchWalletLastUsed(account.address)
       showToast(tr('toasts.wallet.switcher.switchSuccess'), 'success')
       showWalletSwitcher = false
+      return true
     } catch (error) {
       console.error('Failed to switch wallet:', error)
+      if (allowPrompt && isPasswordError(error)) {
+        pendingSwitcherAddress = address
+        switcherPasswordInput = ''
+        switcherPasswordError = ''
+        showSwitcherPasswordPrompt = true
+        return false
+      }
+      if (showSwitcherPasswordPrompt && isPasswordError(error)) {
+        switcherPasswordError = tr('wallet.errors.loadFailed')
+        return false
+      }
       showToast(tr('toasts.wallet.switcher.switchError'), 'error')
+      return false
     } finally {
       isSwitchingWallet = false
     }
   }
 
+  async function confirmSwitcherPassword() {
+    if (!pendingSwitcherAddress) return
+    switcherPasswordError = ''
+    const success = await switchToWallet(pendingSwitcherAddress, switcherPasswordInput, false)
+    if (success) {
+      showSwitcherPasswordPrompt = false
+      pendingSwitcherAddress = null
+      switcherPasswordInput = ''
+    }
+  }
+
+  async function handleQuickSwitchChange(address: string) {
+    if (!address || address.toLowerCase() === $etcAccount?.address.toLowerCase()) {
+      return
+    }
+    await switchToWallet(address, '', true)
+  }
+
   // Delete wallet from switcher
-  async function deleteWalletFromSwitcher(address: string, event: MouseEvent) {
+  function requestDeleteWalletFromSwitcher(address: string, event: MouseEvent) {
     event.stopPropagation()
 
     if (address.toLowerCase() === $etcAccount?.address.toLowerCase()) {
@@ -1074,11 +1192,13 @@
       return
     }
 
-    const displayName = getWalletDisplayName(address)
-    const confirmMsg = tr('wallet.switcher.deleteConfirm', { address: displayName })
+    pendingSwitcherDeleteAddress = address
+    showSwitcherDeleteConfirm = true
+  }
 
-    if (!confirm(confirmMsg)) return
-
+  async function deleteWalletFromSwitcher() {
+    if (!pendingSwitcherDeleteAddress) return
+    const address = pendingSwitcherDeleteAddress
     try {
       await walletService.deleteKeystoreAccount(address)
       removeWalletName(address)
@@ -1087,6 +1207,9 @@
     } catch (error) {
       console.error('Failed to delete wallet:', error)
       showToast(tr('toasts.wallet.switcher.deleteError'), 'error')
+    } finally {
+      pendingSwitcherDeleteAddress = null
+      showSwitcherDeleteConfirm = false
     }
   }
 
@@ -1117,8 +1240,8 @@
     }
   }
 
-  async function loadFromKeystore() {
-    if (!selectedKeystoreAccount || !loadKeystorePassword) return;
+  async function loadFromKeystore(): Promise<boolean> {
+    if (!selectedKeystoreAccount) return false;
 
     // Rate limiting: prevent brute force attacks
     if (!keystoreRateLimiter.checkLimit('keystore-unlock')) {
@@ -1130,9 +1253,11 @@
     isLoadingFromKeystore = true;
     keystoreLoadMessage = '';
 
+    const passwordToTry = loadKeystorePassword || '';
+
     try {
         if (isTauri) {
-            const account = await walletService.loadFromKeystore(selectedKeystoreAccount, loadKeystorePassword);
+            const account = await walletService.loadFromKeystore(selectedKeystoreAccount, passwordToTry);
 
             if (account.address.toLowerCase() !== selectedKeystoreAccount.toLowerCase()) {
                 throw new Error(tr('keystore.load.addressMismatch'));
@@ -1141,7 +1266,7 @@
             // Success - reset rate limiter for this account
             keystoreRateLimiter.reset('keystore-unlock');
 
-            saveOrClearPassword(selectedKeystoreAccount, loadKeystorePassword);
+            saveOrClearPassword(selectedKeystoreAccount, passwordToTry);
 
             // The wallet service already sets etcAccount and clears transactions;
             // ensure the UI store mirrors the loaded address.
@@ -1149,6 +1274,8 @@
                 ...w,
                 address: account.address
             }));
+
+            touchWalletLastUsed(account.address);
 
             // Clear sensitive data
             loadKeystorePassword = '';
@@ -1161,26 +1288,47 @@
             }
 
             keystoreLoadMessage = tr('keystore.load.success');
+            return true;
 
         } else {
             // Web demo mode simulation
-            // Save or clear the password from local storage based on the checkbox
-            saveOrClearPassword(selectedKeystoreAccount, loadKeystorePassword);
+            saveOrClearPassword(selectedKeystoreAccount, passwordToTry);
             await new Promise(resolve => setTimeout(resolve, 1000));
-            keystoreRateLimiter.reset('keystore-unlock'); // Reset on success in demo mode too
+            keystoreRateLimiter.reset('keystore-unlock');
             keystoreLoadMessage = tr('keystore.load.successSimulated');
+            return true;
         }
 
     } catch (error) {
         console.error('Failed to load from keystore:', error);
+        if (isPasswordError(error)) {
+          if (showKeystorePasswordPrompt) {
+            keystorePasswordPromptError = tr('keystore.load.error', { error: String(error) });
+          } else {
+            keystorePasswordPromptError = '';
+            showKeystorePasswordPrompt = true;
+          }
+          isLoadingFromKeystore = false;
+          return false;
+        }
         keystoreLoadMessage = tr('keystore.load.error', { error: String(error) });
 
         // Clear sensitive data on error
-        // Note: Rate limiter is NOT reset on failure - failed attempts count toward limit
         loadKeystorePassword = '';
+        return false;
     } finally {
         isLoadingFromKeystore = false;
         setTimeout(() => keystoreLoadMessage = '', 4000);
+    }
+  }
+
+  async function confirmKeystorePassword() {
+    if (!selectedKeystoreAccount) return
+    keystorePasswordPromptError = ''
+    const success = await loadFromKeystore()
+    if (success) {
+      showKeystorePasswordPrompt = false
+      loadKeystorePassword = ''
     }
   }
 
@@ -1754,6 +1902,26 @@
         {#if !$etcAccount}
           <div class="space-y-3">
             <p class="text-sm text-muted-foreground">{msg('wallet.cta.intro', 'Create or import a wallet to get started.')}</p>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div class="flex flex-col gap-2">
+                <Label for="create-wallet-name">{$t('wallet.wizard.walletName')}</Label>
+                <Input
+                  id="create-wallet-name"
+                  bind:value={createWalletName}
+                  placeholder={$t('wallet.wizard.walletNamePlaceholder')}
+                />
+              </div>
+              <div class="flex flex-col gap-2">
+                <Label for="create-wallet-password">{$t('wallet.wizard.passwordOptional')}</Label>
+                <Input
+                  id="create-wallet-password"
+                  type="password"
+                  bind:value={createWalletPassword}
+                  placeholder={$t('wallet.wizard.passwordPlaceholder')}
+                />
+              </div>
+            </div>
             
             <Button 
               class="w-full" 
@@ -1775,6 +1943,25 @@
             </div>
             
             <div class="space-y-2">
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div class="flex flex-col gap-2">
+                  <Label for="import-wallet-name">{$t('wallet.wizard.walletName')}</Label>
+                  <Input
+                    id="import-wallet-name"
+                    bind:value={importWalletName}
+                    placeholder={$t('wallet.wizard.walletNamePlaceholder')}
+                  />
+                </div>
+                <div class="flex flex-col gap-2">
+                  <Label for="import-wallet-password">{$t('wallet.wizard.passwordOptional')}</Label>
+                  <Input
+                    id="import-wallet-password"
+                    type="password"
+                    bind:value={importWalletPassword}
+                    placeholder={$t('wallet.wizard.passwordPlaceholder')}
+                  />
+                </div>
+              </div>
               <div class="flex flex-col sm:flex-row w-full gap-2 sm:gap-0">
                 <Input
                   type="text"
@@ -1832,33 +2019,11 @@
                       />
                     </div>
                   </div>
-                  <div>
-                    <Label for="keystore-password">{$t('placeholders.password')}</Label>
-                    <Input
-                      id="keystore-password"
-                      type="password"
-                      bind:value={loadKeystorePassword}
-                      placeholder={$t('placeholders.unlockPassword')}
-                      class="w-full mt-1"
-                      autocomplete="current-password"
-                    />
-                  </div>
-                  <div class="flex items-center space-x-2 mt-2">
-                    <input type="checkbox" id="remember-password" bind:checked={rememberKeystorePassword} />
-                    <label for="remember-password" class="text-sm font-medium leading-none text-muted-foreground cursor-pointer">
-                      {$t('keystore.load.savePassword')}
-                    </label>
-                  </div>
-                  {#if rememberKeystorePassword}
-                    <div class="text-xs text-orange-600 p-2 bg-orange-50 border border-orange-200 rounded-md mt-2">
-                      {$t('keystore.load.savePasswordWarning')}
-                    </div>
-                  {/if}
                   <Button
                     class="w-full"
                     variant="outline"
                     on:click={loadFromKeystore}
-                    disabled={!selectedKeystoreAccount || !loadKeystorePassword || isLoadingFromKeystore}
+                    disabled={!selectedKeystoreAccount || isLoadingFromKeystore}
                   >
                     <KeyRound class="h-4 w-4 mr-2" />
                     {isLoadingFromKeystore ? $t('actions.unlocking') : $t('actions.unlockAccount')}
@@ -1884,6 +2049,20 @@
           </div>
         {:else}
         <div>
+          {#if keystoreAccounts.length > 1}
+            <div class="mb-3">
+              <Label for="quick-switch">{tr('wallet.switcher.title')}</Label>
+              <DropDown
+                id="quick-switch"
+                options={quickSwitchOptions}
+                bind:value={quickSwitchAccount}
+                on:change={(event) => handleQuickSwitchChange(event.detail.value)}
+                className="mt-1"
+                disabled={isSwitchingWallet}
+                placeholder={tr('wallet.switcher.switchWallet')}
+              />
+            </div>
+          {/if}
           <p class="text-sm text-muted-foreground">{msg('wallet.balance', 'Balance')}</p>
           <p class="text-3xl font-bold text-foreground">{$wallet.balance.toFixed(8)} Chiral</p>
         </div>
@@ -2068,6 +2247,7 @@
                     </button>
                   </div>
 
+
                   <div class="space-y-2 max-h-64 overflow-y-auto">
                     {#each keystoreAccounts as address}
                       {@const balanceData = keystoreBalances.get(address.toLowerCase())}
@@ -2077,7 +2257,7 @@
                       <div class="relative group">
                         <button
                           class="w-full text-left p-2.5 rounded border transition-all {isCurrentWallet ? 'bg-primary/10 border-primary' : 'border-border hover:border-primary/50 hover:bg-muted/50'}"
-                          on:click={() => switchToWallet(address)}
+                          on:click={() => switchToWallet(address, '', true)}
                           disabled={isSwitchingWallet || isCurrentWallet}
                           type="button"
                         >
@@ -2119,7 +2299,7 @@
                         {#if !isCurrentWallet}
                           <button
                             class="absolute top-1 right-1 p-1 rounded bg-red-100 hover:bg-red-200 text-red-600 opacity-0 group-hover:opacity-100 transition-opacity"
-                            on:click={(e) => deleteWalletFromSwitcher(address, e)}
+                            on:click={(e) => requestDeleteWalletFromSwitcher(address, e)}
                             disabled={isSwitchingWallet}
                             type="button"
                             title={tr('wallet.switcher.deleteWallet')}
@@ -2135,6 +2315,101 @@
                 </div>
               {/if}
             </div>
+
+            {#if showSwitcherPasswordPrompt}
+              <div class="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4">
+                <Card class="w-full max-w-sm p-6 space-y-4">
+                  <h3 class="text-lg font-semibold">
+                    {$t('wallet.wizard.enterPassword') === 'wallet.wizard.enterPassword'
+                      ? 'Enter wallet password'
+                      : $t('wallet.wizard.enterPassword')}
+                  </h3>
+                  <p class="text-sm text-muted-foreground">
+                    {$t('wallet.errors.passwordRequired') === 'wallet.errors.passwordRequired'
+                      ? 'Password required'
+                      : $t('wallet.errors.passwordRequired')}
+                  </p>
+                  <Input
+                    type="password"
+                    bind:value={switcherPasswordInput}
+                    placeholder={$t('placeholders.unlockPassword')}
+                  />
+                  {#if switcherPasswordError}
+                    <p class="text-sm text-red-500">{switcherPasswordError}</p>
+                  {/if}
+                  <div class="flex gap-2 justify-end">
+                    <Button variant="outline" on:click={() => { showSwitcherPasswordPrompt = false; pendingSwitcherAddress = null; switcherPasswordInput = ''; }}>Cancel</Button>
+                    <Button on:click={confirmSwitcherPassword} disabled={isSwitchingWallet}>
+                      {isSwitchingWallet
+                        ? ($t('actions.unlocking') === 'actions.unlocking' ? 'Unlocking...' : $t('actions.unlocking'))
+                        : ($t('wallet.wizard.unlockWallet') === 'wallet.wizard.unlockWallet' ? 'Unlock' : $t('wallet.wizard.unlockWallet'))}
+                    </Button>
+                  </div>
+                </Card>
+              </div>
+            {/if}
+
+            {#if showSwitcherDeleteConfirm}
+              <div class="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4">
+                <Card class="w-full max-w-sm p-6 space-y-4">
+                  <h3 class="text-lg font-semibold">{tr('wallet.switcher.deleteWallet')}</h3>
+                  {#if pendingSwitcherDeleteAddress}
+                    <p class="text-sm text-muted-foreground">
+                      {tr('wallet.switcher.deleteConfirm', { address: getWalletDisplayName(pendingSwitcherDeleteAddress) })}
+                    </p>
+                  {/if}
+                  <div class="flex gap-2 justify-end">
+                    <Button variant="outline" on:click={() => { showSwitcherDeleteConfirm = false; pendingSwitcherDeleteAddress = null; }}>Cancel</Button>
+                    <Button variant="destructive" on:click={deleteWalletFromSwitcher}>Delete</Button>
+                  </div>
+                </Card>
+              </div>
+            {/if}
+
+            {#if showKeystorePasswordPrompt}
+              <div class="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4">
+                <Card class="w-full max-w-sm p-6 space-y-4">
+                  <h3 class="text-lg font-semibold">
+                    {$t('wallet.wizard.enterPassword') === 'wallet.wizard.enterPassword'
+                      ? 'Enter wallet password'
+                      : $t('wallet.wizard.enterPassword')}
+                  </h3>
+                  <p class="text-sm text-muted-foreground">
+                    {$t('wallet.errors.passwordRequired') === 'wallet.errors.passwordRequired'
+                      ? 'Password required'
+                      : $t('wallet.errors.passwordRequired')}
+                  </p>
+                  <Input
+                    type="password"
+                    bind:value={loadKeystorePassword}
+                    autocomplete="current-password"
+                    placeholder={$t('placeholders.unlockPassword')}
+                  />
+                  <div class="flex items-center space-x-2">
+                    <input type="checkbox" id="remember-password-modal" bind:checked={rememberKeystorePassword} />
+                    <label for="remember-password-modal" class="text-sm font-medium leading-none text-muted-foreground cursor-pointer">
+                      {$t('keystore.load.savePassword')}
+                    </label>
+                  </div>
+                  {#if rememberKeystorePassword}
+                    <div class="text-xs text-orange-600 p-2 bg-orange-50 border border-orange-200 rounded-md">
+                      {$t('keystore.load.savePasswordWarning')}
+                    </div>
+                  {/if}
+                  {#if keystorePasswordPromptError}
+                    <p class="text-sm text-red-500">{keystorePasswordPromptError}</p>
+                  {/if}
+                  <div class="flex gap-2 justify-end">
+                    <Button variant="outline" on:click={() => { showKeystorePasswordPrompt = false; loadKeystorePassword = ''; }}>Cancel</Button>
+                    <Button on:click={confirmKeystorePassword} disabled={isLoadingFromKeystore}>
+                      {isLoadingFromKeystore
+                        ? ($t('actions.unlocking') === 'actions.unlocking' ? 'Unlocking...' : $t('actions.unlocking'))
+                        : ($t('wallet.wizard.unlockWallet') === 'wallet.wizard.unlockWallet' ? 'Unlock' : $t('wallet.wizard.unlockWallet'))}
+                    </Button>
+                  </div>
+                </Card>
+              </div>
+            {/if}
 
             <div class="mt-4">
               <p class="text-sm text-muted-foreground">{msg('wallet.privateKey', 'Private key')}</p>

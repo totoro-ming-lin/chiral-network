@@ -11,6 +11,7 @@
   import { walletService } from '$lib/wallet'
   import { getCachedBalance, setCachedBalance, formatRelativeTime } from '$lib/utils/keystoreBalanceCache'
   import { getWalletName, setWalletName, removeWalletName } from '$lib/utils/walletNameCache'
+  import { saveWalletMetadata, touchWalletLastUsed } from '$lib/utils/walletCache'
 
   export let onComplete: () => void
 
@@ -18,6 +19,7 @@
   let mode: 'welcome' | 'mnemonic' | 'import' = 'welcome'
   let importPrivateKey = ''
   let importWalletName = ''
+  let importWalletPassword = ''
   let isImportingAccount = false
   let importedSnapshot: any = null
   let showMnemonicRecovery = false
@@ -29,8 +31,12 @@
   let loadingKeystoreAccounts = false
   let isUnlockingAccount = false
 
-  // Default password for auto-saved wallets (empty string for simplicity)
-  const DEFAULT_KEYSTORE_PASSWORD = ''
+  let pendingKeystoreAddress: string | null = null
+  let keystorePasswordInput = ''
+  let keystorePasswordError = ''
+  let showKeystorePasswordPrompt = false
+  let pendingDeleteAddress: string | null = null
+  let showDeleteConfirm = false
 
   onMount(async () => {
     // Load keystore accounts on wizard open
@@ -42,7 +48,7 @@
     showMnemonicWizard = true
   }
 
-  async function handleMnemonicComplete(ev: { mnemonic: string, passphrase: string, account: { address: string, privateKeyHex: string, index: number, change: number }, name?: string }) {
+  async function handleMnemonicComplete(ev: { mnemonic: string, passphrase: string, account: { address: string, privateKeyHex: string, index: number, change: number }, name?: string, password?: string }) {
     try {
       // Import to backend to set as active account
       const { invoke } = await import('@tauri-apps/api/core')
@@ -59,15 +65,20 @@
         setWalletName(ev.account.address, ev.name)
       }
 
-      // Auto-save to keystore with default password
+      saveWalletMetadata(ev.account.address, {
+        name: ev.name,
+        source: 'create'
+      })
+
+      // Save to keystore with user-provided password (optional)
       try {
-        await walletService.saveToKeystore(DEFAULT_KEYSTORE_PASSWORD, {
+        await walletService.saveToKeystore(ev.password ?? '', {
           address: ev.account.address,
           private_key: privateKeyWithPrefix
         })
-        console.log('Auto-saved wallet to keystore')
+        console.log('Saved wallet to keystore')
       } catch (error) {
-        console.warn('Failed to auto-save to keystore:', error)
+        console.warn('Failed to save to keystore:', error)
       }
 
       // Reset mining state for new account
@@ -90,7 +101,16 @@
   async function handleCreateTestWallet() {
     try {
       // Create a regular account through backend
-      await walletService.createAccount()
+      const account = await walletService.createAccount()
+
+      try {
+        await walletService.saveToKeystore('', {
+          address: account.address,
+          private_key: account.private_key
+        })
+      } catch (error) {
+        console.warn('Failed to save test wallet to keystore:', error)
+      }
 
       // showToast('Test wallet "TestWallet" created!', 'success')
       showToast($t('toasts.account.firstRun.testWalletCreated'), 'success')
@@ -194,11 +214,16 @@
   }
 
   // Load selected keystore account (auto-unlock with default password)
-  async function loadSelectedKeystoreAccount(address: string) {
+  function isPasswordError(error: unknown): boolean {
+    const message = String(error).toLowerCase()
+    return message.includes('password') || message.includes('decrypt') || message.includes('keystore')
+  }
+
+  async function loadSelectedKeystoreAccount(address: string, password: string, allowPrompt = false): Promise<boolean> {
     isUnlockingAccount = true
 
     try {
-      const account = await walletService.loadFromKeystore(address, DEFAULT_KEYSTORE_PASSWORD)
+      const account = await walletService.loadFromKeystore(address, password)
 
       // Update stores
       wallet.update(w => ({
@@ -212,28 +237,57 @@
       await walletService.refreshBalance()
       walletService.startProgressiveLoading()
 
+      touchWalletLastUsed(account.address)
+
+      touchWalletLastUsed(account.address)
+
       // Show success and complete wizard
       showToast(msg('wallet.wizard.unlockSuccess', 'Wallet loaded successfully'), 'success')
       onComplete()
+      return true
 
     } catch (error) {
       console.error('Failed to load keystore account:', error)
+      if (allowPrompt && isPasswordError(error)) {
+        pendingKeystoreAddress = address
+        keystorePasswordInput = ''
+        keystorePasswordError = ''
+        showKeystorePasswordPrompt = true
+        return false
+      }
+      if (showKeystorePasswordPrompt && isPasswordError(error)) {
+        keystorePasswordError = msg('wallet.errors.loadFailed', 'Failed to load wallet. It may have been saved with a password.')
+        return false
+      }
       const errorMsg = msg('wallet.errors.loadFailed', 'Failed to load wallet. It may have been saved with a password.')
       showToast(errorMsg, 'error')
+      return false
     } finally {
       isUnlockingAccount = false
     }
   }
 
+  async function confirmKeystorePassword() {
+    if (!pendingKeystoreAddress) return
+    keystorePasswordError = ''
+    const success = await loadSelectedKeystoreAccount(pendingKeystoreAddress, keystorePasswordInput, false)
+    if (success) {
+      showKeystorePasswordPrompt = false
+      pendingKeystoreAddress = null
+      keystorePasswordInput = ''
+    }
+  }
+
   // Delete wallet from keystore
-  async function deleteWallet(address: string, event: MouseEvent) {
-    event.stopPropagation() // Prevent card click
+  function requestDeleteWallet(address: string, event: MouseEvent) {
+    event.stopPropagation()
+    pendingDeleteAddress = address
+    showDeleteConfirm = true
+  }
 
-    const displayName = getWalletDisplayName(address)
-    const confirmMsg = msg('wallet.wizard.deleteConfirm', `Delete wallet "${displayName}"? This cannot be undone.`)
-
-    if (!confirm(confirmMsg)) return
-
+  async function deleteWallet() {
+    if (!pendingDeleteAddress) return
+    const address = pendingDeleteAddress
     try {
       await walletService.deleteKeystoreAccount(address)
 
@@ -247,6 +301,9 @@
     } catch (error) {
       console.error('Failed to delete wallet:', error)
       showToast(msg('wallet.errors.deleteFailed', 'Failed to delete wallet'), 'error')
+    } finally {
+      pendingDeleteAddress = null
+      showDeleteConfirm = false
     }
   }
 
@@ -325,15 +382,20 @@
         setWalletName(account.address, importWalletName.trim())
       }
 
-      // Auto-save to keystore with default password
+      saveWalletMetadata(account.address, {
+        name: importWalletName.trim() || undefined,
+        source: 'import'
+      })
+
+      // Save to keystore with user-provided password (optional)
       try {
-        await walletService.saveToKeystore(DEFAULT_KEYSTORE_PASSWORD, {
+        await walletService.saveToKeystore(importWalletPassword, {
           address: account.address,
           private_key: normalized
         })
-        console.log('Auto-saved imported wallet to keystore')
+        console.log('Saved imported wallet to keystore')
       } catch (error) {
-        console.warn('Failed to auto-save to keystore:', error)
+        console.warn('Failed to save to keystore:', error)
       }
 
       // If we loaded a snapshot from file, hydrate wallet/txs immediately
@@ -360,6 +422,7 @@
       walletService.startProgressiveLoading()
       importPrivateKey = ''
       importWalletName = ''  // Clear name input
+      importWalletPassword = ''
       importedSnapshot = null
       showToast(msg('account.firstRun.importSuccess', 'Wallet imported successfully'), 'success')
       mode = 'welcome'
@@ -372,7 +435,7 @@
     }
   }
 
-  async function handleMnemonicRecovery(ev: { mnemonic: string, passphrase: string, account: { address: string, privateKeyHex: string, index: number, change: number }, name?: string }) {
+  async function handleMnemonicRecovery(ev: { mnemonic: string, passphrase: string, account: { address: string, privateKeyHex: string, index: number, change: number }, name?: string, password?: string }) {
     try {
       // Import to backend to set as active account
       const { invoke } = await import('@tauri-apps/api/core')
@@ -389,15 +452,20 @@
         setWalletName(ev.account.address, ev.name)
       }
 
-      // Auto-save to keystore with default password
+      saveWalletMetadata(ev.account.address, {
+        name: ev.name,
+        source: 'import'
+      })
+
+      // Save to keystore with user-provided password (optional)
       try {
-        await walletService.saveToKeystore(DEFAULT_KEYSTORE_PASSWORD, {
+        await walletService.saveToKeystore(ev.password ?? '', {
           address: ev.account.address,
           private_key: privateKeyWithPrefix
         })
-        console.log('Auto-saved recovered wallet to keystore')
+        console.log('Saved recovered wallet to keystore')
       } catch (error) {
-        console.warn('Failed to auto-save to keystore:', error)
+        console.warn('Failed to save to keystore:', error)
       }
 
       // Reset mining state for recovered account
@@ -442,6 +510,7 @@
               : $t('wallet.wizard.existingWallets')}
           </h3>
 
+
           {#if loadingKeystoreAccounts}
             <div class="text-center py-4">
               <div class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
@@ -460,7 +529,7 @@
                 <Card class="transition-all hover:border-primary/50 cursor-pointer relative group">
                   <button
                     class="w-full text-left p-4"
-                    on:click={() => loadSelectedKeystoreAccount(address)}
+                    on:click={() => loadSelectedKeystoreAccount(address, '', true)}
                     disabled={isUnlockingAccount}
                     type="button"
                   >
@@ -498,7 +567,7 @@
                   <!-- Delete button (top-right corner) -->
                   <button
                     class="absolute top-2 right-2 p-1.5 rounded-full bg-red-100 hover:bg-red-200 text-red-600 opacity-0 group-hover:opacity-100 transition-opacity duration-200"
-                    on:click={(e) => deleteWallet(address, e)}
+                    on:click={(e) => requestDeleteWallet(address, e)}
                     disabled={isUnlockingAccount}
                     type="button"
                     aria-label={$t('wallet.wizard.deleteWallet') === 'wallet.wizard.deleteWallet' ? 'Delete wallet' : $t('wallet.wizard.deleteWallet')}
@@ -609,6 +678,23 @@
           />
         </div>
 
+        <!-- Wallet Password Input -->
+        <div class="flex flex-col gap-2">
+          <label for="import-wallet-password" class="text-sm font-medium">
+            {$t('wallet.wizard.passwordOptional') === 'wallet.wizard.passwordOptional'
+              ? 'Password (optional)'
+              : $t('wallet.wizard.passwordOptional')}
+          </label>
+          <Input
+            id="import-wallet-password"
+            type="password"
+            bind:value={importWalletPassword}
+            placeholder={$t('wallet.wizard.passwordPlaceholder') === 'wallet.wizard.passwordPlaceholder'
+              ? 'Leave empty if none'
+              : $t('wallet.wizard.passwordPlaceholder')}
+          />
+        </div>
+
         <!-- Private Key Input -->
         <div class="flex flex-col gap-2">
           <Input
@@ -663,6 +749,7 @@
           on:click={() => {
             mode = 'welcome'
             importPrivateKey = ''
+            importWalletPassword = ''
           }}
         >
           {$t('account.firstRun.backToCreate') === 'account.firstRun.backToCreate'
@@ -689,6 +776,60 @@
     onComplete={handleMnemonicRecovery}
     onCancel={() => showMnemonicRecovery = false}
   />
+{/if}
+
+{#if showKeystorePasswordPrompt}
+  <div class="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <Card class="w-full max-w-sm p-6 space-y-4">
+      <h3 class="text-lg font-semibold">
+        {$t('wallet.wizard.enterPassword') === 'wallet.wizard.enterPassword'
+          ? 'Enter wallet password'
+          : $t('wallet.wizard.enterPassword')}
+      </h3>
+      <p class="text-sm text-muted-foreground">
+        {$t('wallet.errors.passwordRequired') === 'wallet.errors.passwordRequired'
+          ? 'Password required'
+          : $t('wallet.errors.passwordRequired')}
+      </p>
+      <Input
+        type="password"
+        bind:value={keystorePasswordInput}
+        placeholder={$t('placeholders.unlockPassword')}
+      />
+      {#if keystorePasswordError}
+        <p class="text-sm text-red-500">{keystorePasswordError}</p>
+      {/if}
+      <div class="flex gap-2 justify-end">
+        <Button variant="outline" on:click={() => { showKeystorePasswordPrompt = false; pendingKeystoreAddress = null; keystorePasswordInput = ''; }}>Cancel</Button>
+        <Button on:click={confirmKeystorePassword} disabled={isUnlockingAccount}>
+          {isUnlockingAccount
+            ? ($t('actions.unlocking') === 'actions.unlocking' ? 'Unlocking...' : $t('actions.unlocking'))
+            : ($t('wallet.wizard.unlockWallet') === 'wallet.wizard.unlockWallet' ? 'Unlock' : $t('wallet.wizard.unlockWallet'))}
+        </Button>
+      </div>
+    </Card>
+  </div>
+{/if}
+
+{#if showDeleteConfirm}
+  <div class="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <Card class="w-full max-w-sm p-6 space-y-4">
+      <h3 class="text-lg font-semibold">
+        {$t('wallet.wizard.deleteWallet') === 'wallet.wizard.deleteWallet'
+          ? 'Delete wallet'
+          : $t('wallet.wizard.deleteWallet')}
+      </h3>
+      {#if pendingDeleteAddress}
+        <p class="text-sm text-muted-foreground">
+          {msg('wallet.wizard.deleteConfirm', `Delete wallet "${getWalletDisplayName(pendingDeleteAddress)}"? This cannot be undone.`)}
+        </p>
+      {/if}
+      <div class="flex gap-2 justify-end">
+        <Button variant="outline" on:click={() => { showDeleteConfirm = false; pendingDeleteAddress = null; }}>Cancel</Button>
+        <Button variant="destructive" on:click={deleteWallet}>Delete</Button>
+      </div>
+    </Card>
+  </div>
 {/if}
 
 <style>

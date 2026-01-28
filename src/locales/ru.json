@@ -576,7 +576,9 @@
       "unlockSuccess": "Кошелек успешно разблокирован",
       "orCreateImport": "Или",
       "walletName": "Название Кошелька (необязательно)",
-      "walletNamePlaceholder": "например, Основной Кошелек"
+      "walletNamePlaceholder": "например, Основной Кошелек",
+      "passwordOptional": "Пароль (необязательно)",
+      "passwordPlaceholder": "Оставьте пустым, если нет"
     },
     "errors": {
       "loadKeystoreFailed": "Не удалось загрузить сохраненные кошельки",

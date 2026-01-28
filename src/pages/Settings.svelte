@@ -444,6 +444,8 @@
     }
   if (isTauri) {
       try {
+        console.log("saving settings");
+        console.log(localSettings)
         await invoke("save_app_settings", {
           settingsJson: JSON.stringify(localSettings),
         });

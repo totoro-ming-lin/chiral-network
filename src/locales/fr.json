@@ -595,7 +595,9 @@
       "unlockSuccess": "Portefeuille déverrouillé avec succès",
       "orCreateImport": "Ou",
       "walletName": "Nom du Portefeuille (facultatif)",
-      "walletNamePlaceholder": "ex. Portefeuille Principal"
+      "walletNamePlaceholder": "ex. Portefeuille Principal",
+      "passwordOptional": "Mot de passe (facultatif)",
+      "passwordPlaceholder": "Laissez vide si aucun"
     },
     "errors": {
       "loadKeystoreFailed": "Échec du chargement des portefeuilles enregistrés",

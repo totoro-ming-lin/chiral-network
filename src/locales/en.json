@@ -629,6 +629,8 @@
       "orCreateImport": "Or",
       "walletName": "Wallet Name (optional)",
       "walletNamePlaceholder": "e.g., Main Wallet",
+      "passwordOptional": "Password (optional)",
+      "passwordPlaceholder": "Leave empty if none",
       "deleteWallet": "Delete wallet",
       "deleteConfirm": "Delete wallet \"{name}\"? This cannot be undone.",
       "deleteSuccess": "Wallet deleted successfully"

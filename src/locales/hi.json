@@ -596,7 +596,9 @@
       "unlockSuccess": "वॉलेट सफलतापूर्वक अनलॉक किया गया",
       "orCreateImport": "या",
       "walletName": "वॉलेट का नाम (वैकल्पिक)",
-      "walletNamePlaceholder": "उदा. मुख्य वॉलेट"
+      "walletNamePlaceholder": "उदा. मुख्य वॉलेट",
+      "passwordOptional": "पासवर्ड (वैकल्पिक)",
+      "passwordPlaceholder": "यदि नहीं है तो खाली छोड़ें"
     },
     "errors": {
       "loadKeystoreFailed": "सहेजे गए वॉलेट लोड करने में विफल",

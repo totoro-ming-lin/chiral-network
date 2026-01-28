@@ -417,61 +417,6 @@
       }
 
       if (DEV) console.log(`[DownloadSearchSection] seeder_file_info #${seederIndex}`);
-
-      // If the DHT record didn't include Bitswap CIDs (common when metadata is built progressively),
-      // hydrate them from seeder protocol details so downloads can start.
-      if (latestMetadata && protocolDetails) {
-        const next = { ...latestMetadata } as any;
-        let changed = false;
-
-        // Bitswap requires CIDs; seed them as soon as we learn them.
-        if (
-          (!next.cids || next.cids.length === 0) &&
-          Array.isArray(protocolDetails.cids) &&
-          protocolDetails.cids.length > 0
-        ) {
-          next.cids = protocolDetails.cids;
-          changed = true;
-          // Default to root=true when we only have a root CID list.
-          if (typeof next.isRoot !== 'boolean') {
-            next.isRoot = true;
-            changed = true;
-          }
-        }
-
-        // Fill in other protocol-specific fields opportunistically.
-        if (!next.httpSources && Array.isArray(protocolDetails.httpSources) && protocolDetails.httpSources.length > 0) {
-          next.httpSources = protocolDetails.httpSources;
-          changed = true;
-        }
-        if (!next.ftpSources && Array.isArray(protocolDetails.ftpSources) && protocolDetails.ftpSources.length > 0) {
-          next.ftpSources = protocolDetails.ftpSources;
-          changed = true;
-        }
-        if (!next.ed2kSources && Array.isArray(protocolDetails.ed2kSources) && protocolDetails.ed2kSources.length > 0) {
-          next.ed2kSources = protocolDetails.ed2kSources;
-          changed = true;
-        }
-        if (!next.infoHash && typeof protocolDetails.infoHash === 'string' && protocolDetails.infoHash.trim().length > 0) {
-          next.infoHash = protocolDetails.infoHash;
-          changed = true;
-        }
-        if (!next.trackers && Array.isArray(protocolDetails.trackers) && protocolDetails.trackers.length > 0) {
-          next.trackers = protocolDetails.trackers;
-          changed = true;
-        }
-
-        if (changed) {
-          latestMetadata = next;
-          console.log('✅ Hydrated metadata from seeder_file_info:', {
-            cids: next.cids?.length || 0,
-            httpSources: next.httpSources?.length || 0,
-            ftpSources: next.ftpSources?.length || 0,
-            ed2kSources: next.ed2kSources?.length || 0,
-            infoHash: next.infoHash ? 'set' : 'unset'
-          });
-        }
-      }
     }));
 
     unlisteners.push(await listen('search_complete', (event: any) => {
@@ -1027,7 +972,7 @@
     console.log('🔍 getAvailableProtocols called with metadata:', metadata);
     console.log('🔍 progressiveSearchState.seeders:', progressiveSearchState.seeders);
 
-    // Collect all protocols reported by seeders
+    // Collect protocols reported by seeders (from protocolDetails)
     const reportedProtocols = new Set<string>();
     for (const seeder of progressiveSearchState.seeders) {
       if (seeder.protocols && seeder.protocols.length > 0) {
@@ -1039,68 +984,42 @@
 
     console.log('🔍 Seeder-reported protocols:', Array.from(reportedProtocols));
 
-    // Also check metadata fields as fallback for backwards compatibility
-    const hasInfoHash = !!metadata.infoHash;
-    const hasHttpSources = !!(metadata.httpSources && metadata.httpSources.length > 0);
-    const hasFtpSources = !!(metadata.ftpSources && metadata.ftpSources.length > 0);
-    const hasEd2kSources = !!(metadata.ed2kSources && metadata.ed2kSources.length > 0);
-    const hasCids = !!(metadata.cids && metadata.cids.length > 0);
-
-    console.log('🔍 Metadata fields:', { hasInfoHash, hasHttpSources, hasFtpSources, hasEd2kSources, hasCids });
-
-    // Determine availability: use seeder-reported protocols if available, otherwise fall back to metadata detection
-    const isBitSwapAvailable = reportedProtocols.has('bitswap') || (reportedProtocols.size === 0 && hasCids);
-    const isWebRTCAvailable = reportedProtocols.has('webrtc') || (reportedProtocols.size === 0 && metadata.seeders && metadata.seeders.length > 0 && !hasInfoHash && !hasHttpSources && !hasFtpSources && !hasEd2kSources);
-    const isBitTorrentAvailable = reportedProtocols.has('bittorrent') || (reportedProtocols.size === 0 && hasInfoHash);
-    const isHttpAvailable = reportedProtocols.has('http') || (reportedProtocols.size === 0 && hasHttpSources);
-    const isEd2kAvailable = reportedProtocols.has('ed2k') || (reportedProtocols.size === 0 && hasEd2kSources);
-    const isFtpAvailable = reportedProtocols.has('ftp') || (reportedProtocols.size === 0 && hasFtpSources);
-
-    console.log('🔍 Protocol availability:', {
-      bitswap: isBitSwapAvailable,
-      webrtc: isWebRTCAvailable,
-      bittorrent: isBitTorrentAvailable,
-      http: isHttpAvailable,
-      ed2k: isEd2kAvailable,
-      ftp: isFtpAvailable
-    });
-
     return [
       {
         id: 'bitswap',
         name: 'BitSwap',
         description: 'Content-addressed P2P (IPFS)',
-        available: isBitSwapAvailable
+        available: reportedProtocols.has('bitswap')
       },
       {
         id: 'webrtc',
         name: 'WebRTC',
         description: 'Peer-to-peer via WebRTC',
-        available: isWebRTCAvailable
+        available: reportedProtocols.has('webrtc')
       },
       {
         id: 'http',
         name: 'HTTP',
         description: 'Direct HTTP download',
-        available: isHttpAvailable
+        available: reportedProtocols.has('http')
       },
       {
         id: 'bittorrent',
         name: 'BitTorrent',
         description: 'BitTorrent protocol',
-        available: isBitTorrentAvailable
+        available: reportedProtocols.has('bittorrent')
       },
       {
         id: 'ed2k',
         name: 'ED2K',
         description: 'ED2K protocol',
-        available: isEd2kAvailable
+        available: reportedProtocols.has('ed2k')
       },
       {
         id: 'ftp',
         name: 'FTP',
         description: 'FTP protocol',
-        available: isFtpAvailable
+        available: reportedProtocols.has('ftp')
       }
     ];
   }
@@ -1164,93 +1083,17 @@
     console.log('🔍 DEBUG: protocolId:', protocolId);
     console.log('🔍 DEBUG: metadata.seeders:', metadata.seeders);
     
-    // Handle HTTP and ED2K direct downloads (no peer selection)
-    if (protocolId === 'http' || protocolId === 'ed2k') {
-      console.log('🔍 DEBUG: Using direct download for protocol:', protocolId);
-      await startDirectDownload(metadata, protocolId);
+    // Check if there are any seeders
+    if (!metadata.seeders || metadata.seeders.length === 0) {
+      pushMessage('No seeders available for this file', 'warning');
       return;
     }
 
-    // Handle FTP - show source selection modal
-    if (protocolId === 'ftp') {
-      if (!metadata.ftpSources || metadata.ftpSources.length === 0) {
-        pushMessage('No FTP sources available for this file', 'warning');
-        return;
-      }
-
-      selectedFile = metadata;
-      selectedProtocol = 'ftp';
-      
-      // Create "peers" from FTP sources
-      availablePeers = metadata.ftpSources.map((source, index) => {
-        // Extract host from FTP URL
-        let host = 'FTP Server';
-        try {
-          const url = new URL(source.url);
-          host = url.hostname;
-        } catch {}
-        
-        return {
-          peerId: source.url, // Use URL as the ID
-          location: host,
-          latency_ms: undefined,
-          bandwidth_kbps: undefined,
-          reliability_score: source.isAvailable ? 1.0 : 0.0,
-          price_per_mb: 0, // FTP is free
-          selected: index === 0, // Select first by default
-          percentage: index === 0 ? 100 : 0
-        };
-      });
-
-      showPeerSelectionModal = true;
-      return;
-    }
-
-    // For P2P protocols (WebRTC, BitSwap, BitTorrent) - need peer selection
-    if (protocolId === 'webrtc' || protocolId === 'bitswap' || protocolId === 'bittorrent') {
-      // Check if there are any seeders
-      if (!metadata.seeders || metadata.seeders.length === 0) {
-        pushMessage('No seeders available for this file', 'warning');
-        return;
-      }
-
-      // Proceed with peer selection for P2P protocols
-      await proceedWithPeerSelection(metadata);
-    }
+    // All protocols go through peer selection
+    await proceedWithPeerSelection(metadata);
   }
 
-  // Start direct download for HTTP/FTP/ED2K protocols
-  async function startDirectDownload(metadata: FileMetadata, protocolId: string) {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-
-      if (protocolId === 'http' && metadata.httpSources && metadata.httpSources.length > 0) {
-        await invoke('download_file_http', {
-          seeder_url: metadata.httpSources[0],
-          merkle_root: metadata.merkleRoot || metadata.fileHash,
-          output_path: `./downloads/${metadata.fileName}`,
-          peer_id: null
-        });
-        pushMessage('HTTP download started', 'success');
-      } else if (protocolId === 'ftp' && metadata.ftpSources && metadata.ftpSources.length > 0) {
-        await invoke('download_ftp', { url: metadata.ftpSources[0].url });
-        pushMessage('FTP download started', 'success');
-      } else if (protocolId === 'ed2k' && metadata.ed2kSources && metadata.ed2kSources.length > 0) {
-        // Construct ED2K file link from source info: ed2k://|file|name|size|hash|/
-        const ed2kSource = metadata.ed2kSources[0];
-        const ed2kLink = `ed2k://|file|${metadata.fileName}|${metadata.fileSize}|${ed2kSource.file_hash}|/`;
-        await invoke('download_ed2k', { link: ed2kLink });
-        pushMessage('ED2K download started', 'success');
-      } else {
-        pushMessage(`No ${protocolId.toUpperCase()} sources available`, 'warning');
-      }
-    } catch (error) {
-      console.error(`Failed to start ${protocolId} download:`, error);
-      pushMessage(`Failed to start ${protocolId.toUpperCase()} download: ${String(error)}`, 'error');
-    }
-  }
-
-  // Proceed with peer selection for P2P protocols
+  // Proceed with peer selection for all protocols
   async function proceedWithPeerSelection(metadata: FileMetadata) {
     if (DEV) {
       console.log('[DownloadSearchSection] proceedWithPeerSelection', {
@@ -1380,32 +1223,79 @@
   async function confirmPeerSelection() {
     if (!selectedFile) return;
 
-    // Handle FTP downloads from peer selection modal
-    if (selectedProtocol === 'ftp') {
-      const selectedSource = availablePeers.find(p => p.selected);
-      if (!selectedSource) {
-        pushMessage('Please select an FTP source', 'warning');
+    // Get selected peers
+    const selectedPeerIds = availablePeers
+      .filter(p => p.selected)
+      .map(p => p.peerId);
+
+    // For FTP/HTTP/ED2K, extract sources from selected peer's protocol details
+    if (selectedProtocol === 'ftp' || selectedProtocol === 'http' || selectedProtocol === 'ed2k') {
+      // Find a selected peer that supports the chosen protocol
+      const selectedSeeder = progressiveSearchState.seeders.find(s => {
+        if (!selectedPeerIds.includes(s.peerId)) return false;
+        if (!s.protocols || !s.protocolDetails) return false;
+
+        // Check if this peer supports the selected protocol
+        const supportsProtocol = s.protocols.some(p => p.toLowerCase() === selectedProtocol);
+        return supportsProtocol;
+      });
+
+      if (!selectedSeeder) {
+        pushMessage(`None of the selected peers support ${selectedProtocol.toUpperCase()}. Please select a peer that supports this protocol.`, 'warning');
+        return;
+      }
+
+      if (!selectedSeeder.protocolDetails) {
+        pushMessage('Selected peer does not have protocol details', 'error');
         return;
       }
 
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        await invoke('download_ftp', { url: selectedSource.peerId }); // peerId is the FTP URL
-        
+
+        if (selectedProtocol === 'ftp') {
+          const ftpDetails = selectedSeeder.protocolDetails.ftp;
+          if (!ftpDetails || !ftpDetails.sources || ftpDetails.sources.length === 0) {
+            pushMessage('Selected peer has no FTP sources', 'warning');
+            return;
+          }
+
+          await invoke('download_ftp', { url: ftpDetails.sources[0].url });
+          pushMessage('FTP download started', 'success');
+        } else if (selectedProtocol === 'http') {
+          const httpDetails = selectedSeeder.protocolDetails.http;
+          if (!httpDetails || !httpDetails.sources || httpDetails.sources.length === 0) {
+            pushMessage('Selected peer has no HTTP sources', 'warning');
+            return;
+          }
+
+          await invoke('download_file_http', {
+            seeder_url: httpDetails.sources[0].url,
+            merkle_root: selectedFile.merkleRoot || selectedFile.fileHash,
+            output_path: `./downloads/${selectedFile.fileName}`,
+            peer_id: selectedSeeder.peerId
+          });
+          pushMessage('HTTP download started', 'success');
+        } else if (selectedProtocol === 'ed2k') {
+          const ed2kDetails = selectedSeeder.protocolDetails.ed2k;
+          if (!ed2kDetails || !ed2kDetails.sources || ed2kDetails.sources.length === 0) {
+            pushMessage('Selected peer has no ED2K sources', 'warning');
+            return;
+          }
+
+          const ed2kLink = `ed2k://|file|${selectedFile.fileName}|${selectedFile.fileSize}|${ed2kDetails.sources[0].fileHash}|/`;
+          await invoke('download_ed2k', { link: ed2kLink });
+          pushMessage('ED2K download started', 'success');
+        }
+
         showPeerSelectionModal = false;
         selectedFile = null;
-        pushMessage('FTP download started', 'success');
+        return;
       } catch (error) {
-        console.error('Failed to start FTP download:', error);
-        pushMessage(`Failed to start FTP download: ${String(error)}`, 'error');
+        console.error(`Failed to start ${selectedProtocol} download:`, error);
+        pushMessage(`Failed to start download: ${String(error)}`, 'error');
+        return;
       }
-      return;
-    }
-
-    // Handle direct downloads (HTTP, ED2K) that skip peer selection
-    if (selectedProtocol === 'http' || selectedProtocol === 'ed2k') {
-      // This shouldn't happen since direct downloads bypass peer selection
-      return;
     }
 
     // Handle BitTorrent downloads from search
@@ -1757,6 +1647,7 @@
   isTorrent={pendingTorrentType !== null}
   {availableProtocols}
   isSeeding={selectedFileIsSeeding}
+  seederDetails={progressiveSearchState.seeders}
   on:confirm={confirmPeerSelection}
   on:cancel={cancelPeerSelection}
 />

@@ -468,7 +468,9 @@
       "unlockSuccess": "Billetera desbloqueada con éxito",
       "orCreateImport": "O",
       "walletName": "Nombre de Billetera (opcional)",
-      "walletNamePlaceholder": "ej., Billetera Principal"
+      "walletNamePlaceholder": "ej., Billetera Principal",
+      "passwordOptional": "Contraseña (opcional)",
+      "passwordPlaceholder": "Deja vacío si no hay"
     },
     "errors": {
       "loadKeystoreFailed": "Error al cargar billeteras guardadas",

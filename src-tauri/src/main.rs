@@ -38,7 +38,8 @@ pub mod webhook_manager;
 use chiral_network::{
     analytics, bandwidth, bittorrent_handler, dht, download_restart, download_source, ed2k_client,
     encryption, file_transfer, ftp_bookmarks, ftp_client, http_download, keystore, logger, manager,
-    multi_source_download, peer_selection, protocols, reputation, stream_auth, webrtc_service,
+    multi_source_download, peer_selection, protocol_manager, protocols, reputation, stream_auth,
+    webrtc_service,
 };
 use headless::create_dht_config_from_args;
 
@@ -148,11 +149,12 @@ use x25519_dalek::{PublicKey, StaticSecret}; // For key handling
                                              // Settings structure for backend use
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackendSettings {
-    #[serde(rename = "storagePath")]
+    // Storage settings
+    #[serde(default, rename = "storagePath")]
     storage_path: String,
-    #[serde(rename = "enableFileLogging")]
+    #[serde(default, rename = "enableFileLogging")]
     enable_file_logging: bool,
-    #[serde(rename = "maxLogSizeMB")]
+    #[serde(default, rename = "maxLogSizeMB")]
     max_log_size_mb: u64,
     #[serde(rename = "maxStorageSize")]
     max_storage_size: Option<u64>, // GB
@@ -162,11 +164,50 @@ struct BackendSettings {
     cleanup_threshold: Option<u64>, // %
     #[serde(rename = "cacheSize")]
     cache_size: Option<u64>, // MB
+
+    // Network / DHT settings (read from Settings.svelte persisted settings.json)
+    #[serde(rename = "port")]
+    port: Option<u16>,
+    #[serde(rename = "enableAutonat")]
+    enable_autonat: Option<bool>,
+    #[serde(rename = "disableDirectNatTraversal")]
+    disable_direct_nat_traversal: Option<bool>,
+    #[serde(rename = "autonatProbeInterval")]
+    autonat_probe_interval: Option<u64>,
+    #[serde(rename = "autonatServers")]
+    autonat_servers: Option<Vec<String>>,
+    #[serde(rename = "enableAutorelay")]
+    enable_autorelay: Option<bool>,
+    #[serde(rename = "enableRelayServer")]
+    enable_relay_server: Option<bool>,
+    #[serde(rename = "enableUPnP")]
+    enable_upnp: Option<bool>,
+    #[serde(rename = "pureClientMode")]
+    pure_client_mode: Option<bool>,
+    #[serde(rename = "forceServerMode")]
+    force_server_mode: Option<bool>,
+    #[serde(rename = "customBootstrapNodes")]
+    custom_bootstrap_nodes: Option<Vec<String>>,
+    #[serde(rename = "preferredRelays")]
+    preferred_relays: Option<Vec<String>>,
+    #[serde(rename = "trustedProxyRelays")]
+    trusted_proxy_relays: Option<Vec<String>>,
+    #[serde(rename = "ipPrivacyMode")]
+    ip_privacy_mode: Option<String>,
+    #[serde(rename = "enableProxy")]
+    enable_proxy: Option<bool>,
+    #[serde(rename = "proxyAddress")]
+    proxy_address: Option<String>,
+    #[serde(rename = "chunkSize")]
+    chunk_size: Option<usize>,
+    #[serde(rename = "autoStartDHT")]
+    auto_start_dht: Option<bool>,
 }
 
 impl Default for BackendSettings {
     fn default() -> Self {
         Self {
+            // Storage defaults
             storage_path: "".to_string(), // No hardcoded default - get_download_directory handles this
             enable_file_logging: false,
             max_log_size_mb: 10,
@@ -174,8 +215,228 @@ impl Default for BackendSettings {
             auto_cleanup: Some(true),
             cleanup_threshold: Some(90), // 90% default
             cache_size: Some(1024),      // 1024 MB default
+
+            // Network defaults (None = use DHT service defaults)
+            port: None,
+            enable_autonat: None,
+            disable_direct_nat_traversal: None,
+            autonat_probe_interval: None,
+            autonat_servers: None,
+            enable_autorelay: None,
+            enable_relay_server: None,
+            enable_upnp: None,
+            pure_client_mode: None,
+            force_server_mode: None,
+            custom_bootstrap_nodes: None,
+            preferred_relays: None,
+            trusted_proxy_relays: None,
+            ip_privacy_mode: None,
+            enable_proxy: None,
+            proxy_address: None,
+            chunk_size: None,
+            auto_start_dht: None,
         }
     }
+}
+
+/// Load settings from a specific directory path
+/// This should be called with Tauri's app.path().app_data_dir() in setup()
+fn load_settings_from_path(app_data_dir: &std::path::Path) -> BackendSettings {
+    let settings_file = app_data_dir.join("settings.json");
+
+    if !settings_file.exists() {
+        info!(
+            "No settings file found at {:?}, using defaults",
+            settings_file
+        );
+        return BackendSettings::default();
+    }
+
+    match std::fs::read_to_string(&settings_file)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<BackendSettings>(&contents).ok())
+    {
+        Some(mut settings) => {
+            settings.enable_proxy = Some(false);
+            settings.enable_upnp = Some(false);
+            settings.proxy_address = Some("".to_string());
+            settings.custom_bootstrap_nodes = None;
+            settings.enable_autonat = None;
+            settings.enable_autorelay = None;
+            settings.enable_relay_server = None;
+            warn!("Proxy and UPNP not supported");
+            info!("Loaded settings from {:?}", settings_file);
+            settings
+        }
+        None => {
+            warn!(
+                "Failed to parse settings from {:?}, using defaults",
+                settings_file
+            );
+            BackendSettings::default()
+        }
+    }
+}
+
+/// Initialize DHT and related network services with proper settings
+/// This should be called from Tauri's setup() hook after loading settings
+async fn initialize_network_services(
+    app_data_dir: &std::path::Path,
+    settings: &BackendSettings,
+    instance_suffix: &str,
+) -> Result<
+    (
+        Arc<DhtService>,
+        Arc<bittorrent_handler::BitTorrentHandler>,
+        Arc<chiral_network::ftp_server::FtpServer>,
+        Arc<ProtocolManager>,
+        protocols::ftp::EventBusHolder,
+    ),
+    String,
+> {
+    info!("Initializing network services...");
+
+    // Determine DHT port from settings or environment
+    let env_dht_port = std::env::var("CHIRAL_DHT_PORT")
+        .or_else(|_| std::env::var("CHIRAL_P2P_PORT"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok());
+    let dht_port: u16 = env_dht_port.or(settings.port).unwrap_or(4001);
+
+    // Build DHT config from settings
+    let bootstrap_nodes = match settings.custom_bootstrap_nodes.clone() {
+        Some(nodes) if !nodes.is_empty() => nodes,
+        _ => get_bootstrap_nodes(),
+    };
+
+    let enable_autonat = match settings.disable_direct_nat_traversal {
+        Some(disabled) => !disabled,
+        None => settings.enable_autonat.unwrap_or(true),
+    };
+
+    let enable_autorelay = if settings.ip_privacy_mode.as_deref() != Some("off") {
+        true
+    } else {
+        settings.enable_autorelay.unwrap_or(true)
+    };
+
+    let autonat_probe_interval_secs = settings.autonat_probe_interval.unwrap_or(30);
+    let chunk_size_kb = settings.chunk_size.unwrap_or(256);
+    let cache_size_mb = settings
+        .cache_size
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(1024);
+    let enable_relay_server = settings.enable_relay_server.unwrap_or(false);
+    let enable_upnp = settings.enable_upnp.unwrap_or(true);
+    let pure_client_mode = settings.pure_client_mode.unwrap_or(false);
+    let force_server_mode = settings.force_server_mode.unwrap_or(false);
+    let autonat_servers = settings
+        .autonat_servers
+        .clone()
+        .unwrap_or_else(|| bootstrap_nodes.clone());
+
+    let preferred_relays = match settings.trusted_proxy_relays.clone() {
+        Some(relays) if !relays.is_empty() => relays,
+        _ => settings.preferred_relays.clone().unwrap_or_default(),
+    };
+
+    let proxy_address = if settings.enable_proxy.unwrap_or(false) {
+        settings
+            .proxy_address
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let blockstore_db_path = app_data_dir.join("blockstore_db");
+    let async_blockstore_path = async_std::path::Path::new(blockstore_db_path.as_os_str());
+
+    info!(
+        "Initializing DHT service with port {} and {} bootstrap nodes",
+        dht_port,
+        bootstrap_nodes.len()
+    );
+
+    let dht_config = DhtConfig::builder()
+        .port(dht_port)
+        .bootstrap_nodes(bootstrap_nodes)
+        .enable_autonat(enable_autonat)
+        .autonat_probe_interval(Duration::from_secs(autonat_probe_interval_secs))
+        .chunk_size_kb(chunk_size_kb)
+        .cache_size_mb(cache_size_mb)
+        .enable_autorelay(enable_autorelay)
+        .enable_relay_server(enable_relay_server)
+        .enable_upnp(enable_upnp)
+        .pure_client_mode(pure_client_mode)
+        .force_server_mode(force_server_mode)
+        .autonat_servers(autonat_servers)
+        .preferred_relays(preferred_relays)
+        .proxy_address(proxy_address)
+        .blockstore_db_path(async_blockstore_path)
+        .build();
+
+    let dht_service = DhtService::new(dht_config, None, None, None)
+        .await
+        .map_err(|e| format!("Failed to create DHT service: {}", e))?;
+    let dht_service_arc = Arc::new(dht_service);
+
+    info!("DHT service initialized successfully");
+
+    // Initialize BitTorrent handler
+    let download_dir = app_data_dir.join(format!("downloads{}", instance_suffix));
+    if let Err(e) = std::fs::create_dir_all(&download_dir) {
+        warn!("Failed to create download directory: {}", e);
+    }
+
+    let port_range = 6881..6891;
+    info!(
+        "Initializing BitTorrent handler with port range {}-{}",
+        port_range.start, port_range.end
+    );
+
+    let bittorrent_handler =
+        create_bt_handler_with_fallback(download_dir.clone(), dht_service_arc.clone(), port_range)
+            .await;
+    let bittorrent_handler_arc = Arc::new(bittorrent_handler);
+
+    info!("BitTorrent handler initialized");
+
+    // Create FTP server
+    let ftp_files_dir = app_data_dir.join("ftp_files");
+    let ftp_server = Arc::new(chiral_network::ftp_server::FtpServer::new(
+        ftp_files_dir,
+        2121,
+    ));
+
+    info!("FTP server initialized");
+
+    // Create protocol manager
+    let mut manager = ProtocolManager::new();
+
+    let bittorrent_protocol_handler =
+        BitTorrentProtocolHandler::new(bittorrent_handler_arc.clone());
+    manager.register(Arc::new(bittorrent_protocol_handler));
+
+    let ed2k_handler =
+        protocols::ed2k::Ed2kProtocolHandler::new("ed2k://|server|45.82.80.155|5687|/".to_string());
+    manager.register(Arc::new(ed2k_handler));
+
+    let (ftp_handler, ftp_event_bus_holder) =
+        protocols::ftp::FtpProtocolHandler::with_ftp_server(ftp_server.clone());
+    manager.register(Arc::new(ftp_handler));
+
+    info!("Protocol manager initialized with BitTorrent, ED2K, and FTP handlers");
+
+    Ok((
+        dht_service_arc,
+        bittorrent_handler_arc,
+        ftp_server,
+        Arc::new(manager),
+        ftp_event_bus_holder,
+    ))
 }
 
 /// Get a unique file path by adding (1), (2), etc. if the file already exists
@@ -395,7 +656,11 @@ struct AppState {
     relay_aliases: Arc<Mutex<std::collections::HashMap<String, String>>>,
 
     // Protocol manager for handling different download/upload protocols
-    protocol_manager: Arc<ProtocolManager>,
+    // Initialized when DHT is started (auto-start or via start_dht_node)
+    protocol_manager: Mutex<Option<Arc<ProtocolManager>>>,
+
+    // Upload/Download protocol manager for FTP, WebRTC uploads
+    upload_download_protocol_manager: Mutex<Option<Arc<protocol_manager::ProtocolManager>>>,
 
     // AutoRelay timeline persistence across DHT restarts
     autorelay_last_enabled: Arc<Mutex<Option<SystemTime>>>,
@@ -404,7 +669,8 @@ struct AppState {
     // File logger writer for dynamic log configuration updates
     file_logger: Arc<Mutex<Option<logger::ThreadSafeWriter>>>,
     // BitTorrent handler for creating and seeding torrents
-    bittorrent_handler: Arc<bittorrent_handler::BitTorrentHandler>,
+    // Initialized when DHT is started (auto-start or via start_dht_node)
+    bittorrent_handler: Mutex<Option<Arc<bittorrent_handler::BitTorrentHandler>>>,
 
     // Chunk manager for file chunking operations
     chunk_manager: Mutex<Option<Arc<ChunkManager>>>,
@@ -414,6 +680,20 @@ struct AppState {
 
     // FTP server for serving uploaded files
     ftp_server: Arc<chiral_network::ftp_server::FtpServer>,
+}
+
+pub(crate) async fn require_protocol_manager(
+    state: &State<'_, AppState>,
+) -> Result<Arc<ProtocolManager>, String> {
+    let mgr = { state.protocol_manager.lock().await.as_ref().cloned() };
+    mgr.ok_or_else(|| "Protocol manager not initialized. Start the DHT node first.".to_string())
+}
+
+pub(crate) async fn require_bittorrent_handler(
+    state: &State<'_, AppState>,
+) -> Result<Arc<bittorrent_handler::BitTorrentHandler>, String> {
+    let h = { state.bittorrent_handler.lock().await.as_ref().cloned() };
+    h.ok_or_else(|| "BitTorrent handler not initialized. Start the DHT node first.".to_string())
 }
 
 /// Tauri command to create a new Chiral account
@@ -433,15 +713,8 @@ async fn create_chiral_account(state: State<'_, AppState>) -> Result<EthAccount,
         *active_key = Some(account.private_key.clone());
     }
 
-    // Default mining rewards to the active wallet address.
-    {
-        let mut miner_address = state.miner_address.lock().await;
-        *miner_address = Some(account.address.clone());
-    }
-    {
-        let mut current_address = CURRENT_MINER_ADDRESS.lock().await;
-        *current_address = Some(account.address.clone());
-    }
+    // Update all services with wallet address
+    update_wallet_address_for_services(account.address.clone(), state.clone()).await?;
 
     Ok(account)
 }
@@ -465,17 +738,43 @@ async fn import_chiral_account(
         *active_key = Some(account.private_key.clone());
     }
 
-    // Default mining rewards to the active wallet address.
+    // Update all services with wallet address
+    update_wallet_address_for_services(account.address.clone(), state.clone()).await?;
+
+    Ok(account)
+}
+
+#[tauri::command]
+async fn update_wallet_address_for_services(
+    address: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    info!("🔄 Updating wallet address for all services: {}", address);
+
+    // 1. Update miner address
     {
         let mut miner_address = state.miner_address.lock().await;
-        *miner_address = Some(account.address.clone());
+        *miner_address = Some(address.clone());
     }
     {
         let mut current_address = CURRENT_MINER_ADDRESS.lock().await;
-        *current_address = Some(account.address.clone());
+        *current_address = Some(address.clone());
+    }
+    info!("✅ Updated miner address");
+
+    // 2. Update DHT SeederGeneralInfo (if DHT is running)
+    {
+        let dht = state.dht.lock().await;
+        if let Some(dht_service) = dht.as_ref() {
+            dht_service.update_wallet_address(address.clone()).await?;
+            info!("✅ Updated DHT SeederGeneralInfo with wallet address");
+        } else {
+            info!("⚠️ DHT not running, skipping DHT update");
+        }
     }
 
-    Ok(account)
+    info!("✅ Wallet address updated for all services");
+    Ok(())
 }
 
 #[tauri::command]
@@ -546,7 +845,10 @@ async fn check_geth_data_compatibility(
 async fn download(identifier: String, state: State<'_, AppState>) -> Result<(), String> {
     println!("Received download command for: {}", identifier);
     #[allow(deprecated)]
-    state.protocol_manager.download_simple(&identifier).await
+    require_protocol_manager(&state)
+        .await?
+        .download_simple(&identifier)
+        .await
 }
 
 /// Tauri command to download a torrent from raw .torrent file bytes.
@@ -562,7 +864,7 @@ async fn download_torrent_from_bytes(
     );
 
     // Get the BitTorrent handler from the state
-    let handler = state.bittorrent_handler.clone();
+    let handler = require_bittorrent_handler(&state).await?;
 
     // Start the download from bytes
     // Note: start_download_from_bytes already emits the torrent_event Added event with the actual torrent name
@@ -587,7 +889,7 @@ async fn download_torrent_from_magnet(
     );
 
     // Get the BitTorrent handler from the state
-    let handler = state.bittorrent_handler.clone();
+    let handler = require_bittorrent_handler(&state).await?;
 
     // Start the download from magnet link
     let managed_torrent = handler
@@ -633,7 +935,7 @@ async fn download_torrent_from_magnet(
 async fn open_torrent_folder(info_hash: String, state: State<'_, AppState>) -> Result<(), String> {
     println!("Opening folder for torrent: {}", info_hash);
 
-    let handler = state.bittorrent_handler.clone();
+    let handler = require_bittorrent_handler(&state).await?;
     let folder_path = handler
         .get_torrent_folder(&info_hash)
         .await
@@ -649,7 +951,10 @@ async fn seed(file_path: String, state: State<'_, AppState>) -> Result<String, S
     println!("Received seed command for: {}", file_path);
     // Delegate the seed operation to the protocol manager.
     #[allow(deprecated)]
-    state.protocol_manager.seed_simple(&file_path).await
+    require_protocol_manager(&state)
+        .await?
+        .seed_simple(&file_path)
+        .await
 }
 
 /// Helper function to create and seed a BitTorrent file.
@@ -669,7 +974,7 @@ async fn create_and_seed_torrent(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     // Use the BitTorrent handler directly to create and seed the torrent
-    let handler = state.bittorrent_handler.clone();
+    let handler = require_bittorrent_handler(&state).await?;
     create_and_seed_torrent_internal(file_path, handler).await
 }
 
@@ -681,7 +986,7 @@ async fn bittorrent_post_download_publish(
     state: State<'_, AppState>,
 ) -> Result<bittorrent_handler::PostDownloadResult, String> {
     println!("Post-download publish for info_hash: {}", info_hash);
-    let handler = state.bittorrent_handler.clone();
+    let handler = require_bittorrent_handler(&state).await?;
     handler.post_download_seed_and_publish(&info_hash).await
 }
 
@@ -731,6 +1036,9 @@ async fn load_account_from_keystore(
             .set_active_private_key(Some(private_key.clone()))
             .await;
     }
+
+    // Update all services with wallet address
+    update_wallet_address_for_services(address.clone(), state.clone()).await?;
 
     // Derive account details from private key
     get_account_from_private_key(&private_key)
@@ -1706,10 +2014,17 @@ async fn start_dht_node(
     // Currently NOT sent by tauri frontend:
     // is_bootstrap: Option<bool>, false
 ) -> Result<String, String> {
+    println!("start_dht_node called");
     {
-        let dht_guard = state.dht.lock().await;
-        if dht_guard.is_some() {
-            return Err("DHT node is already running".to_string());
+        let existing = { state.dht.lock().await.as_ref().cloned() };
+        if let Some(dht) = existing {
+            if dht.is_command_channel_alive().await {
+                return Err("DHT node is already running".to_string());
+            }
+
+            warn!("Stale DHT handle detected (command channel dead). Clearing and restarting...");
+            let mut dht_guard = state.dht.lock().await;
+            *dht_guard = None;
         }
     }
 
@@ -1800,6 +2115,36 @@ async fn start_dht_node(
 
     // DHT node is already running in a spawned background task
     let dht_arc = Arc::new(dht_service);
+
+    // Initialize BitTorrent handler + protocol manager now that DHT exists.
+    // This keeps feature parity between auto-start and manual start.
+    let (bittorrent_handler_arc, protocol_manager_arc, ftp_event_bus_holder) = {
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Could not get app data directory: {}", e))?;
+
+        let download_dir = app_data_dir.join("downloads");
+        if let Err(e) = std::fs::create_dir_all(&download_dir) {
+            warn!("Failed to create download directory: {}", e);
+        }
+
+        let port_range = 6881..6891;
+        let bt = create_bt_handler_with_fallback(download_dir, dht_arc.clone(), port_range).await;
+        let bt_arc = Arc::new(bt);
+
+        let mut pm = ProtocolManager::new();
+        pm.register(Arc::new(BitTorrentProtocolHandler::new(bt_arc.clone())));
+        pm.register(Arc::new(protocols::ed2k::Ed2kProtocolHandler::new(
+            "ed2k://|server|45.82.80.155|5687|/".to_string(),
+        )));
+
+        let (ftp_handler, ftp_holder) =
+            protocols::ftp::FtpProtocolHandler::with_ftp_server(state.ftp_server.clone());
+        pm.register(Arc::new(ftp_handler));
+
+        (bt_arc, Arc::new(pm), ftp_holder)
+    };
 
     // Spawn the event pump
     let app_handle = app.clone();
@@ -1950,14 +2295,8 @@ async fn start_dht_node(
                         analytics_arc.record_upload_completed().await;
                         analytics_arc.decrement_active_uploads().await;
                     }
-                    DhtEvent::FileDiscovered(metadata) => {
-                        info!(
-                            "📡 Emitting found_file event to frontend for: {}",
-                            metadata.file_name
-                        );
-                        let payload = serde_json::json!(metadata);
-                        let _ = app_handle.emit("found_file", payload);
-                    }
+                    // Note: DhtEvent::FileDiscovered has been removed from DhtEvent enum
+                    // File discovery is now handled through DhtEvent::DhtMetadataFound
                     DhtEvent::ReputationEvent {
                         peer_id,
                         event_type,
@@ -2067,6 +2406,10 @@ async fn start_dht_node(
                         created_at,
                         mime_type,
                     } => {
+                        info!(
+                            "📡 Emitting dht_metadata_found event to frontend: {}",
+                            file_name
+                        );
                         let _ = app_handle.emit(
                             "dht_metadata_found",
                             serde_json::json!({
@@ -2077,6 +2420,7 @@ async fn start_dht_node(
                                 "mimeType": mime_type
                             }),
                         );
+                        info!("✅ EMITTED DHTMETADATAFOUND TO FRONTEND");
                     }
 
                     DhtEvent::ProvidersFound {
@@ -2175,6 +2519,33 @@ async fn start_dht_node(
         *dht_guard = Some(dht_arc.clone());
     }
 
+    // Store BitTorrent handler + protocol manager in state
+    {
+        let mut bt_guard = state.bittorrent_handler.lock().await;
+        *bt_guard = Some(bittorrent_handler_arc.clone());
+    }
+    {
+        let mut pm_guard = state.protocol_manager.lock().await;
+        *pm_guard = Some(protocol_manager_arc.clone());
+    }
+
+    // Hook up FTP event bus now that we have an app handle
+    protocols::ftp::FtpProtocolHandler::set_event_bus_from_holder(
+        &ftp_event_bus_holder,
+        app.clone(),
+    );
+
+    // Reinitialize upload/download protocol manager with new DHT service
+    {
+        let upload_protocol_manager = Arc::new(protocol_manager::ProtocolManager::new(
+            dht_arc.clone(),
+            app.clone(),
+        ));
+        let mut protocol_manager_guard = state.upload_download_protocol_manager.lock().await;
+        *protocol_manager_guard = Some(upload_protocol_manager);
+        info!("✓ Upload/Download Protocol Manager reinitialized with new DHT service");
+    }
+
     // Store chunk manager in AppState
     {
         let mut chunk_guard = state.chunk_manager.lock().await;
@@ -2192,7 +2563,7 @@ async fn start_dht_node(
         use std::time::Duration;
         let mut last_check = std::time::Instant::now();
         let check_interval = Duration::from_secs(30); // Check every 30 seconds
-        const MINIMUM_PEERS: usize = 5; // Auto-reconnect if below this
+        const MINIMUM_PEERS: usize = 1; // Auto-reconnect if below this
 
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2268,6 +2639,27 @@ async fn stop_dht_node(app: tauri::AppHandle, state: State<'_, AppState>) -> Res
             .map_err(|e| format!("Failed to stop DHT: {}", e))?;
     }
 
+    // Clear upload/download protocol manager when DHT is stopped
+    {
+        let mut protocol_manager_guard = state.upload_download_protocol_manager.lock().await;
+        *protocol_manager_guard = None;
+        info!("✓ Upload/Download Protocol Manager cleared (DHT stopped)");
+    }
+
+    // Clear protocol manager + BitTorrent handler when DHT is stopped
+    {
+        let mut pm_guard = state.protocol_manager.lock().await;
+        *pm_guard = None;
+    }
+    {
+        let mut bt_guard = state.bittorrent_handler.lock().await;
+        *bt_guard = None;
+    }
+    {
+        let mut chunk_guard = state.chunk_manager.lock().await;
+        *chunk_guard = None;
+    }
+
     // Proxy reset
     {
         let mut proxies = state.proxies.lock().await;
@@ -2307,8 +2699,12 @@ async fn connect_to_peer(state: State<'_, AppState>, peer_address: String) -> Re
 
 #[tauri::command]
 async fn is_dht_running(state: State<'_, AppState>) -> Result<bool, String> {
-    let dht_guard = state.dht.lock().await;
-    Ok(dht_guard.is_some())
+    let dht = { state.dht.lock().await.as_ref().cloned() };
+    if let Some(dht) = dht {
+        Ok(dht.is_command_channel_alive().await)
+    } else {
+        Ok(false)
+    }
 }
 
 #[tauri::command]
@@ -2509,11 +2905,7 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                 DhtEvent::PeerDisconnected { peer_id } => {
                     format!("peer_disconnected:{}", peer_id)
                 }
-                DhtEvent::FileDiscovered(meta) => {
-                    // Serialize the full metadata object to JSON for the frontend
-                    let payload = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
-                    format!("file_discovered:{}", payload)
-                }
+                // Note: DhtEvent::FileDiscovered removed - use DhtMetadataFound instead
                 DhtEvent::PublishedFile(meta) => format!(
                     "file_published:{}:{}:{}", // Use merkle_root as the primary identifier
                     meta.merkle_root, meta.file_name, meta.file_size
@@ -3942,7 +4334,7 @@ async fn start_file_transfer_service(
         let multi_source_service = MultiSourceDownloadService::new(
             dht_service,
             webrtc_arc.clone(),
-            state.bittorrent_handler.clone(),
+            require_bittorrent_handler(&state).await?,
             transfer_event_bus,
             state.analytics.clone(),
             chunk_manager,
@@ -4114,7 +4506,7 @@ async fn upload_file_to_network(
                 }
 
                 // Use torrent seeding
-                let handler = state.bittorrent_handler.clone();
+                let handler = require_bittorrent_handler(&state).await?;
                 match create_and_seed_torrent_internal(file_path.clone(), handler).await {
                     Ok(magnet_link) => {
                         let info_hash = {
@@ -5108,7 +5500,10 @@ async fn upload_to_external_ftp(
     println!("[FTP_UPLOAD] Starting FTP upload");
     println!("[FTP_UPLOAD] File path: {}", file_path);
     println!("[FTP_UPLOAD] FTP URL: {}", ftp_url);
-    println!("[FTP_UPLOAD] Username: {:?}", username.as_deref().unwrap_or("anonymous"));
+    println!(
+        "[FTP_UPLOAD] Username: {:?}",
+        username.as_deref().unwrap_or("anonymous")
+    );
     println!("[FTP_UPLOAD] Use FTPS: {}", use_ftps);
     println!("[FTP_UPLOAD] Passive mode: {}", passive_mode);
 
@@ -5121,7 +5516,10 @@ async fn upload_to_external_ftp(
     let mut file_data = Vec::new();
     file.read_to_end(&mut file_data)
         .map_err(|e| format!("Failed to read file: {}", e))?;
-    println!("[FTP_UPLOAD] File read complete. Size: {} bytes", file_data.len());
+    println!(
+        "[FTP_UPLOAD] File read complete. Size: {} bytes",
+        file_data.len()
+    );
 
     // Parse URL to get host, port, and remote path
     println!("[FTP_UPLOAD] Parsing FTP URL...");
@@ -5129,7 +5527,10 @@ async fn upload_to_external_ftp(
     let host = parsed.host_str().ok_or("Invalid FTP URL: no host")?;
     let port = parsed.port().unwrap_or(21);
     let remote_path = parsed.path();
-    println!("[FTP_UPLOAD] Parsed - Host: {}, Port: {}, Remote path: {}", host, port, remote_path);
+    println!(
+        "[FTP_UPLOAD] Parsed - Host: {}, Port: {}, Remote path: {}",
+        host, port, remote_path
+    );
 
     // Get filename from local path
     let file_name = std::path::Path::new(&file_path)
@@ -5161,14 +5562,14 @@ async fn upload_to_external_ftp(
 
         // Connect to FTPS server
         let connect_addr = format!("{}:{}", host, port);
-        println!("[FTP_UPLOAD] Connecting to FTPS server at {}...", connect_addr);
+        println!(
+            "[FTP_UPLOAD] Connecting to FTPS server at {}...",
+            connect_addr
+        );
         println!("[FTP_UPLOAD] NOTE: No timeout configured - this may hang indefinitely!");
-        let mut ftp_stream = NativeTlsFtpStream::connect_secure_implicit(
-            connect_addr,
-            tls_connector,
-            host,
-        )
-        .map_err(|e| format!("Failed to connect to FTPS server: {}", e))?;
+        let mut ftp_stream =
+            NativeTlsFtpStream::connect_secure_implicit(connect_addr, tls_connector, host)
+                .map_err(|e| format!("Failed to connect to FTPS server: {}", e))?;
         println!("[FTP_UPLOAD] FTPS connection established!");
 
         // Set passive mode
@@ -5193,7 +5594,10 @@ async fn upload_to_external_ftp(
             .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
         // Upload file
-        println!("[FTP_UPLOAD] Starting file upload to {}...", full_remote_path);
+        println!(
+            "[FTP_UPLOAD] Starting file upload to {}...",
+            full_remote_path
+        );
         let mut reader = std::io::Cursor::new(file_data);
         ftp_stream
             .put_file(&full_remote_path, &mut reader)
@@ -5211,7 +5615,10 @@ async fn upload_to_external_ftp(
 
         // Connect to regular FTP server
         let connect_addr = format!("{}:{}", host, port);
-        println!("[FTP_UPLOAD] Connecting to FTP server at {}...", connect_addr);
+        println!(
+            "[FTP_UPLOAD] Connecting to FTP server at {}...",
+            connect_addr
+        );
         println!("[FTP_UPLOAD] NOTE: No timeout configured - this may hang indefinitely!");
         let mut ftp_stream = FtpStream::connect(connect_addr)
             .map_err(|e| format!("Failed to connect to FTP server: {}", e))?;
@@ -5239,7 +5646,10 @@ async fn upload_to_external_ftp(
             .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
         // Upload file
-        println!("[FTP_UPLOAD] Starting file upload to {}...", full_remote_path);
+        println!(
+            "[FTP_UPLOAD] Starting file upload to {}...",
+            full_remote_path
+        );
         let mut reader = std::io::Cursor::new(file_data);
         ftp_stream
             .put_file(&full_remote_path, &mut reader)
@@ -5262,7 +5672,10 @@ async fn upload_to_external_ftp(
         full_remote_path
     );
 
-    println!("[FTP_UPLOAD] Upload complete! Uploaded URL: {}", uploaded_url);
+    println!(
+        "[FTP_UPLOAD] Upload complete! Uploaded URL: {}",
+        uploaded_url
+    );
     println!("[FTP_UPLOAD] ===== FTP UPLOAD SUCCESSFUL =====");
 
     Ok(uploaded_url)
@@ -8657,8 +9070,8 @@ async fn download_ed2k(link: String, state: State<'_, AppState>) -> Result<(), S
         ..Default::default()
     };
 
-    state
-        .protocol_manager
+    require_protocol_manager(&state)
+        .await?
         .download(&link, options)
         .await
         .map_err(|e| format!("ED2K download failed: {}", e))?;
@@ -9475,291 +9888,12 @@ fn main() {
         return;
     }
 
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-
-    // --- Single Instance Check ---
-    // Prevent multiple instances from running *on the same DHT port*.
-    //
-    // NOTE: Real E2E (spawn/attach) and local multi-node setups can run multiple instances
-    // on one machine as long as each uses a distinct DHT port.
-    let dht_port: u16 = std::env::var("CHIRAL_DHT_PORT")
-        .or_else(|_| std::env::var("CHIRAL_P2P_PORT"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(4001);
-
-    if std::net::TcpListener::bind(format!("127.0.0.1:{}", dht_port)).is_err() {
-        eprintln!("Error: Another instance of Chiral Network is already running.");
-        eprintln!("Please close the existing instance before starting a new one.");
-        eprintln!(
-            "Hint: set CHIRAL_DHT_PORT (or CHIRAL_P2P_PORT) to run multiple nodes on one machine."
-        );
-        std::process::exit(1);
-    }
-
-    // --- Initialize DHT Service at startup ---
-    let instance_suffix = String::new();
-    let instance_suffix_clone = instance_suffix.clone();
-    let dht_service_arc = runtime.block_on(async move {
-        // These settings can be moved to a config file later
-        let bootstrap_nodes = get_bootstrap_nodes();
-        let port = dht_port; // DHT port (configurable via env)
-        let is_bootstrap = false;
-        let enable_autonat = true;
-        let enable_autorelay = true;
-
-        let proj_dirs = ProjectDirs::from("com", "chiral-network", "chiral-network")
-            .ok_or("Failed to get project directories")
-            .unwrap();
-        let blockstore_db_path = proj_dirs.data_dir().join("blockstore_db");
-        let async_blockstore_path = async_std::path::Path::new(blockstore_db_path.as_os_str());
-
-        let dht_config = DhtConfig::builder()
-            .port(port)
-            .bootstrap_nodes(bootstrap_nodes)
-            .enable_autonat(enable_autonat)
-            .enable_autorelay(enable_autorelay)
-            .blockstore_db_path(async_blockstore_path)
-            .build();
-
-        let dht_service = DhtService::new(dht_config, None, None, None)
-            .await
-            .expect("Failed to create DHT service at startup");
-
-        Arc::new(dht_service)
-    });
-
-    // Store DHT service and related data for later use in setup()
-    let dht_service_for_bt = dht_service_arc.clone();
-
-    let (bittorrent_handler_arc, ftp_server_arc, protocol_manager_arc, ftp_event_bus_holder) =
-        runtime.block_on(async move {
-            // Use the instance_id and instance_suffix from above for BitTorrent paths
-            let download_dir =
-                directories::ProjectDirs::from("com", "chiral-network", "chiral-network")
-                    .map(|dirs| {
-                        dirs.data_dir()
-                            .join(format!("downloads{}", instance_suffix))
-                    })
-                    .unwrap_or_else(|| {
-                        std::env::current_dir()
-                            .unwrap()
-                            .join(format!("downloads{}", instance_suffix))
-                    });
-
-            if let Err(e) = std::fs::create_dir_all(&download_dir) {
-                eprintln!("Failed to create download directory: {}", e);
-            }
-
-            // Use default BitTorrent port range
-            let port_range = 6881..6891;
-
-            println!(
-                "Using BitTorrent port range: {}-{}",
-                port_range.start, port_range.end
-            );
-
-            let bittorrent_handler = create_bt_handler_with_fallback(
-                download_dir.clone(),
-                dht_service_for_bt,
-                port_range,
-            )
-            .await;
-            let bittorrent_handler_arc = Arc::new(bittorrent_handler);
-
-            // Create FTP server for seeding support
-            let ftp_server = Arc::new(chiral_network::ftp_server::FtpServer::new(
-                directories::ProjectDirs::from("com", "chiral-network", "chiral-network")
-                    .map(|dirs| dirs.data_dir().join("ftp_files"))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join("ftp_files")),
-                2121, // FTP port
-            ));
-
-            let mut manager = ProtocolManager::new();
-
-            // Wrap the simple handler in the enhanced protocol handler
-            let bittorrent_protocol_handler =
-                BitTorrentProtocolHandler::new(bittorrent_handler_arc.clone());
-            manager.register(Arc::new(bittorrent_protocol_handler));
-
-            // Register ED2K and FTP handlers
-            let ed2k_handler = protocols::ed2k::Ed2kProtocolHandler::new(
-                "ed2k://|server|45.82.80.155|5687|/".to_string(),
-            );
-            manager.register(Arc::new(ed2k_handler));
-
-            let (ftp_handler, ftp_event_bus_holder) =
-                protocols::ftp::FtpProtocolHandler::with_ftp_server(ftp_server.clone());
-            manager.register(Arc::new(ftp_handler));
-
-            (
-                bittorrent_handler_arc,
-                ftp_server,
-                Arc::new(manager),
-                ftp_event_bus_holder,
-            )
-        });
-
-    // Reputation system Tauri commands
-    #[tauri::command]
-    async fn publish_reputation_verdict(
-        verdict: reputation::TransactionVerdict,
-        state: State<'_, AppState>,
-    ) -> Result<(), String> {
-        println!("📊 RUST: publish_reputation_verdict called");
-        tracing::info!(
-            "📊 publish_reputation_verdict: {} -> {} ({:?})",
-            verdict.issuer_id,
-            verdict.target_id,
-            verdict.outcome
-        );
-
-        // Get DHT service from AppState
-        let dht_guard = state.dht.lock().await;
-        let dht = dht_guard
-            .as_ref()
-            .ok_or_else(|| "DHT service not initialized".to_string())?;
-
-        // Create ReputationDhtService and store verdict
-        let mut reputation_dht = reputation::ReputationDhtService::new();
-        reputation_dht.set_dht_service(Arc::clone(dht));
-        println!("📊 RUST: About to store verdict");
-        reputation_dht.store_transaction_verdict(&verdict).await?;
-
-        println!("✅ RUST: Verdict stored successfully");
-        tracing::info!(
-            "✅ Published verdict to DHT for peer: {}",
-            verdict.target_id
-        );
-        Ok(())
-    }
-
-    #[tauri::command]
-    async fn get_reputation_verdicts(
-        peer_id: String,
-        state: State<'_, AppState>,
-    ) -> Result<Vec<reputation::TransactionVerdict>, String> {
-        println!("🔍 RUST: get_reputation_verdicts called for: {}", peer_id);
-        tracing::info!("📊 get_reputation_verdicts for peer: {}", peer_id);
-
-        // Get DHT service from AppState
-        let dht_guard = state.dht.lock().await;
-        let dht = dht_guard
-            .as_ref()
-            .ok_or_else(|| "DHT service not initialized".to_string())?;
-
-        // Create ReputationDhtService and retrieve verdicts
-        let mut reputation_dht = reputation::ReputationDhtService::new();
-        reputation_dht.set_dht_service(Arc::clone(dht));
-        println!("🔍 RUST: About to retrieve verdicts");
-        let verdicts = reputation_dht
-            .retrieve_transaction_verdicts(&peer_id)
-            .await?;
-
-        println!("✅ RUST: Retrieved {} verdicts", verdicts.len());
-        tracing::info!(
-            "✅ Retrieved {} verdicts for peer: {}",
-            verdicts.len(),
-            peer_id
-        );
-        Ok(verdicts)
-    }
-
-    // Clone the FTP event bus holder so it can be moved into setup()
-    let ftp_event_bus_holder_for_setup = ftp_event_bus_holder.clone();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
-        .manage(AppState {
-            geth: Mutex::new(GethProcess::new()),
-            downloader: Arc::new(GethDownloader::new()),
-            miner_address: Mutex::new(None),
-            active_account: Arc::new(Mutex::new(None)),
-            active_account_private_key: Arc::new(Mutex::new(None)),
-            rpc_url: Mutex::new("http://127.0.0.1:8545".to_string()),
-            dht: Mutex::new(Some(dht_service_arc.clone())),
-            file_transfer: Mutex::new(None),
-            webrtc: Mutex::new(None),
-            multi_source_download: Mutex::new(None),
-            keystore: Arc::new(Mutex::new(
-                Keystore::load().unwrap_or_else(|_| Keystore::new()),
-            )),
-            proxies: Arc::new(Mutex::new(Vec::new())),
-            privacy_proxies: Arc::new(Mutex::new(Vec::new())),
-            file_transfer_pump: Mutex::new(None),
-            multi_source_pump: Mutex::new(None),
-            socks5_proxy_cli: Mutex::new(args.socks5_proxy),
-            analytics: Arc::new(analytics::AnalyticsService::new()),
-            bandwidth: Arc::new(BandwidthController::new()),
-            payment_checkpoint: Arc::new(PaymentCheckpointService::new()),
-
-            // Initialize transaction queue
-            transaction_queue: Arc::new(Mutex::new(VecDeque::new())),
-            transaction_processor: Mutex::new(None),
-            processing_transaction: Arc::new(Mutex::new(false)),
-
-            // Initialize upload sessions
-            upload_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
-
-            // Initialize download sessions (for streaming WebRTC downloads)
-            download_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
-
-            // Initialize proxy authentication tokens
-            proxy_auth_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
-
-            // Initialize HTTP server state (uses same storage as FileTransferService)
-            http_server_state: Arc::new(http_server::HttpServerState::new({
-                // Use same storage directory as FileTransferService (files/, not chunks/)
-                use directories::ProjectDirs;
-                ProjectDirs::from("com", "chiral-network", "chiral-network")
-                    .map(|dirs| dirs.data_dir().join("files"))
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join("files"))
-            })),
-            http_server_addr: Arc::new(Mutex::new(None)),
-            http_server_shutdown: Arc::new(Mutex::new(None)),
-
-            // Initialize stream authentication
-            stream_auth: Arc::new(Mutex::new(stream_auth::StreamAuthService::new())),
-
-            // Initialize the new map for AES keys
-            canonical_aes_keys: Arc::new(Mutex::new(std::collections::HashMap::new())),
-
-            // Proof-of-Storage watcher background handle and contract address
-            // make these clonable so we can .clone() and move into spawned tasks
-            proof_watcher: Arc::new(Mutex::new(None)),
-            proof_contract_address: Arc::new(Mutex::new(None)),
-
-            // Relay reputation statistics
-            relay_reputation: Arc::new(Mutex::new(std::collections::HashMap::new())),
-
-            // Relay aliases
-            relay_aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
-
-            // Protocol Manager with BitTorrent support
-            protocol_manager: protocol_manager_arc,
-
-            // AutoRelay timeline persistence across DHT restarts
-            autorelay_last_enabled: Arc::new(Mutex::new(None)),
-            autorelay_last_disabled: Arc::new(Mutex::new(None)),
-
-            // File logger - will be initialized in setup phase after loading settings
-            file_logger: Arc::new(Mutex::new(None)),
-
-            // BitTorrent handler for creating and seeding torrents
-            bittorrent_handler: bittorrent_handler_arc,
-
-            // Chunk manager (will be initialized when DHT starts)
-            chunk_manager: Mutex::new(None),
-
-            // Download restart service (will be initialized in setup)
-            download_restart: Mutex::new(None),
-
-            // FTP server for serving uploaded files (created earlier for protocol manager)
-            ftp_server: ftp_server_arc,
-        })
         .invoke_handler(tauri::generate_handler![
             create_chiral_account,
             import_chiral_account,
+            update_wallet_address_for_services,
             has_active_account,
             get_active_account_address,
             get_active_account_private_key,
@@ -10027,7 +10161,10 @@ fn main() {
             get_blockstore_stats,
             clear_blockstore,
             cleanup_old_blockstore_files,
-            auto_cleanup_blockstore
+            auto_cleanup_blockstore,
+            // Upload protocol manager commands
+            upload_via_ftp,
+            upload_via_webrtc
         ])
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_os::init())
@@ -10046,61 +10183,15 @@ fn main() {
             }
         })
         .setup(move |app| {
-            // Initialize FTP event bus now that we have the app handle
-            protocols::ftp::FtpProtocolHandler::set_event_bus_from_holder(
-                &ftp_event_bus_holder_for_setup,
-                app.handle().clone(),
-            );
-
             // Load settings from disk
             // We only need log-related settings during setup; parse them from settings.json
             // without depending on a local `load_settings_from_file` helper.
-            let settings = {
-                #[derive(serde::Deserialize)]
-                struct LogSettings {
-                    #[serde(rename = "enableFileLogging")]
-                    enable_file_logging: Option<bool>,
-                    #[serde(rename = "maxLogSizeMB")]
-                    max_log_size_mb: Option<u64>,
-                }
 
-                let app_data_dir = app
-                    .path()
-                    .app_data_dir()
-                    .expect("Failed to get app data directory");
-                let settings_file = app_data_dir.join("settings.json");
-
-                let mut settings = BackendSettings::default();
-                if settings_file.exists() {
-                    if let Ok(contents) = std::fs::read_to_string(&settings_file) {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                            settings.enable_file_logging = json
-                                .get("enableFileLogging")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(settings.enable_file_logging);
-                            settings.max_log_size_mb = json
-                                .get("maxLogSizeMB")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(settings.max_log_size_mb);
-                            settings.storage_path = json
-                                .get("storagePath")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                        } else if let Ok(log_json) = serde_json::from_str::<LogSettings>(&contents)
-                        {
-                            // Fallback in case settings.json isn't a plain object
-                            settings.enable_file_logging = log_json
-                                .enable_file_logging
-                                .unwrap_or(settings.enable_file_logging);
-                            settings.max_log_size_mb =
-                                log_json.max_log_size_mb.unwrap_or(settings.max_log_size_mb);
-                        }
-                    }
-                }
-                settings
-            };
-
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("Failed to get app data directory");
+            let mut settings = load_settings_from_path(&app_data_dir);
             // Initialize tracing subscriber with console output and optionally file output
             use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -10175,6 +10266,213 @@ fn main() {
                     }
                 }
             }
+
+            let dht_port: u16 = std::env::var("CHIRAL_DHT_PORT")
+                .or_else(|_| std::env::var("CHIRAL_P2P_PORT"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .unwrap_or(4001);
+            settings.port = Some(dht_port);
+            let should_auto_start_dht = settings.auto_start_dht.unwrap_or(false);
+
+            if should_auto_start_dht
+                && std::net::TcpListener::bind(format!("127.0.0.1:{}", dht_port)).is_err()
+            {
+                eprintln!(
+                    "Error: Another instance of Chiral Network is already running on port {}.",
+                    dht_port
+                );
+                eprintln!("Please close the existing instance before starting a new one.");
+                eprintln!(
+                    "Hint: set CHIRAL_DHT_PORT (or CHIRAL_P2P_PORT) to run multiple nodes on one machine."
+                );
+                std::process::exit(1);
+            }
+
+            // Always create FTP server; it can run independently of DHT.
+            let ftp_server_arc = Arc::new(chiral_network::ftp_server::FtpServer::new(
+                app_data_dir.join("ftp_files"),
+                2121,
+            ));
+
+            app.manage(AppState {
+                geth: Mutex::new(GethProcess::new()),
+                downloader: Arc::new(GethDownloader::new()),
+                miner_address: Mutex::new(None),
+                active_account: Arc::new(Mutex::new(None)),
+                active_account_private_key: Arc::new(Mutex::new(None)),
+                rpc_url: Mutex::new("http://127.0.0.1:8545".to_string()),
+                dht: Mutex::new(None),
+                file_transfer: Mutex::new(None),
+                webrtc: Mutex::new(None),
+                multi_source_download: Mutex::new(None),
+                keystore: Arc::new(Mutex::new(
+                    Keystore::load().unwrap_or_else(|_| Keystore::new()),
+                )),
+                proxies: Arc::new(Mutex::new(Vec::new())),
+                privacy_proxies: Arc::new(Mutex::new(Vec::new())),
+                file_transfer_pump: Mutex::new(None),
+                multi_source_pump: Mutex::new(None),
+                socks5_proxy_cli: Mutex::new(args.socks5_proxy),
+                analytics: Arc::new(analytics::AnalyticsService::new()),
+                bandwidth: Arc::new(BandwidthController::new()),
+                payment_checkpoint: Arc::new(PaymentCheckpointService::new()),
+
+                // Initialize transaction queue
+                transaction_queue: Arc::new(Mutex::new(VecDeque::new())),
+                transaction_processor: Mutex::new(None),
+                processing_transaction: Arc::new(Mutex::new(false)),
+
+                // Initialize upload sessions
+                upload_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+
+                // Initialize download sessions (for streaming WebRTC downloads)
+                download_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+
+                // Initialize proxy authentication tokens
+                proxy_auth_tokens: Arc::new(Mutex::new(std::collections::HashMap::new())),
+
+                // Initialize HTTP server state (uses same storage as FileTransferService)
+                http_server_state: Arc::new(http_server::HttpServerState::new({
+                    // Use same storage directory as FileTransferService (files/, not chunks/)
+                    use directories::ProjectDirs;
+                    ProjectDirs::from("com", "chiral-network", "chiral-network")
+                        .map(|dirs| dirs.data_dir().join("files"))
+                        .unwrap_or_else(|| std::env::current_dir().unwrap().join("files"))
+                })),
+                http_server_addr: Arc::new(Mutex::new(None)),
+                http_server_shutdown: Arc::new(Mutex::new(None)),
+
+                // Initialize stream authentication
+                stream_auth: Arc::new(Mutex::new(stream_auth::StreamAuthService::new())),
+
+                // Initialize the new map for AES keys
+                canonical_aes_keys: Arc::new(Mutex::new(std::collections::HashMap::new())),
+
+                // Proof-of-Storage watcher background handle and contract address
+                // make these clonable so we can .clone() and move into spawned tasks
+                proof_watcher: Arc::new(Mutex::new(None)),
+                proof_contract_address: Arc::new(Mutex::new(None)),
+
+                // Relay reputation statistics
+                relay_reputation: Arc::new(Mutex::new(std::collections::HashMap::new())),
+
+                // Relay aliases
+                relay_aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
+
+                // Protocol Manager - initialized when DHT is started
+                protocol_manager: Mutex::new(None),
+
+                // Upload/Download Protocol Manager for FTP, WebRTC uploads (initialized when DHT starts)
+                upload_download_protocol_manager: Mutex::new(None),
+
+                // AutoRelay timeline persistence across DHT restarts
+                autorelay_last_enabled: Arc::new(Mutex::new(None)),
+                autorelay_last_disabled: Arc::new(Mutex::new(None)),
+
+                // File logger - will be initialized in setup phase after loading settings
+                file_logger: Arc::new(Mutex::new(None)),
+
+                // BitTorrent handler - initialized when DHT is started
+                bittorrent_handler: Mutex::new(None),
+
+                // Chunk manager (initialized when DHT starts)
+                chunk_manager: Mutex::new(None),
+
+                // Download restart service (will be initialized in setup)
+                download_restart: Mutex::new(None),
+
+                // FTP server - initialized with proper app data directory
+                ftp_server: ftp_server_arc,
+            });
+
+            // Auto-start DHT via the same code path as the frontend (start_dht_node)
+            if should_auto_start_dht {
+                let env_dht_port = std::env::var("CHIRAL_DHT_PORT")
+                    .or_else(|_| std::env::var("CHIRAL_P2P_PORT"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u16>().ok());
+                let port: u16 = env_dht_port.or(settings.port).unwrap_or(4001);
+
+                let bootstrap_nodes = match settings.custom_bootstrap_nodes.clone() {
+                    Some(nodes) if !nodes.is_empty() => nodes,
+                    _ => get_bootstrap_nodes(),
+                };
+
+                let enable_autonat = match settings.disable_direct_nat_traversal {
+                    Some(disabled) => !disabled,
+                    None => settings.enable_autonat.unwrap_or(true),
+                };
+
+                let enable_autorelay = if settings.ip_privacy_mode.as_deref() != Some("off") {
+                    true
+                } else {
+                    settings.enable_autorelay.unwrap_or(true)
+                };
+
+                let autonat_probe_interval_secs = settings.autonat_probe_interval.unwrap_or(30);
+                let chunk_size_kb = settings.chunk_size.unwrap_or(256);
+                let cache_size_mb = settings
+                    .cache_size
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(1024);
+                let enable_relay_server = settings.enable_relay_server.unwrap_or(false);
+                let enable_upnp = settings.enable_upnp.unwrap_or(true);
+                let pure_client_mode = settings.pure_client_mode;
+                let force_server_mode = settings.force_server_mode;
+                let autonat_servers = settings
+                    .autonat_servers
+                    .clone()
+                    .or_else(|| Some(bootstrap_nodes.clone()));
+
+                let preferred_relays = match settings.trusted_proxy_relays.clone() {
+                    Some(relays) if !relays.is_empty() => Some(relays),
+                    _ => settings.preferred_relays.clone(),
+                };
+
+                let proxy_address = if settings.enable_proxy.unwrap_or(false) {
+                    settings
+                        .proxy_address
+                        .clone()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+                .filter(|s| !s.is_empty());
+
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::block_on(async move {
+                    let state = app_handle.state::<AppState>();
+                    match start_dht_node(
+                        app_handle.clone(),
+                        state,
+                        port,
+                        bootstrap_nodes,
+                        enable_autonat,
+                        autonat_probe_interval_secs,
+                        chunk_size_kb,
+                        cache_size_mb,
+                        enable_autorelay,
+                        enable_relay_server,
+                        enable_upnp,
+                        pure_client_mode,
+                        force_server_mode,
+                        autonat_servers,
+                        preferred_relays,
+                        proxy_address,
+                    )
+                    .await
+                    {
+                        Ok(peer_id) => info!("✓ Auto-start DHT enabled: peer_id={}", peer_id),
+                        Err(e) => warn!("Auto-start DHT failed: {}", e),
+                    }
+                });
+            }
+
+            info!(
+                "✓ Network services ready (auto-start DHT: {})",
+                should_auto_start_dht
+            );
 
             // Clean up any orphaned geth processes on startup
             #[cfg(unix)]
@@ -10416,7 +10714,11 @@ fn main() {
                         let persistent_torrents = state_manager.await.get_all();
 
                         // Set the app_handle on the BitTorrent handler so it can emit events
-                        let bittorrent_handler = state.bittorrent_handler.clone();
+                        let bittorrent_handler = { state.bittorrent_handler.lock().await.as_ref().cloned() };
+                        let Some(bittorrent_handler) = bittorrent_handler else {
+                            info!("BitTorrent handler not initialized; skipping torrent restoration");
+                            return;
+                        };
                         bittorrent_handler.set_app_handle(app_handle.clone()).await;
                         info!("AppHandle set on BitTorrentHandler");
 
@@ -10586,6 +10888,71 @@ fn main() {
         });
 }
 
+// Reputation system Tauri commands
+#[tauri::command]
+async fn publish_reputation_verdict(
+    verdict: reputation::TransactionVerdict,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    println!("📊 RUST: publish_reputation_verdict called");
+    tracing::info!(
+        "📊 publish_reputation_verdict: {} -> {} ({:?})",
+        verdict.issuer_id,
+        verdict.target_id,
+        verdict.outcome
+    );
+
+    // Get DHT service from AppState
+    let dht_guard = state.dht.lock().await;
+    let dht = dht_guard
+        .as_ref()
+        .ok_or_else(|| "DHT service not initialized".to_string())?;
+
+    // Create ReputationDhtService and store verdict
+    let mut reputation_dht = reputation::ReputationDhtService::new();
+    reputation_dht.set_dht_service(Arc::clone(dht));
+    println!("📊 RUST: About to store verdict");
+    reputation_dht.store_transaction_verdict(&verdict).await?;
+
+    println!("✅ RUST: Verdict stored successfully");
+    tracing::info!(
+        "✅ Published verdict to DHT for peer: {}",
+        verdict.target_id
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_reputation_verdicts(
+    peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<reputation::TransactionVerdict>, String> {
+    println!("🔍 RUST: get_reputation_verdicts called for: {}", peer_id);
+    tracing::info!("📊 get_reputation_verdicts for peer: {}", peer_id);
+
+    // Get DHT service from AppState
+    let dht_guard = state.dht.lock().await;
+    let dht = dht_guard
+        .as_ref()
+        .ok_or_else(|| "DHT service not initialized".to_string())?;
+
+    // Create ReputationDhtService and retrieve verdicts
+    let mut reputation_dht = reputation::ReputationDhtService::new();
+    reputation_dht.set_dht_service(Arc::clone(dht));
+    println!("🔍 RUST: About to retrieve verdicts");
+    let verdicts = reputation_dht
+        .retrieve_transaction_verdicts(&peer_id)
+        .await?;
+
+    println!("✅ RUST: Retrieved {} verdicts", verdicts.len());
+    tracing::info!(
+        "✅ Retrieved {} verdicts for peer: {}",
+        verdicts.len(),
+        peer_id
+    );
+    Ok(verdicts)
+}
+
 async fn create_bt_handler_with_fallback(
     download_dir: PathBuf,
     dht_service: Arc<DhtService>,
@@ -10607,11 +10974,10 @@ async fn create_bt_handler_with_fallback(
         "Default BitTorrent port range {}-{} unavailable. Falling back to a random high port range...",
         port_range.start, port_range.end
     );
-    let mut rng = rand::thread_rng();
-
     // Try up to 50 times to find an available port range
     for attempt in 0..50 {
-        let start = rng.gen_range(30000..60000);
+        // IMPORTANT: Don't hold ThreadRng across await (tauri commands require Send futures).
+        let start = rand::thread_rng().gen_range(30000..60000);
         let fallback = start..(start + 10);
 
         match bittorrent_handler::BitTorrentHandler::new_with_port_range(
@@ -11169,6 +11535,68 @@ fn get_default_storage_directory() -> String {
     }
 }
 
+/// Upload file via FTP using the ProtocolManager
+#[tauri::command]
+async fn upload_via_ftp(
+    state: State<'_, AppState>,
+    file_path: String,
+    ftp_url: String,
+    username: Option<String>,
+    password: Option<String>,
+    use_ftps: bool,
+    passive_mode: bool,
+    price_per_mb: f64,
+) -> Result<protocol_manager::FtpUploadResult, String> {
+    info!(
+        "📤 upload_via_ftp called: file={}, ftp_url={}",
+        file_path, ftp_url
+    );
+
+    let protocol_manager_guard = state.upload_download_protocol_manager.lock().await;
+    let protocol_manager = protocol_manager_guard
+        .as_ref()
+        .ok_or_else(|| "Protocol manager not initialized".to_string())?;
+
+    protocol_manager
+        .upload_via_ftp(
+            file_path,
+            ftp_url,
+            username,
+            password,
+            use_ftps,
+            passive_mode,
+            price_per_mb,
+        )
+        .await
+        .map_err(|e| {
+            error!("❌ FTP upload failed: {}", e);
+            e.to_string()
+        })
+}
+
+/// Upload file via WebRTC using the ProtocolManager
+#[tauri::command]
+async fn upload_via_webrtc(
+    state: State<'_, AppState>,
+    file_path: String,
+    price_per_mb: f64,
+) -> Result<protocol_manager::WebRTCUploadResult, String> {
+    info!("📤 upload_via_webrtc called: file={}", file_path);
+
+    let protocol_manager_guard = state.upload_download_protocol_manager.lock().await;
+    let protocol_manager = protocol_manager_guard
+        .as_ref()
+        .ok_or_else(|| "Protocol manager not initialized".to_string())?;
+
+    protocol_manager
+        .upload_via_webrtc(file_path, price_per_mb)
+        .await
+        .map_err(|e| {
+            error!("❌ WebRTC upload failed: {}", e);
+            e.to_string()
+        })
+}
+
 /// Event pump for DHT events, moved out of start_dht_node
 async fn pump_dht_events(
     app_handle: tauri::AppHandle,
@@ -11244,9 +11672,7 @@ async fn pump_dht_events(
                     let payload = serde_json::json!({ "state": state, "confidence": confidence, "lastError": last_error, "summary": summary });
                     let _ = app_handle.emit("nat_status_update", payload);
                 }
-                DhtEvent::FileDiscovered(metadata) => {
-                    let _ = app_handle.emit("found_file", &metadata);
-                }
+                // Note: DhtEvent::FileDiscovered removed - file discovery now uses DhtMetadataFound
                 DhtEvent::PublishedFile(metadata) => {
                     let _ = app_handle.emit("published_file", &metadata);
                 }
@@ -11327,6 +11753,10 @@ async fn pump_dht_events(
                     created_at,
                     mime_type,
                 } => {
+                    info!(
+                        "📡 [Command Event Pump] Emitting dht_metadata_found: {}",
+                        file_name
+                    );
                     let _ = app_handle.emit(
                         "dht_metadata_found",
                         serde_json::json!({
@@ -11337,6 +11767,7 @@ async fn pump_dht_events(
                             "mimeType": mime_type
                         }),
                     );
+                    info!("✅ [Command Event Pump] EMITTED DHTMETADATAFOUND TO FRONTEND");
                 }
                 DhtEvent::ProvidersFound {
                     file_hash,
