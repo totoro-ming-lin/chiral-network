@@ -1261,8 +1261,7 @@
     { value: "WebRTC", label: "WebRTC" },
     { value: "BitTorrent", label: "BitTorrent" },
     { value: "ED2K", label: "ED2K" },
-    { value: "FTP", label: "FTP" },
-    { value: "Bitswap", label: "BitSwap"}
+    { value: "FTP", label: "FTP" }
   ];
 
   async function handleCopy(hash: string) {
