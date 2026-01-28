@@ -214,7 +214,10 @@ fn merge_protocol_details(
     };
 
     // Merge encryption details (prefer new if available)
-    let encryption = new.encryption.clone().or_else(|| existing.encryption.clone());
+    let encryption = new
+        .encryption
+        .clone()
+        .or_else(|| existing.encryption.clone());
 
     ProtocolDetails {
         http,
@@ -1701,7 +1704,6 @@ async fn run_dht_node(
                 _ = gossipsub_general_interval.tick() => {
                     let general_info_opt = published_general_info.lock().await.clone();
                     if let Some(general_info) = general_info_opt {
-                        info!("Yes general");
 
                         let general_topic = general_seeder_topic(&peer_id);
                         match serde_json::to_vec(&general_info) {
