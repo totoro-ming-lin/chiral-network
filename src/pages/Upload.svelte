@@ -49,6 +49,7 @@
   import { settings } from "$lib/stores";
   import { paymentService } from '$lib/services/paymentService';
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import type { UploadProtocol } from "$lib/services/uploadService";
   const tr = (k: string, params?: Record<string, any>): string =>
     $t(k, params);
 
@@ -192,6 +193,9 @@
   let ftpPassword = '';
   let ftpUseFTPS = false;
   let ftpPassiveMode = true;
+
+  // Track upload progress for each file (refactored architecture)
+  let uploadProgress = new Map<string, { percent: number; status: string }>();
 
   // Calculate price using dynamic network metrics with safe fallbacks
   async function uploadFileStreamingToDisk(file: File) {
@@ -971,6 +975,16 @@
   });
 
   async function openFileDialog() {
+    console.log("[UPLOAD] openFileDialog called");
+    console.log("[UPLOAD] Selected protocol:", selectedProtocol);
+    if (selectedProtocol === "FTP") {
+      console.log("[UPLOAD] FTP configuration:");
+      console.log("[UPLOAD]   - FTP URL:", ftpUrl);
+      console.log("[UPLOAD]   - Username:", ftpUsername || "anonymous");
+      console.log("[UPLOAD]   - Use FTPS:", ftpUseFTPS);
+      console.log("[UPLOAD]   - Passive mode:", ftpPassiveMode);
+    }
+
     // Verify backend has active account before proceeding
     if (isTauri) {
       try {
@@ -1054,293 +1068,189 @@
     }
   }
 
+  /**
+   * Add files to network using the new uploadService (refactored for DRY)
+   * Replaces old implementation with cleaner, protocol-agnostic approach
+   */
   async function addFilesFromPaths(paths: string[]) {
-    // Fallback: Force reset isUploading after 30 seconds to prevent UI from being stuck
+    console.log("[UPLOAD] addFilesFromPaths called with", paths.length, "file(s)");
+    console.log("[UPLOAD] Selected protocol:", selectedProtocol);
+
+    // Timeout failsafe (increased to 60s for large files)
     const forceResetTimeout = setTimeout(() => {
-      console.log(`[UPLOAD] Force resetting isUploading due to timeout`);
+      console.warn("[UPLOAD] Upload timeout - resetting");
       isUploading = false;
       showToast("Upload timed out - please try again", "error");
-    }, 30000);
+    }, 60000);
+    console.log("[UPLOAD] 60-second timeout failsafe armed");
 
-    // STEP 1: Verify backend has active account before proceeding
-    if (isTauri) {
-      try {
-        const hasAccount = await invoke<boolean>("has_active_account");
-        if (!hasAccount) {
-          showToast(
-            // "Please log in to your account before uploading files",
-            tr("toasts.upload.loginRequired"),
-            "error",
-          );
-          clearTimeout(forceResetTimeout);
-          isUploading = false;
-          return;
-        }
-      } catch (error) {
-        console.error("Failed to verify account status:", error);
-        showToast(
-          // "Failed to verify account status. Please try logging in again.",
-          tr("toasts.upload.verifyAccountFailed"),
-          "error",
-        );
-        clearTimeout(forceResetTimeout);
-        isUploading = false;
+    try {
+      // Import upload service
+      const {
+        uploadFile,
+        validateUploadPrerequisites,
+      } = await import("$lib/services/uploadService");
+
+      // Validate prerequisites (replaces steps 1-2)
+      const validation = await validateUploadPrerequisites();
+      if (!validation.valid) {
+        showToast(validation.error || "Upload validation failed", "error");
         return;
       }
-    }
 
-    // STEP 2: Ensure DHT is connected before attempting upload
-    const dhtConnected = await isDhtConnected();
-    if (!dhtConnected) {
-      showToast(
-        // "DHT network is not connected. Please start the DHT network before uploading files.",
-        tr("toasts.upload.dhtDisconnected"),
-        "error",
-      );
-      clearTimeout(forceResetTimeout);
-      isUploading = false;
-      return;
-    }
+      // Check pure client mode (step 3)
+      if ($settings.pureClientMode) {
+        showToast(tr("toasts.upload.pureClientMode"), "error");
+        return;
+      }
 
-    // STEP 3: Check if node is in pure-client mode (cannot seed files)
-    if ($settings.pureClientMode) {
-      showToast(
-        tr("toasts.upload.pureClientMode"),
-        "error",
-      );
-      clearTimeout(forceResetTimeout);
-      isUploading = false;
-      return;
-    }
+      let addedCount = 0;
 
-    let addedCount = 0;
+      // Process each file with new uploadService
+      for (const filePath of paths) {
+        try {
+          const fileName = filePath.replace(/^.*[\\/]/, "") || "";
+          console.log("[UPLOAD] Processing:", fileName);
 
-    // Unified upload flow for all protocols
-    for (const filePath of paths) {
-      try {
-        const fileName = filePath.replace(/^.*[\\/]/, "") || "";
+          // Initialize progress tracking
+          uploadProgress.set(filePath, { percent: 0, status: "preparing" });
+          uploadProgress = uploadProgress; // Trigger reactivity
 
-        // Get file size to calculate price
-        const fileSize = await invoke<number>("get_file_size", { filePath });
-        const price = await calculateFilePrice(fileSize);
+          // Get file size and calculate price
+          const fileSize = await invoke<number>("get_file_size", { filePath });
+          const pricePerMb = await calculatePricePerMb(fileSize);
 
-        // Handle BitTorrent differently - create and seed torrent
-        if (selectedProtocol === "BitTorrent") {
-          const magnetLink = await invoke<string>('create_and_seed_torrent', { filePath });
-
-          const torrentFile = {
-            id: `torrent-${Date.now()}-${Math.random()}`,
-            name: fileName,
-            hash: magnetLink, // Use magnet link as hash for torrents
-            size: fileSize,
-            path: filePath,
-            seederAddresses: [],
-            uploadDate: new Date(),
-            seeders: 1,
-            status: "seeding" as const,
-            price: 0, // BitTorrent is free
+          // Handle hashing progress
+          const onHashingProgress = (progress: any) => {
+            uploadProgress.set(filePath, {
+              percent: progress.percent,
+              status: "hashing",
+            });
+            uploadProgress = uploadProgress; // Trigger reactivity
           };
 
-          files.update(f => [...f, torrentFile]);
-          // showToast(`${fileName} is now seeding as a torrent`, "success");
-          showToast(
-            tr('toasts.upload.torrentSeeding', { values: { name: fileName } }),
-            "success"
-          );
-          // continue; // Skip the normal Chiral upload flow
-        }
+          // Prepare FTP config if needed
+          const ftpConfig =
+            selectedProtocol === "FTP"
+              ? {
+                  url: ftpUrl,
+                  username: ftpUsername || undefined,
+                  password: ftpPassword || undefined,
+                  useFtps: ftpUseFTPS,
+                  passiveMode: ftpPassiveMode,
+                }
+              : undefined;
 
-        // Handle FTP upload to external server
-        if (selectedProtocol === "FTP" && ftpUrl) {
-          try {
-            // Show upload in progress toast
-            showToast(
-              `Uploading ${fileName} to FTP server...`,
-              "info"
-            );
+          // Upload file using unified service
+          uploadProgress.set(filePath, { percent: 0, status: "uploading" });
+          uploadProgress = uploadProgress;
 
-            // Upload file to external FTP server
-            const uploadedUrl = await invoke<string>('upload_to_external_ftp', {
-              filePath,
-              ftpUrl,
-              username: ftpUsername || null,
-              password: ftpPassword || null,
-              useFtps: ftpUseFTPS,
-              passiveMode: ftpPassiveMode,
-            });
+          const result = await uploadFile({
+            protocol: selectedProtocol as UploadProtocol,
+            filePath,
+            pricePerMb,
+            ftpConfig,
+            onHashingProgress,
+          });
 
-            // Create file entry with FTP URL
-            const ftpFile = {
-              id: `ftp-${Date.now()}-${Math.random()}`,
-              name: fileName,
-              hash: uploadedUrl, // Use FTP URL as hash
-              protocolHash: uploadedUrl,
-              size: fileSize,
-              path: filePath,
-              seederAddresses: [],
-              uploadDate: new Date(),
-              seeders: 1,
-              status: "seeding" as const,
-              price: 0, // FTP is free
-              protocol: "FTP" as const,
-            };
-
-            files.update(f => [...f, ftpFile]);
-            showToast(
-              `${fileName} uploaded to FTP server successfully`,
-              "success"
-            );
-            addedCount++;
-            continue; // Skip the normal Chiral upload flow
-          } catch (error) {
-            console.error("FTP upload failed:", error);
-            showToast(
-              `FTP upload failed: ${error}`,
-              "error"
-            );
-            continue;
-          }
-        }
-
-        // Copy file to temp location to prevent original file from being moved
-        const tempFilePath = await invoke<string>("copy_file_to_temp", {
-          filePath,
-        });
-
-        // Extract original filename from the file path
-        const originalFileName = filePath.split(/[/\\]/).pop() || filePath;
-
-        const metadata = await dhtService.publishFileToNetwork(
-          tempFilePath,
-          price,
-          selectedProtocol,
-          originalFileName,
-        );
-
-        // Use seeders from metadata (backend already adds local peer ID via heartbeat system)
-        // Only add WebSocket client ID if no seeders exist (shouldn't happen in normal flow)
-        const allSeederAddresses = metadata.seeders && metadata.seeders.length > 0
-          ? metadata.seeders
-          : (signalingService?.clientId ? [signalingService.clientId] : []);
-
-        // Construct protocol-specific hash for display
-        let protocolHash = metadata.merkleRoot || "";
-        if ((selectedProtocol as "WebRTC" | "BitTorrent" | "ED2K" | "FTP") === "BitTorrent" && metadata.infoHash) {
-          // Construct magnet link for BitTorrent
-          const trackers = metadata.trackers
-            ? metadata.trackers.join("&tr=")
-            : "udp://tracker.openbittorrent.com:80";
-          protocolHash = `magnet:?xt=urn:btih:${metadata.infoHash}&tr=${trackers}`;
-        } else if (
-          selectedProtocol === "ED2K" &&
-          metadata.ed2kSources &&
-          metadata.ed2kSources.length > 0
-        ) {
-          // Use the first ED2K source
-          const ed2kSource = metadata.ed2kSources[0];
-          protocolHash = `ed2k://|file|${metadata.fileName}|${metadata.fileSize}|${ed2kSource.file_hash}|/`;
-        } else if (
-          selectedProtocol === "FTP" &&
-          metadata.ftpSources &&
-          metadata.ftpSources.length > 0
-        ) {
-          // Use the first FTP source
-          protocolHash = metadata.ftpSources[0].url;
-        }
-
-        const newFile = {
-          id: `file-${Date.now()}-${Math.random()}`,
-          name: metadata.fileName,
-          path: filePath,
-          hash: metadata.merkleRoot || "",
-          protocolHash,
-          size: metadata.fileSize,
-          status: "seeding" as const,
-          seeders: metadata.seeders?.length ?? 0,
-          seederAddresses: allSeederAddresses,
-          leechers: 0,
-          uploadDate: new Date(metadata.createdAt),
-          price: price,
-          cids: metadata.cids,
-          protocol: selectedProtocol, // Track which protocol was used
-        };
-
-        let existed = false;
-        files.update((f) => {
-          const matchIndex = f.findIndex(
-            (item) =>
-              metadata.merkleRoot &&
-              item.hash === metadata.merkleRoot &&
-              item.protocol === selectedProtocol,
-          );
-
-          if (matchIndex !== -1) {
-            const existing = f[matchIndex];
-            // Use seeders from metadata (backend already adds local peer ID via heartbeat system)
-            // Only add WebSocket client ID if no seeders exist (shouldn't happen in normal flow)
-            const mergedSeederAddresses = (metadata.seeders && metadata.seeders.length > 0)
-              ? metadata.seeders
-              : (existing.seederAddresses && existing.seederAddresses.length > 0)
-                ? existing.seederAddresses
-                : (signalingService?.clientId ? [signalingService.clientId] : []);
-            const updated = {
-              ...existing,
-              name: metadata.fileName || existing.name,
-              hash: metadata.merkleRoot || existing.hash,
-              size: metadata.fileSize ?? existing.size,
-              seeders: metadata.seeders?.length ?? existing.seeders,
-              seederAddresses: mergedSeederAddresses,
-              uploadDate: new Date(
-                (metadata.createdAt ??
-                  existing.uploadDate?.getTime() ??
-                  Date.now()) * 1000,
-              ),
-              status: "seeding" as const,
-              price: price,
-            };
-            f = f.slice();
-            f[matchIndex] = updated;
-            existed = true;
-          } else {
-            f = [...f, newFile];
+          if (!result.success) {
+            throw new Error(result.error || "Upload failed");
           }
 
-          return f;
-        });
+          console.log("[UPLOAD] Upload result:", result);
 
-        if (existed) {
-          // File was updated, not skipped - don't count as duplicate
-          showToast(
-            tr("upload.fileUpdated", { values: { name: fileName } }),
-            "info",
-          );
-        } else {
-          addedCount++;
-          // showToast(`${fileName} uploaded successfully`, "success");
+          // Clear progress
+          uploadProgress.delete(filePath);
+          uploadProgress = uploadProgress;
+
+          // Create file entry
+          const newFile = {
+            id: `file-${Date.now()}-${Math.random()}`,
+            name: fileName,
+            path: filePath,
+            hash: result.fileHash || "",
+            protocolHash: result.protocolHash || result.fileHash || "",
+            size: fileSize,
+            status: "seeding" as const,
+            seeders: 1,
+            seederAddresses: [],
+            leechers: 0,
+            uploadDate: new Date(),
+            price: pricePerMb * (fileSize / (1024 * 1024)),
+            protocol: selectedProtocol,
+          };
+
+          console.log("[UPLOAD] Created newFile entry:", newFile);
+
+          // Update files store
+          files.update((f) => {
+            // Check if file already exists
+            const existingIndex = f.findIndex(
+              (item) => item.hash === newFile.hash && item.protocol === selectedProtocol
+            );
+
+            if (existingIndex !== -1) {
+              // Update existing file
+              const updated = { ...f[existingIndex], ...newFile };
+              return [...f.slice(0, existingIndex), updated, ...f.slice(existingIndex + 1)];
+            } else {
+              // Add new file
+              return [...f, newFile];
+            }
+          });
+
           showToast(
             tr("toasts.upload.fileSuccess", { values: { name: fileName } }),
-            "success",
+            "success"
+          );
+          addedCount++;
+        } catch (error) {
+          console.error(`[UPLOAD] Error uploading ${filePath}:`, error);
+
+          // Clear progress
+          uploadProgress.delete(filePath);
+          uploadProgress = uploadProgress;
+
+          showToast(
+            tr("upload.fileFailed", {
+              values: {
+                name: filePath.replace(/^.*[\\/]/, ""),
+                error: String(error),
+              },
+            }),
+            "error"
           );
         }
-      } catch (error) {
-        console.error(`[UPLOAD] Error uploading ${filePath}:`, error);
-        showToast(
-          tr("upload.fileFailed", {
-            values: {
-              name: filePath.replace(/^.*[\\/]/, ""),
-              error: String(error),
-            },
-          }),
-          "error",
-        );
       }
+
+      if (addedCount > 0) {
+        setTimeout(() => refreshAvailableStorage(), 100);
+      }
+    } finally {
+      clearTimeout(forceResetTimeout);
+      isUploading = false;
+    }
+  }
+
+  /**
+   * Helper to calculate price per MB (extracted for reusability)
+   */
+  async function calculatePricePerMb(sizeInBytes: number): Promise<number> {
+    const sizeInMB = sizeInBytes / (1024 * 1024);
+
+    // Try dynamic pricing first
+    try {
+      const dynamicPrice = await paymentService.calculateDownloadCost(sizeInBytes);
+      if (Number.isFinite(dynamicPrice) && dynamicPrice > 0) {
+        return Number((dynamicPrice / sizeInMB).toFixed(8));
+      }
+    } catch (error) {
+      console.warn("Dynamic pricing failed, using static rate:", error);
     }
 
-    if (addedCount > 0) {
-      setTimeout(() => refreshAvailableStorage(), 100);
-    }
-    clearTimeout(forceResetTimeout);
-    isUploading = false;
+    // Fallback to static pricing
+    const staticPricePerMB = 0.001; // 0.001 Chiral per MB
+    return staticPricePerMB;
   }
 
   // Use centralized file size formatting for consistency
@@ -1351,7 +1261,7 @@
     { value: "WebRTC", label: "WebRTC" },
     { value: "BitTorrent", label: "BitTorrent" },
     { value: "ED2K", label: "ED2K" },
-    { value: "FTP", label: "FTP" },
+    { value: "FTP", label: "FTP" }
   ];
 
   async function handleCopy(hash: string) {
@@ -1527,6 +1437,33 @@
         bind:ftpUseFTPS
         bind:ftpPassiveMode
       />
+    </Card>
+  {/if}
+
+  <!-- Upload Progress Indicators -->
+  {#if uploadProgress.size > 0}
+    <Card class="p-4 space-y-3 bg-blue-50 border-blue-200">
+      <div class="flex items-center gap-2">
+        <RefreshCw class="w-4 h-4 animate-spin text-blue-600" />
+        <span class="font-semibold text-blue-800">Uploading files...</span>
+      </div>
+      {#each Array.from(uploadProgress.entries()) as [filePath, progress]}
+        <div class="space-y-1">
+          <div class="flex justify-between text-sm">
+            <span class="truncate text-blue-700">{filePath.split(/[/\\]/).pop()}</span>
+            <span class="text-blue-600">{progress.percent.toFixed(0)}%</span>
+          </div>
+          <div class="h-2 bg-blue-100 rounded-full overflow-hidden">
+            <div
+              class="h-full bg-blue-500 transition-all duration-300"
+              style="width: {progress.percent}%"
+            ></div>
+          </div>
+          <div class="text-xs text-blue-600 capitalize">
+            {progress.status}
+          </div>
+        </div>
+      {/each}
     </Card>
   {/if}
 

@@ -454,16 +454,23 @@ impl MultiSourceDownloadService {
         }
 
         // Search for file metadata with sufficient timeout for DHT queries
-        // Using 35s to match main.rs and allow full Kademlia query time (30s) + provider queries
-        let metadata = match self
-            .dht_service
-            .synchronous_search_metadata(file_hash.clone(), 35000)
+        // Trigger progressive search and poll cache until metadata arrives
+        self.dht_service
+            .search_metadata(file_hash.clone(), 35000)
             .await
-        {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => return Err("File metadata not found".to_string()),
-            Err(e) => return Err(format!("DHT search failed: {}", e)),
-        };
+            .map_err(|e| format!("Failed to trigger DHT search: {}", e))?;
+
+        // Poll cache for up to 35 seconds until metadata arrives via events
+        let mut metadata = None;
+        for _ in 0..350 {  // 350 * 100ms = 35s
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if let Some(meta) = self.dht_service.get_cached_metadata(&file_hash).await {
+                metadata = Some(meta);
+                break;
+            }
+        }
+
+        let metadata = metadata.ok_or_else(|| "File metadata not found after 35s".to_string())?;
 
         // Discover available sources (P2P peers + FTP sources)
         let mut available_sources = Vec::new();

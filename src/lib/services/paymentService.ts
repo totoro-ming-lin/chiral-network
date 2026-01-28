@@ -41,7 +41,7 @@ function saveTransactionsToStorage(txs: Transaction[]) {
     const serialized = JSON.stringify(txs);
     localStorage.setItem("chiral_transactions", serialized);
     console.log(
-      `💾 Saved ${txs.length} transactions to localStorage (${(serialized.length / 1024).toFixed(2)} KB)`
+      `💾 Saved ${txs.length} transactions to localStorage (${(serialized.length / 1024).toFixed(2)} KB)`,
     );
   } catch (error) {
     console.error("Failed to save transactions to localStorage:", error);
@@ -179,7 +179,7 @@ export class PaymentService {
         // Ratio clamped between 0.8x and 1.5x
         efficiencyFactor = Math.min(
           Math.max(actualEfficiency / baselineEfficiency, 0.8),
-          1.5
+          1.5,
         );
       }
 
@@ -226,7 +226,8 @@ export class PaymentService {
     fileName: string,
     fileSize: number,
     seederAddress: string,
-    seederPeerId?: string
+    seederPeerId?: string,
+    amountOverride?: number,
   ): Promise<{
     success: boolean;
     transactionId?: number;
@@ -243,7 +244,20 @@ export class PaymentService {
         };
       }
 
-      const amount = await this.calculateDownloadCost(fileSize);
+      let amount: number;
+      if (typeof amountOverride === "number") {
+        if (!Number.isFinite(amountOverride) || amountOverride < 0) {
+          return {
+            success: false,
+            error: "Invalid payment amount",
+          };
+        }
+        // Respect explicit 0 (used for free protocols), otherwise enforce minimum.
+        amount = amountOverride === 0 ? 0 : Math.max(amountOverride, 0.0001);
+        amount = parseFloat(amount.toFixed(8));
+      } else {
+        amount = await this.calculateDownloadCost(fileSize);
+      }
 
       if (!seederAddress || !this.WALLET_ADDRESS_REGEX.test(seederAddress)) {
         console.error("❌ Invalid seeder wallet address for payment", {
@@ -312,7 +326,7 @@ export class PaymentService {
 
       // Deduct from downloader's balance (support 8 decimal places)
       const newBalance = parseFloat(
-        (currentWallet.balance - amount).toFixed(8)
+        (currentWallet.balance - amount).toFixed(8),
       );
       console.log("💸 Balance Update:", {
         before: currentWallet.balance,
@@ -368,14 +382,14 @@ export class PaymentService {
       } catch (err) {
         console.warn(
           "Could not get peer ID for issuer_id, using wallet address:",
-          err
+          err,
         );
       }
 
       // Publish reputation verdict using signed message system (see docs/SIGNED_TRANSACTION_MESSAGES.md)
       try {
         console.log(
-          "📊 Attempting to publish reputation verdict for downloader→seeder"
+          "📊 Attempting to publish reputation verdict for downloader→seeder",
         );
         console.log("📊 seederPeerId:", seederPeerId);
         console.log("📊 seederAddress:", seederAddress);
@@ -395,12 +409,12 @@ export class PaymentService {
 
         console.log(
           "✅ Published good reputation verdict for seeder:",
-          seederPeerId || seederAddress
+          seederPeerId || seederAddress,
         );
       } catch (reputationError) {
         console.error(
           "❌ Failed to publish reputation verdict:",
-          reputationError
+          reputationError,
         );
         // Don't fail the payment if reputation update fails
       }
@@ -409,12 +423,12 @@ export class PaymentService {
       try {
         console.log(
           "📤 Sending payment notification with downloaderPeerId:",
-          downloaderPeerId
+          downloaderPeerId,
         );
         console.log("📤 Type of downloaderPeerId:", typeof downloaderPeerId);
         console.log(
           "📤 Is downloaderPeerId a peer ID?",
-          downloaderPeerId?.startsWith("12D3Koo")
+          downloaderPeerId?.startsWith("12D3Koo"),
         );
 
         await invoke("record_download_payment", {
@@ -460,7 +474,7 @@ export class PaymentService {
     fileSize: number,
     downloaderAddress: string,
     downloaderPeerId: string,
-    transactionHash?: string
+    transactionHash?: string,
   ): Promise<{ success: boolean; transactionId?: number; error?: string }> {
     try {
       // Generate unique key for this payment receipt
@@ -541,20 +555,20 @@ export class PaymentService {
       } catch (err) {
         console.warn(
           "Could not get peer ID for issuer_id, using wallet address:",
-          err
+          err,
         );
       }
 
       // Publish reputation verdict using signed message system (see docs/SIGNED_TRANSACTION_MESSAGES.md)
       try {
         console.log(
-          "📊 Attempting to publish reputation verdict for seeder→downloader"
+          "📊 Attempting to publish reputation verdict for seeder→downloader",
         );
         console.log("📊 downloaderPeerId:", downloaderPeerId);
         console.log("📊 downloaderAddress:", downloaderAddress);
         console.log(
           "📊 Using target_id:",
-          downloaderPeerId || downloaderAddress
+          downloaderPeerId || downloaderAddress,
         );
         console.log("📊 Using issuer_id:", seederPeerId);
 
@@ -571,12 +585,12 @@ export class PaymentService {
 
         console.log(
           "✅ Published good reputation verdict for downloader:",
-          downloaderPeerId || downloaderAddress
+          downloaderPeerId || downloaderAddress,
         );
       } catch (reputationError) {
         console.error(
           "❌ Failed to publish reputation verdict:",
-          reputationError
+          reputationError,
         );
         // Don't fail the payment if reputation update fails
       }
@@ -594,7 +608,7 @@ export class PaymentService {
       } catch (invokeError) {
         console.warn(
           "Failed to persist seeder payment to backend:",
-          invokeError
+          invokeError,
         );
         // Continue anyway - frontend state is updated
       }
@@ -739,7 +753,7 @@ export class PaymentService {
    * Handle a payment notification from the DHT
    */
   private static async handlePaymentNotification(
-    notification: any
+    notification: any,
   ): Promise<void> {
     try {
       console.log("💰 Payment notification received:", notification);
@@ -750,7 +764,7 @@ export class PaymentService {
         notification.file_name,
         notification.file_size,
         notification.downloader_address,
-        notification.transaction_hash
+        notification.transaction_hash,
       );
 
       if (result.success) {

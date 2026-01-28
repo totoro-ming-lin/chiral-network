@@ -1,13 +1,21 @@
 <script context="module" lang="ts">
   export interface PeerInfo {
     peerId: string;
+    walletAddress?: string;
     location?: string;
     latency_ms?: number;
     bandwidth_kbps?: number;
     reliability_score: number;
     price_per_mb: number;
+    offerSource?: 'seeder' | 'fallback';
     selected: boolean;
     percentage: number;
+  }
+
+  export interface SeederDetails {
+    peerId: string;
+    protocols?: string[];
+    protocolDetails?: any;
   }
 </script>
 
@@ -18,6 +26,7 @@
   import Badge from '$lib/components/ui/badge.svelte';
   import { Server, Zap, TrendingUp, Clock, X, Download, Globe, Wifi } from 'lucide-svelte';
   import { toHumanReadableSize } from '$lib/utils';
+  import { costFromPricePerMb, pickLowestPricePeer, weightedTotalCost } from '$lib/utils/pricing';
 
   export let show = false;
   export let fileName: string;
@@ -28,22 +37,38 @@
   export let isTorrent = false; // Flag to indicate torrent download (no peer selection needed)
   export let availableProtocols: Array<{id: string, name: string, description: string, available: boolean}> = [];
   export let isSeeding = false; // Flag to indicate if user is seeding this file
+  export let seederDetails: SeederDetails[] = [];
 
   // Filter to only available protocols for display
   $: validProtocols = availableProtocols.filter(p => p.available);
+
+  // Check if a peer supports the selected protocol
+  function peerSupportsProtocol(peerId: string, protocol: string): boolean {
+    const seeder = seederDetails.find(s => s.peerId === peerId);
+    if (!seeder || !seeder.protocols) return false;
+    return seeder.protocols.some(p => p.toLowerCase() === protocol.toLowerCase());
+  }
 
   const dispatch = createEventDispatcher<{
     confirm: void;
     cancel: void;
   }>();
 
-  // Calculate total cost
-  $: totalCost = peers
-    .filter(p => p.selected)
-    .reduce((sum, p) => {
-      const peerCost = (fileSize / 1024 / 1024) * p.price_per_mb;
-      return sum + (mode === 'manual' ? peerCost * (p.percentage / 100) : peerCost / peers.filter(p => p.selected).length);
-    }, 0);
+  $: selectedPeers = peers.filter(p => p.selected);
+
+  // Single payee model: pay the selected peer with the lowest offer.
+  $: paymentPeer = pickLowestPricePeer(peers);
+  $: requiresPaymentPeer = !isTorrent && !isSeeding && protocol !== 'ftp';
+
+  // Weighted total is still useful as an informational "blended" cost,
+  // but the actual payment goes to a single peer.
+  $: weightedCost = weightedTotalCost({ bytes: fileSize, peers });
+
+  $: estimatedPayment = (() => {
+    if (isSeeding) return 0;
+    if (!paymentPeer) return null;
+    return costFromPricePerMb({ bytes: fileSize, pricePerMb: paymentPeer.price_per_mb });
+  })();
 
   // Format speed
   function formatSpeed(kbps?: number): string {
@@ -95,7 +120,9 @@
     : 100;
 
   $: isValidAllocation = totalAllocation === 100;
-  $: selectedPeerCount = peers.filter(p => p.selected).length;
+  $: selectedPeerCount = selectedPeers.length;
+
+  $: hasValidPaymentPeer = !requiresPaymentPeer || (!!paymentPeer && !!paymentPeer.walletAddress);
 </script>
 
 {#if show}
@@ -221,7 +248,8 @@
               </thead>
               <tbody>
                 {#each peers as peer}
-                  <tr class="border-t hover:bg-muted/50 transition-colors {mode === 'auto' ? 'bg-muted/30' : ''}">
+                  {@const supportsProtocol = peerSupportsProtocol(peer.peerId, protocol)}
+                  <tr class="border-t transition-colors {mode === 'auto' ? 'bg-muted/30' : ''} {supportsProtocol ? 'hover:bg-muted/50' : 'opacity-40'}" title={supportsProtocol ? '' : `This peer does not support ${protocol.toUpperCase()}`}>
                     {#if mode === 'manual'}
                       <td class="p-3">
                         <label class="sr-only" for="peer-select-{peer.peerId.slice(0, 12)}">Select peer {peer.peerId.slice(0, 12)}...</label>
@@ -230,14 +258,18 @@
                           type="checkbox"
                           checked={peer.selected}
                           on:change={() => togglePeer(peer.peerId)}
-                          class="h-4 w-4 rounded border-gray-300 text-primary focus:ring-2 focus:ring-primary cursor-pointer"
+                          disabled={!supportsProtocol}
+                          class="h-4 w-4 rounded border-gray-300 text-primary focus:ring-2 focus:ring-primary {supportsProtocol ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'}"
                         />
                       </td>
                     {/if}
                     <td class="p-3">
                       <div class="flex items-center gap-2">
-                        <div class="h-2 w-2 rounded-full bg-emerald-500"></div>
+                        <div class="h-2 w-2 rounded-full {supportsProtocol ? 'bg-emerald-500' : 'bg-gray-400'}"></div>
                         <code class="font-mono text-sm">{peer.peerId.slice(0, 12)}...</code>
+                        {#if !supportsProtocol}
+                          <span class="text-xs text-muted-foreground">(no {protocol.toUpperCase()})</span>
+                        {/if}
                       </div>
                     </td>
                     <td class="p-3">
@@ -302,16 +334,35 @@
               {selectedPeerCount} of {peers.length}
             </Badge>
           </div>
-          <div class="flex justify-between items-center">
-            <span class="font-medium text-sm">Estimated Cost:</span>
-            <span class="text-green-600 dark:text-green-400 font-bold">
-              {#if isSeeding}
-                Free
-              {:else}
-                {Math.max(totalCost, 0.0001).toFixed(4)} Chiral
-              {/if}
-            </span>
-          </div>
+           <div class="flex justify-between items-center">
+             <span class="font-medium text-sm">Estimated Payment:</span>
+             <span class="text-green-600 dark:text-green-400 font-bold">
+               {#if isSeeding}
+                 Free
+               {:else if estimatedPayment === null}
+                 Loading...
+               {:else}
+                 {estimatedPayment.toFixed(4)} Chiral
+               {/if}
+             </span>
+           </div>
+           {#if !isSeeding && !isTorrent && protocol !== 'ftp'}
+             <div class="flex justify-between items-center">
+               <span class="font-medium text-sm">Paying:</span>
+               <span class="text-sm text-muted-foreground">
+                 {#if paymentPeer}
+                   <code class="font-mono">{paymentPeer.peerId.slice(0, 12)}...</code>
+                   <span class="ml-2">@ {paymentPeer.price_per_mb.toFixed(4)} / MB</span>
+                 {:else}
+                   —
+                 {/if}
+               </span>
+             </div>
+             <div class="flex justify-between items-center">
+               <span class="font-medium text-sm">Blended Estimate:</span>
+               <span class="text-sm text-muted-foreground">{Math.max(weightedCost, 0.0001).toFixed(4)} Chiral</span>
+             </div>
+           {/if}
           {#if mode === 'manual'}
             <div class="flex justify-between items-center">
               <span class="font-medium text-sm">Total Allocation:</span>
@@ -338,7 +389,7 @@
           </Button>
           <Button
             on:click={handleConfirm}
-            disabled={!isTorrent && mode === 'manual' && (!isValidAllocation || selectedPeerCount === 0)}
+            disabled={(!isTorrent && mode === 'manual' && (!isValidAllocation || selectedPeerCount === 0)) || (!isTorrent && selectedPeerCount === 0) || !hasValidPaymentPeer}
           >
             <Download class="h-4 w-4 mr-2" />
             {isTorrent ? 'Start Download' : `Start Download (${selectedPeerCount} ${selectedPeerCount === 1 ? 'peer' : 'peers'})`}
