@@ -444,6 +444,8 @@
     }
   if (isTauri) {
       try {
+        console.log("saving settings");
+        console.log(localSettings)
         await invoke("save_app_settings", {
           settingsJson: JSON.stringify(localSettings),
         });
@@ -651,9 +653,12 @@
       autonatProbeIntervalSecs: localSettings.autonatProbeInterval,
       chunkSizeKb: localSettings.chunkSize,
       cacheSizeMb: localSettings.cacheSize,
-      enableAutorelay: localSettings.ipPrivacyMode !== "off" ? true : localSettings.enableAutorelay,
+      enableAutorelay:
+        localSettings.ipPrivacyMode !== "off" ? true : localSettings.enableAutorelay,
       enableRelayServer: localSettings.enableRelayServer,
       enableUpnp: localSettings.enableUPnP,
+      pureClientMode: localSettings.pureClientMode,
+      forceServerMode: localSettings.forceServerMode,
     };
 
     if (localSettings.autonatServers?.length) {

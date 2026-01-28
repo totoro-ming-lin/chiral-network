@@ -25,12 +25,14 @@ pub mod download_paths;
 
 // Required modules for multi_source_download
 pub mod dht;
+pub mod gossipsub_metadata;
 pub mod file_transfer;
 pub mod ftp_downloader;
 pub mod ftp_server;
 pub mod peer_selection;
 pub mod peer_cache;
 pub mod webrtc_service;
+pub mod protocol_manager;
 
 // Required modules for encryption and keystore functionality
 pub mod encryption;

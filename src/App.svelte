@@ -509,11 +509,8 @@ $: canShowLockAction = !showFirstRunWizard;
             }
           }
 
-          // Show wizard if no account AND no keystore files exist
-          // (Don't rely on first-run flag since user may have cleared data)
-          if (!hasAccount && !hasKeystoreFiles) {
-            showAuthWizard.set(true);
-          }
+          // Always show wallet selector on startup
+          showAuthWizard.set(true);
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : String(error);
           diagnosticLogger.warn('APP', 'Failed to check first-run status', { error: errorMsg });
@@ -592,6 +589,9 @@ $: canShowLockAction = !showFirstRunWizard;
           // Ensure selectedProtocol always has a valid default
           if (!parsed.selectedProtocol) {
             parsed.selectedProtocol = "WebRTC";
+          } else if (parsed.selectedProtocol === "BitSwap") {
+            // Backwards compatibility: older builds used "BitSwap"
+            parsed.selectedProtocol = "Bitswap";
           }
           settings.update(prev => ({ ...prev, ...parsed }));
         }
@@ -761,7 +761,8 @@ $: canShowLockAction = !showFirstRunWizard;
 
                 await invoke('start_geth_node', {
                   dataDir: './bin/geth-data',
-                  pureClientMode: isClientMode  // Combined: forced OR NAT-based
+                  pureClientMode: isClientMode,  // Combined: forced OR NAT-based
+                  allowStartAnyway: true,
                 });
 
                 // Update geth status

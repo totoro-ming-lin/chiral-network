@@ -16,7 +16,13 @@
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
   import { dhtService, type DhtHealth as DhtHealthSnapshot, type NatConfidence, type NatReachabilityState } from '$lib/dht'
-  import { getStatus as fetchGethStatus, type GethStatus } from '$lib/services/gethService'
+  import {
+    getStatus as fetchGethStatus,
+    type GethStatus,
+    gethTransition,
+    markGethStarting,
+    markGethStopping
+  } from '$lib/services/gethService'
   import { resetConnectionAttempts } from '$lib/dhtHelpers'
   import { relayErrorService } from '$lib/services/relayErrorService'
   import { Clipboard } from "lucide-svelte"
@@ -92,8 +98,23 @@
   let peerCount = 0
   let peerCountInterval: ReturnType<typeof setInterval> | undefined
   let chainId: number | null = 98765; // Default, will be fetched from backend
-  // Reactive node address from wallet
-  $: nodeAddress = $wallet.address || ''
+
+  type GethDataCompatibilityStatus = 'ok' | 'missing' | 'mismatch' | 'unknown' | 'corrupted'
+  type GethDataCompatibility = {
+    status: GethDataCompatibilityStatus
+    expected_chain_id: number
+    expected_genesis_sha256: string
+    detected_chain_id: number | null
+    detected_genesis_sha256: string | null
+    message: string
+  }
+
+  let gethDataCompatibility: GethDataCompatibility | null = null
+  // Wallet address (account) vs. blockchain node identity (geth node id)
+  let walletAddress = ''
+  $: walletAddress = $wallet.address || ''
+  let nodeAddress = '' // Geth node id (admin_nodeInfo.id)
+  let nodeEnode: string | null = null
   // let copiedNodeAddr = false
   
   // DHT variables
@@ -1132,6 +1153,12 @@
         peerCountInterval = undefined
       }
       peerCount = 0
+      nodeAddress = ''
+      nodeEnode = null
+    }
+
+    if (status.running && !nodeAddress) {
+      void refreshGethNodeInfo()
     }
   }
 
@@ -1149,10 +1176,23 @@
       const status = await fetchGethStatus('./bin/geth-data', 1)
       // Preserve the running state - don't stop the node if it's already running
       applyGethStatus(status)
+      await refreshGethDataCompatibility()
     } catch (error) {
       errorLogger.networkError(`Failed to check geth status: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       isCheckingGeth = false
+    }
+  }
+
+  async function refreshGethDataCompatibility() {
+    if (!isTauri) return
+    try {
+      gethDataCompatibility = await invoke<GethDataCompatibility>('check_geth_data_compatibility', {
+        dataDir: './bin/geth-data'
+      })
+    } catch (error) {
+      diagnosticLogger.debug('Network', 'Failed to check geth data compatibility', { error: error instanceof Error ? error.message : String(error) })
+      gethDataCompatibility = null
     }
   }
 
@@ -1212,6 +1252,7 @@
     }
 
     isStartingNode = true
+    markGethStarting()
     try {
       // Check if in client mode (forced OR NAT-based)
       let isClientMode = $settings.pureClientMode;
@@ -1229,12 +1270,58 @@
 
       await invoke('start_geth_node', {
         dataDir: './bin/geth-data',
-        pureClientMode: isClientMode  // Combined: forced OR NAT-based
+        pureClientMode: isClientMode,  // Combined: forced OR NAT-based
+        allowStartAnyway: true
       })
       isGethRunning = true
       startPolling()
+      await refreshGethNodeInfo()
+      await refreshGethDataCompatibility()
     } catch (error) {
       errorLogger.networkError(`Failed to start Chiral node: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      isStartingNode = false
+    }
+  }
+
+  async function reinitAndStartGethNode() {
+    if (!isTauri) return
+
+    isStartingNode = true
+    markGethStarting()
+    try {
+      if (isGethRunning) {
+        await stopGethNode()
+      }
+
+      // Check if in client mode (forced OR NAT-based)
+      let isClientMode = $settings.pureClientMode;
+      if (!isClientMode) {
+        try {
+          const health = await dhtService.getHealth();
+          if (health && health.reachability === 'private') {
+            isClientMode = true;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      await invoke('start_geth_node', {
+        dataDir: './bin/geth-data',
+        pureClientMode: isClientMode,
+        allowReinit: true,
+        allowStartAnyway: false,
+      })
+
+      isGethRunning = true
+      startPolling()
+      await refreshGethNodeInfo()
+      await refreshGethDataCompatibility()
+      showToast(tr('toasts.network.gethReinitSuccess'), 'success')
+    } catch (error) {
+      errorLogger.networkError(`Failed to reinitialize Chiral node: ${error instanceof Error ? error.message : String(error)}`);
+      showToast(tr('toasts.network.gethReinitError', { values: { error: String(error) } }), 'error')
     } finally {
       isStartingNode = false
     }
@@ -1246,6 +1333,7 @@
       return
     }
 
+    markGethStopping()
     try {
       await invoke('stop_geth_node')
       isGethRunning = false
@@ -1254,6 +1342,8 @@
         peerCountInterval = undefined
       }
       peerCount = 0
+      nodeAddress = ''
+      nodeEnode = null
     } catch (error) {
       errorLogger.networkError(`Failed to stop Chiral node: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1277,6 +1367,39 @@
       await navigator.clipboard.writeText(text)
     } catch (e) {
       errorLogger.networkError(`Copy failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  function extractNodeIdFromEnode(enode: string | null | undefined): string | null {
+    if (!enode) return null
+    const prefix = 'enode://'
+    if (!enode.startsWith(prefix)) return null
+    const rest = enode.slice(prefix.length)
+    const at = rest.indexOf('@')
+    if (at === -1) return null
+    const id = rest.slice(0, at).trim()
+    return id.length ? id : null
+  }
+
+  async function refreshGethNodeInfo() {
+    if (!isTauri || !isGethRunning) {
+      nodeAddress = ''
+      nodeEnode = null
+      return
+    }
+
+    try {
+      const info = await invoke<any>('get_geth_node_info')
+      const id = (typeof info?.id === 'string' && info.id.trim().length) ? info.id.trim() : null
+      const enode = (typeof info?.enode === 'string' && info.enode.trim().length) ? info.enode.trim() : null
+
+      nodeEnode = enode
+      nodeAddress = id ?? extractNodeIdFromEnode(enode) ?? ''
+    } catch (error) {
+      errorLogger.networkError(`Failed to fetch geth node info: ${error instanceof Error ? error.message : String(error)}`)
+      if (!nodeAddress) {
+        nodeEnode = null
+      }
     }
   }
 
@@ -1599,13 +1722,30 @@
                 <Server class="h-5 w-5 text-primary" />
                 Blockchain Node
               </h3>
-              <Badge variant={isGethRunning ? 'default' : 'secondary'} class={isGethRunning ? 'bg-emerald-600' : ''}>
-                {isGethRunning ? 'Running' : !isGethInstalled ? 'Not Installed' : 'Stopped'}
+              <Badge
+                variant={isGethRunning ? 'default' : 'secondary'}
+                class={
+                  isGethRunning
+                    ? 'bg-emerald-600'
+                    : $gethTransition === 'starting'
+                      ? 'bg-blue-600'
+                      : $gethTransition === 'stopping'
+                        ? 'bg-amber-600'
+                        : ''
+                }
+              >
+                {#if $gethTransition === 'starting'}
+                  Starting…
+                {:else if $gethTransition === 'stopping'}
+                  Shutting down…
+                {:else}
+                  {isGethRunning ? 'Running' : !isGethInstalled ? 'Not Installed' : 'Stopped'}
+                {/if}
               </Badge>
             </div>
 
             <div class="space-y-6">
-              {#if !isGethInstalled}
+              {#if !isGethInstalled && $gethTransition === 'idle'}
                 <div class="text-center py-6 space-y-4">
                   <p class="text-muted-foreground text-sm">The Chiral blockchain node is required for transaction validation and mining.</p>
                   <Button on:click={downloadGeth} disabled={isDownloading}>
@@ -1625,7 +1765,7 @@
                     <Button
                       class="flex-1"
                       variant={isGethRunning ? "secondary" : "default"}
-                      disabled={isGethRunning || isStartingNode}
+                      disabled={isGethRunning || isStartingNode || $gethTransition !== 'idle'}
                       on:click={startGethNode}
                     >
                       {#if isStartingNode}
@@ -1637,12 +1777,86 @@
                     <Button 
                       class="flex-1" 
                       variant="destructive"
-                      disabled={!isGethRunning}
+                      disabled={!isGethRunning || $gethTransition !== 'idle'}
                       on:click={stopGethNode}
                     >
-                      <Square class="h-4 w-4 mr-2" /> Stop Node
+                      {#if $gethTransition === 'stopping'}
+                        <RefreshCw class="h-4 w-4 mr-2 animate-spin" /> Stopping…
+                      {:else if $gethTransition === 'starting'}
+                        <RefreshCw class="h-4 w-4 mr-2 animate-spin" /> Starting…
+                      {:else}
+                        <Square class="h-4 w-4 mr-2" /> Stop Node
+                      {/if}
                     </Button>
                   </div>
+
+                  {#if $gethTransition === 'starting'}
+                    <div class="rounded-lg border border-blue-500/20 bg-blue-500/10 p-3 text-sm text-blue-800">
+                      The node is starting up. This may take a few seconds while RPC becomes available.
+                    </div>
+                  {/if}
+
+                  {#if $gethTransition === 'stopping'}
+                    <div class="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800">
+                      The node is shutting down. This may take a few seconds while it flushes chain data.
+                    </div>
+                  {/if}
+
+                  {#if gethDataCompatibility && ['mismatch', 'unknown', 'corrupted'].includes(gethDataCompatibility.status)}
+                    <div
+                      class={
+                        gethDataCompatibility.status === 'unknown'
+                          ? 'rounded-lg border border-sky-500/20 bg-sky-500/10 p-3 text-sm text-sky-950'
+                          : 'rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-950'
+                      }
+                    >
+                      <div class="flex items-start gap-2">
+                        <AlertCircle
+                          class={
+                            gethDataCompatibility.status === 'unknown'
+                              ? 'h-4 w-4 mt-0.5 flex-shrink-0 text-sky-700'
+                              : 'h-4 w-4 mt-0.5 flex-shrink-0 text-amber-700'
+                          }
+                        />
+                        <div class="space-y-1">
+                          <div class="font-medium">
+                            {gethDataCompatibility.status === 'unknown'
+                              ? 'Chain data could not be verified'
+                              : 'Network upgrade detected'}
+                          </div>
+                          <div class={gethDataCompatibility.status === 'unknown' ? 'text-sky-900/90' : 'text-amber-900/90'}>
+                            {gethDataCompatibility.message}
+                          </div>
+                          <div class={gethDataCompatibility.status === 'unknown' ? 'text-xs text-sky-900/80' : 'text-xs text-amber-900/80'}>
+                            Expected chain: <span class="font-mono">{gethDataCompatibility.expected_chain_id}</span>
+                            {#if gethDataCompatibility.detected_chain_id !== null}
+                              · Your data: <span class="font-mono">{gethDataCompatibility.detected_chain_id}</span>
+                            {/if}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div class="mt-3 flex flex-col sm:flex-row gap-2">
+                        <Button
+                          class="sm:flex-1"
+                          on:click={reinitAndStartGethNode}
+                          disabled={isStartingNode || $gethTransition !== 'idle'}
+                        >
+                          Reinitialize to new network
+                        </Button>
+                        {#if !isGethRunning}
+                          <Button
+                            class="sm:flex-1"
+                            variant="secondary"
+                            on:click={startGethNode}
+                            disabled={isStartingNode || $gethTransition !== 'idle'}
+                          >
+                            Start anyway (existing data)
+                          </Button>
+                        {/if}
+                      </div>
+                    </div>
+                  {/if}
 
                   <div class="pt-2 border-t space-y-3">
                     <div class="flex justify-between text-sm">
@@ -1656,7 +1870,7 @@
                     <div class="space-y-1">
                       <span class="text-xs text-muted-foreground uppercase">Node Address</span>
                       <div class="flex items-center gap-2">
-                        <code class="bg-muted px-2 py-1 rounded text-xs font-mono flex-1 truncate" title={nodeAddress}>
+                        <code class="bg-muted px-2 py-1 rounded text-xs font-mono flex-1 truncate" title={nodeEnode ?? nodeAddress}>
                           {nodeAddress || 'Waiting for start...'}
                         </code>
                         {#if nodeAddress}
@@ -2063,9 +2277,9 @@
             <div class="space-y-1">
               <span class="text-xs text-muted-foreground uppercase">Blockchain Address</span>
               <div class="bg-muted/50 border border-border px-3 py-2 rounded-md text-sm font-mono text-foreground flex items-center">
-                <span class="flex-1 truncate" title={nodeAddress}>{nodeAddress || 'Unknown'}</span>
-                {#if nodeAddress}
-                  <Button variant="outline" size="icon" class="h-8 w-8 ml-2" on:click={() => copy(nodeAddress)}>
+                <span class="flex-1 truncate" title={walletAddress}>{walletAddress || 'Unknown'}</span>
+                {#if walletAddress}
+                  <Button variant="outline" size="icon" class="h-8 w-8 ml-2" on:click={() => copy(walletAddress)}>
                     <Clipboard class="h-4 w-4" />
                   </Button>
                 {/if}

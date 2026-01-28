@@ -57,6 +57,12 @@ export interface FileItem {
   isSeedingDownload?: boolean;
   protocol?: "WebRTC" | "BitTorrent" | "ED2K" | "FTP" | "Bitswap"; // Protocol used for upload
   uploaderAddress?: string; // Wallet address of the uploader for payment
+
+  // Download-side payment terms (single payee model)
+  paymentPeerId?: string;
+  paymentPeerWalletAddress?: string;
+  paymentPricePerMb?: number;
+  estimatedPaymentTotal?: number;
 }
 
 export interface ProtocolEntry {
@@ -331,20 +337,20 @@ export const coalescedFiles = derived(files, ($files): CoalescedFileItem[] => {
     // Calculate aggregate stats
     const totalSeeders = protocols.reduce(
       (sum, p) => sum + (p.technicalInfo.seederCount || 0),
-      0
+      0,
     );
     const totalLeechers = protocols.reduce(
       (sum, p) => sum + (p.technicalInfo.leechers || 0),
-      0
+      0,
     );
     const totalPrice = protocols.reduce(
       (sum, p) => sum + p.technicalInfo.price,
-      0
+      0,
     );
     const averagePrice =
       protocols.length > 0 ? totalPrice / protocols.length : 0;
     const isSeeding = protocols.some(
-      (p) => p.technicalInfo.status === "seeding"
+      (p) => p.technicalInfo.status === "seeding",
     );
 
     coalescedItems.push({
@@ -368,7 +374,7 @@ export const coalescedFiles = derived(files, ($files): CoalescedFileItem[] => {
 
   // Sort by latest upload date (most recent first)
   coalescedItems.sort(
-    (a, b) => b.latestUploadDate.getTime() - a.latestUploadDate.getTime()
+    (a, b) => b.latestUploadDate.getTime() - a.latestUploadDate.getTime(),
   );
 
   return coalescedItems;
@@ -394,7 +400,7 @@ const initialPaginationState: TransactionPaginationState = storedPagination
     };
 
 export const transactionPagination = writable<TransactionPaginationState>(
-  initialPaginationState
+  initialPaginationState,
 );
 
 // Persist pagination state to localStorage
@@ -408,7 +414,7 @@ if (typeof window !== "undefined") {
         hasMore: state.hasMore,
         batchSize: state.batchSize,
         // Don't persist isLoading state
-      })
+      }),
     );
   });
 }
@@ -431,7 +437,7 @@ const initialMiningPaginationState: MiningPaginationState =
       };
 
 export const miningPagination = writable<MiningPaginationState>(
-  initialMiningPaginationState
+  initialMiningPaginationState,
 );
 
 // Persist mining pagination state to localStorage
@@ -445,7 +451,7 @@ if (typeof window !== "undefined") {
         hasMore: state.hasMore,
         batchSize: state.batchSize,
         // Don't persist isLoading state
-      })
+      }),
     );
   });
 }
@@ -504,7 +510,7 @@ export const peerGeoDistribution = derived(
     });
 
     const dominantRegion = buckets.find(
-      (bucket) => bucket.regionId !== UNKNOWN_REGION_ID && bucket.count > 0
+      (bucket) => bucket.regionId !== UNKNOWN_REGION_ID && bucket.count > 0,
     );
 
     return {
@@ -513,7 +519,7 @@ export const peerGeoDistribution = derived(
       dominantRegionId: dominantRegion ? dominantRegion.regionId : null,
       generatedAt: Date.now(),
     };
-  }
+  },
 );
 
 export const networkStats = writable<NetworkStats>(dummyNetworkStats);
@@ -582,26 +588,26 @@ export interface AccurateTotalsProgress {
 export const accurateTotals = writable<AccurateTotals | null>(null);
 export const isCalculatingAccurateTotals = writable<boolean>(false);
 export const accurateTotalsProgress = writable<AccurateTotalsProgress | null>(
-  null
+  null,
 );
 
 // Calculate total mined from loaded mining reward transactions (partial - based on loaded data)
 export const totalEarned = derived(transactions, ($txs) =>
   $txs
     .filter((tx) => tx.type === "mining")
-    .reduce((sum, tx) => sum + tx.amount, 0)
+    .reduce((sum, tx) => sum + tx.amount, 0),
 );
 
 export const totalSpent = derived(transactions, ($txs) =>
   $txs
     .filter((tx) => tx.type === "sent")
-    .reduce((sum, tx) => sum + tx.amount, 0)
+    .reduce((sum, tx) => sum + tx.amount, 0),
 );
 
 export const totalReceived = derived(transactions, ($txs) =>
   $txs
     .filter((tx) => tx.type === "received")
-    .reduce((sum, tx) => sum + tx.amount, 0)
+    .reduce((sum, tx) => sum + tx.amount, 0),
 );
 
 // Store for active P2P transfers and WebRTC sessions
@@ -695,7 +701,7 @@ export interface AppSettings {
   maxLogSizeMB: number; // Maximum size of a single log file in MB
   pricePerMb: number; // Price per MB in Chiral (e.g., 0.001)
   customBootstrapNodes: string[]; // Custom bootstrap nodes for DHT (leave empty to use defaults)
-  selectedProtocol: "WebRTC" | "BitTorrent" | "ED2K" | "FTP"; // Protocol selected for file uploads
+  selectedProtocol: "WebRTC" | "BitTorrent" | "ED2K" | "FTP" | "Bitswap"; // Protocol selected for file uploads
 }
 
 // Export the settings store
@@ -751,11 +757,11 @@ export const settings = writable<AppSettings>({
   maxLogSizeMB: 10, // 10 MB per log file by default
   pricePerMb: 0.001, // Default price: 0.001, until ability to set pricePerMb is there, then change to 0.001 Chiral per MB
   customBootstrapNodes: [], // Empty by default - use hardcoded bootstrap nodes
-  selectedProtocol: "WebRTC", // Default to WebRTC
+  selectedProtocol: "WebRTC", // Default upload protocol
 });
 
 export const activeBandwidthLimits = writable<ActiveBandwidthLimits>(
-  defaultActiveBandwidthLimits
+  defaultActiveBandwidthLimits,
 );
 
 // Transaction polling functionality
@@ -771,7 +777,7 @@ const activePollingTasks = new Map<string, boolean>();
  * Add a transaction and start polling for status updates
  */
 export async function addTransactionWithPolling(
-  transaction: Transaction
+  transaction: Transaction,
 ): Promise<void> {
   if (!transaction.transaction_hash) {
     throw new Error("Transaction must have a hash for polling");
@@ -817,11 +823,11 @@ export async function addTransactionWithPolling(
               };
             }
             return tx;
-          })
+          }),
         );
       },
       120, // 2 minutes max polling
-      2000 // 2 second intervals
+      2000, // 2 second intervals
     );
   } catch (error) {
     console.error(`Failed to poll transaction ${txHash}:`, error);
@@ -838,7 +844,7 @@ export async function addTransactionWithPolling(
           };
         }
         return tx;
-      })
+      }),
     );
   } finally {
     activePollingTasks.delete(txHash);
@@ -850,11 +856,11 @@ export async function addTransactionWithPolling(
  */
 export function updateTransactionStatus(
   txHash: string,
-  updates: Partial<Transaction>
+  updates: Partial<Transaction>,
 ): void {
   transactions.update((txs) =>
     txs.map((tx) =>
-      tx.transaction_hash === txHash ? { ...tx, ...updates } : tx
-    )
+      tx.transaction_hash === txHash ? { ...tx, ...updates } : tx,
+    ),
   );
 }
