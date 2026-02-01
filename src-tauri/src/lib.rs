@@ -1,11 +1,14 @@
 // Library exports for testing
+pub mod app_state;
 pub mod protocols;
 pub mod analytics;
 pub mod bandwidth;
-pub mod config; 
+pub mod chunk_verification;
+pub mod config;
 pub mod control_plane;
 pub mod multi_source_download;
 pub mod download_restart;
+pub mod p2p_download_recovery;
 pub mod transfer_events;
 
 // Connection retry and resilience framework
@@ -25,17 +28,22 @@ pub mod download_paths;
 
 // Required modules for multi_source_download
 pub mod dht;
+pub mod gossipsub_metadata;
 pub mod file_transfer;
 pub mod ftp_downloader;
 pub mod ftp_server;
 pub mod peer_selection;
 pub mod peer_cache;
 pub mod webrtc_service;
+pub mod protocol_manager;
 
 // Required modules for encryption and keystore functionality
 pub mod encryption;
 pub mod keystore;
 pub mod manager;
+
+// P2P chunk network - real network integration for recovery
+pub mod p2p_chunk_network;
 
 // Proxy latency optimization module
 pub mod proxy_latency;

@@ -621,6 +621,31 @@
     "testWallet": {
       "header": "For Testing Only",
       "button": "Create Test Wallet"
+    },
+    "wizard": {
+      "existingWallets": "Your Saved Wallets",
+      "loadingWallets": "Loading wallets...",
+      "unlockSuccess": "Wallet loaded successfully",
+      "orCreateImport": "Or",
+      "walletName": "Wallet Name (optional)",
+      "walletNamePlaceholder": "e.g., Main Wallet",
+      "passwordOptional": "Password (optional)",
+      "passwordPlaceholder": "Leave empty if none",
+      "deleteWallet": "Delete wallet",
+      "deleteConfirm": "Delete wallet \"{name}\"? This cannot be undone.",
+      "deleteSuccess": "Wallet deleted successfully"
+    },
+    "switcher": {
+      "title": "Switch Wallet",
+      "switchWallet": "Switch",
+      "current": "Current",
+      "deleteWallet": "Delete wallet",
+      "deleteConfirm": "Delete wallet {address}? This cannot be undone."
+    },
+    "errors": {
+      "loadKeystoreFailed": "Failed to load saved wallets",
+      "loadFailed": "Failed to load wallet. It may have been saved with a password.",
+      "deleteFailed": "Failed to delete wallet"
     }
   },
   "transfer": {
@@ -1133,6 +1158,12 @@
     "off": "OFF",
     "refresh": "Refresh",
     "clear": "Clear",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "Solo Mining",
       "pool1": "ChiralPool #1",
@@ -1716,7 +1747,15 @@
     },
     "blocks": {
       "latest": "Latest Blocks",
-      "noBlocks": "No blocks found"
+      "noBlocks": "No blocks found",
+      "syncingTitle": "Syncing blocks…",
+      "syncingSubtitle": "Your node is still syncing. Recent blocks may not be available until sync completes."
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "Syncing",
@@ -1724,7 +1763,8 @@
       "highest": "Highest Block",
       "remaining": "Remaining",
       "eta": "ETA",
-      "complete": "Sync Complete"
+      "complete": "Sync Complete",
+      "inProgress": "Sync in progress"
     },
     "search": {
       "title": "Search Blockchain",
@@ -1782,6 +1822,13 @@
       "transaction": {
         "confirmed": "Transaction confirmed! {amount} CN sent to {address}... (Block {block})",
         "failed": "Transaction failed in block {block}. Your funds were not sent."
+      },
+      "switcher": {
+        "switchSuccess": "Switched to wallet successfully",
+        "switchError": "Failed to switch wallet",
+        "deleteSuccess": "Wallet deleted successfully",
+        "deleteError": "Failed to delete wallet",
+        "cannotDeleteActive": "Cannot delete the currently active wallet"
       }
     },
     "account": {
@@ -1875,7 +1922,9 @@
       "messageSent": "Test message sent: {message}",
       "sendError": "Failed to send message: {error}",
       "gethInstalled": "Geth is already installed",
-      "gethDownloadError": "Failed to download Geth: {error}"
+      "gethDownloadError": "Failed to download Geth: {error}",
+      "gethReinitSuccess": "Reinitialized blockchain data for the new network",
+      "gethReinitError": "Failed to reinitialize blockchain data: {error}"
     },
     "download": {
       "payment": {
@@ -1951,7 +2000,7 @@
     "warnings": {
       "forcedMode": "You have manually enabled pure client mode in Settings. You cannot seed files or act as a DHT server. Blockchain uses light sync mode (minimal download).",
       "forcedModeMining": "You have manually enabled pure client mode in Settings. Blockchain syncs only last ~100 blocks instead of full sync (~10,000 blocks). Mining is available but uses minimal storage.",
-      "natDetected": "AutoNAT detected that you're behind NAT or a restrictive firewall. You can download files but cannot seed them to other peers.",
+      "natDetected": "AutoNAT detected that you're behind NAT or a restrictive firewall. You can download files but cannot seed them directly to other peers. Files are saved locally and may be shared through relay servers.",
       "natDetectedMining": "AutoNAT detected that you're behind NAT or a restrictive firewall. Blockchain syncs only last ~100 blocks to reduce bandwidth/storage requirements. Mining is available with reduced storage.",
       "settingsForced": "⚠️ Client mode forced: You will not be able to seed files or act as DHT server. Blockchain uses partial sync (last ~100 blocks only) instead of full sync (~10,000 blocks). Mining available with reduced storage. Requires DHT restart.",
       "serverModeDisabled": "ℹ️ Server mode is disabled when client mode is forced."
@@ -1966,12 +2015,12 @@
         "defaultMining": "Client-Only Mode - Limited Blockchain Sync"
       },
       "description": {
-        "default": "You are in client-only mode and cannot seed files.",
+        "default": "You can still upload files - they will be shared through relay servers instead of direct connections.",
         "defaultMining": "You are in client-only mode. Blockchain syncs only last ~100 blocks (minimal storage). Mining is available."
       },
       "help": {
         "forced": "To enable seeding, disable \"Force Client-Only Mode\" in Settings → Developers → DHT Client Mode.",
-        "nat": "Your files will still be saved locally, but won't be shared with the network. To enable seeding, configure port forwarding or use a VPN with a public IP.",
+        "nat": "To enable direct peer-to-peer seeding: 1) Enable UPnP in Settings → Network (if your router supports it), 2) Manually configure port forwarding on your router, or 3) Use a VPN with a public IP. Relay-based sharing may still work.",
         "default": "Check your network settings or AutoNAT configuration.",
         "forcedMining": "To enable full blockchain sync (10,000 blocks), disable \"Force Client-Only Mode\" in Settings → Developers.",
         "natMining": "Full nodes sync ~10,000 blocks. To upgrade, configure port forwarding or use a VPN with a public IP to become publicly reachable.",

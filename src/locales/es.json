@@ -459,6 +459,23 @@
     "testWallet": {
       "header": "Solo para Pruebas",
       "button": "Crear Billetera de Prueba"
+    },
+    "wizard": {
+      "existingWallets": "Tus Billeteras Guardadas",
+      "loadingWallets": "Cargando billeteras...",
+      "enterPassword": "Ingresa la contraseña de la billetera",
+      "unlockWallet": "Desbloquear Billetera",
+      "unlockSuccess": "Billetera desbloqueada con éxito",
+      "orCreateImport": "O",
+      "walletName": "Nombre de Billetera (opcional)",
+      "walletNamePlaceholder": "ej., Billetera Principal",
+      "passwordOptional": "Contraseña (opcional)",
+      "passwordPlaceholder": "Deja vacío si no hay"
+    },
+    "errors": {
+      "loadKeystoreFailed": "Error al cargar billeteras guardadas",
+      "passwordRequired": "Se requiere contraseña",
+      "incorrectPassword": "Contraseña incorrecta o keystore corrupto"
     }
   },
   "transfer": {
@@ -972,6 +989,12 @@
     "off": "APAGADO",
     "refresh": "Actualizar",
     "clear": "Limpiar",
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "Mining and RPC calls may pause for a few seconds while the node flushes data."
+      }
+    },
     "pools": {
       "solo": "Minería en solitario",
       "pool1": "ChiralPool #1",
@@ -1547,7 +1570,15 @@
     },
     "blocks": {
       "latest": "Bloques recientes",
-      "noBlocks": "No se encontraron bloques"
+      "noBlocks": "No se encontraron bloques",
+      "syncingTitle": "Sincronizando bloques...",
+      "syncingSubtitle": "Tu nodo todavia esta sincronizando. Los bloques recientes pueden no estar disponibles hasta que termine la sincronizacion."
+    },
+    "node": {
+      "shuttingDown": {
+        "title": "Blockchain node is shutting down",
+        "subtitle": "You can keep browsing other pages. This view will refresh automatically once the node stops/starts."
+      }
     },
     "sync": {
       "syncing": "Sincronizando",
@@ -1555,7 +1586,8 @@
       "highest": "Bloque más alto",
       "remaining": "Restante",
       "eta": "ETA",
-      "complete": "Sincronización completa"
+      "complete": "Sincronización completa",
+      "inProgress": "Sincronizacion en curso"
     },
     "search": {
       "title": "Buscar en la blockchain",
@@ -1706,7 +1738,9 @@
       "messageSent": "Mensaje de prueba enviado: {message}",
       "sendError": "No se pudo enviar el mensaje: {error}",
       "gethInstalled": "Geth ya está instalado",
-      "gethDownloadError": "No se pudo descargar Geth: {error}"
+      "gethDownloadError": "No se pudo descargar Geth: {error}",
+      "gethReinitSuccess": "Se reinicializaron los datos de blockchain para la nueva red",
+      "gethReinitError": "No se pudieron reinicializar los datos de blockchain: {error}"
     },
     "download": {
       "payment": {
@@ -1957,7 +1991,7 @@
     "warnings": {
       "forcedMode": "Ha habilitado manualmente el modo cliente puro en Configuración. No puede compartir archivos ni actuar como servidor DHT. Blockchain usa modo de sincronización ligera (descarga mínima).",
       "forcedModeMining": "Ha habilitado manualmente el modo cliente puro en Configuración. Blockchain sincroniza solo los últimos ~100 bloques en lugar de sincronización completa (~10,000 bloques). Minería disponible pero usa almacenamiento mínimo.",
-      "natDetected": "AutoNAT detectó que está detrás de NAT o un firewall restrictivo. Puede descargar archivos pero no puede compartirlos con otros pares.",
+      "natDetected": "AutoNAT detectó que está detrás de NAT o un firewall restrictivo. Puede descargar archivos pero no puede compartirlos directamente con otros pares. Los archivos se guardan localmente y pueden compartirse a través de servidores de retransmisión.",
       "natDetectedMining": "AutoNAT detectó que está detrás de NAT o un firewall restrictivo. Blockchain sincroniza solo los últimos ~100 bloques para reducir requisitos de ancho de banda/almacenamiento. Minería disponible con almacenamiento reducido.",
       "settingsForced": "⚠️ Modo cliente forzado: No podrá compartir archivos ni actuar como servidor DHT. Blockchain usa sincronización parcial (solo últimos ~100 bloques) en lugar de sincronización completa (~10,000 bloques). Minería disponible con almacenamiento reducido. Requiere reinicio de DHT.",
       "serverModeDisabled": "ℹ️ El modo servidor está deshabilitado cuando el modo cliente está forzado."
@@ -1977,7 +2011,7 @@
       },
       "help": {
         "forced": "Para habilitar compartir, deshabilite \"Forzar Modo Solo Cliente\" en Configuración → Desarrolladores → Modo Cliente DHT.",
-        "nat": "Sus archivos aún se guardarán localmente, pero no se compartirán con la red. Para habilitar compartir, configure reenvío de puertos o use una VPN con IP pública.",
+        "nat": "Para habilitar el intercambio directo entre pares: 1) Active UPnP en Configuración → Red (si su router lo admite), 2) Configure manualmente el reenvío de puertos en su router, o 3) Use una VPN con IP pública. El intercambio basado en retransmisión aún puede funcionar.",
         "default": "Verifique su configuración de red o configuración de AutoNAT.",
         "forcedMining": "Para habilitar sincronización blockchain completa (10,000 bloques), deshabilite \"Forzar Modo Solo Cliente\" en Configuración → Desarrolladores.",
         "natMining": "Los nodos completos sincronizan ~10,000 bloques. Para actualizar, configure reenvío de puertos o use una VPN con IP pública para ser públicamente accesible.",

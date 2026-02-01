@@ -13,11 +13,18 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use suppaftp::types::FileType;
-use suppaftp::{FtpStream, NativeTlsConnector, NativeTlsFtpStream};
+use suppaftp::{FtpStream, RustlsConnector, RustlsFtpStream};
 use tokio::task::spawn_blocking;
 use tracing::{debug, info, warn};
 use serde::{Serialize, Deserialize};
 use url::Url;
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use sha2::{Sha256, Digest};
+use rand::RngCore;
+use base64::{Engine as _, engine::general_purpose};
 
 /// FTP file entry information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +44,25 @@ pub struct FtpFileEntry {
 /// - Allowing time for slow network connections to establish
 /// - Preventing indefinite hangs on unresponsive servers
 const DEFAULT_FTP_TIMEOUT_SECS: u64 = 30;
+
+/// Create a rustls TLS connector for FTPS connections
+fn create_rustls_connector() -> Result<RustlsConnector> {
+    let mut root_cert_store = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs()
+        .context("Failed to load native root certificates")?
+    {
+        root_cert_store
+            .add(&rustls::Certificate(cert.0))
+            .context("Failed to add certificate to store")?;
+    }
+    
+    let tls_config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_cert_store)
+        .with_no_client_auth();
+
+    Ok(RustlsConnector::from(Arc::new(tls_config)))
+}
 
 /// FTP download progress callback
 pub type ProgressCallback = Box<dyn Fn(u64, u64) + Send>;
@@ -179,14 +205,12 @@ impl FtpClient {
             "Connecting to FTPS server"
         );
 
-        // Create TLS connector
-        let tls_connector = NativeTlsConnector::from(
-            native_tls::TlsConnector::new().context("Failed to create TLS connector")?,
-        );
+        // Create TLS connector with rustls
+        let tls_connector = create_rustls_connector()?;
 
         // Note: connect_secure_implicit doesn't support timeout directly,
         // so we use the deprecated method but set timeouts after connection
-        let mut ftp_stream = NativeTlsFtpStream::connect_secure_implicit(
+        let mut ftp_stream = RustlsFtpStream::connect_secure_implicit(
             format!("{}:{}", host, port),
             tls_connector,
             &host,
@@ -485,11 +509,9 @@ pub async fn list_ftp_directory(source_info: &FtpSourceInfo) -> Result<Vec<FtpFi
         // Connect to FTP server
         let ftp_stream = if source_clone.use_ftps {
             // FTPS connection
-            let tls_connector = NativeTlsConnector::from(
-                native_tls::TlsConnector::new().context("Failed to create TLS connector")?
-            );
+            let tls_connector = create_rustls_connector()?;
 
-            let mut stream = NativeTlsFtpStream::connect_secure_implicit(
+            let mut stream = RustlsFtpStream::connect_secure_implicit(
                 format!("{}:{}", host, port),
                 tls_connector,
                 &host,
@@ -611,11 +633,9 @@ pub async fn delete_ftp_file(source_info: &FtpSourceInfo) -> Result<()> {
 
         if source_clone.use_ftps {
             // FTPS connection
-            let tls_connector = NativeTlsConnector::from(
-                native_tls::TlsConnector::new().context("Failed to create TLS connector")?
-            );
+            let tls_connector = create_rustls_connector()?;
 
-            let mut stream = NativeTlsFtpStream::connect_secure_implicit(
+            let mut stream = RustlsFtpStream::connect_secure_implicit(
                 format!("{}:{}", host, port),
                 tls_connector,
                 &host,
@@ -694,11 +714,9 @@ pub async fn rename_ftp_file(source_info: &FtpSourceInfo, new_name: &str) -> Res
 
         if source_clone.use_ftps {
             // FTPS connection
-            let tls_connector = NativeTlsConnector::from(
-                native_tls::TlsConnector::new().context("Failed to create TLS connector")?
-            );
+            let tls_connector = create_rustls_connector()?;
 
-            let mut stream = NativeTlsFtpStream::connect_secure_implicit(
+            let mut stream = RustlsFtpStream::connect_secure_implicit(
                 format!("{}:{}", host, port),
                 tls_connector,
                 &host,
@@ -759,11 +777,9 @@ pub async fn create_ftp_directory(source_info: &FtpSourceInfo) -> Result<()> {
 
         if source_clone.use_ftps {
             // FTPS connection
-            let tls_connector = NativeTlsConnector::from(
-                native_tls::TlsConnector::new().context("Failed to create TLS connector")?
-            );
+            let tls_connector = create_rustls_connector()?;
 
-            let mut stream = NativeTlsFtpStream::connect_secure_implicit(
+            let mut stream = RustlsFtpStream::connect_secure_implicit(
                 format!("{}:{}", host, port),
                 tls_connector,
                 &host,
@@ -905,4 +921,100 @@ mod tests {
         let timeout = source_info.timeout_secs.unwrap_or(DEFAULT_FTP_TIMEOUT_SECS);
         assert_eq!(timeout, 60);
     }
+}
+
+// ------ FTP Credential Encryption ------
+
+/// Encrypts an FTP password using AES-256-GCM with file hash as key derivation material
+///
+/// # Security Properties
+/// - Uses AES-256-GCM for authenticated encryption (detects tampering)
+/// - Key derived from SHA-256(file_hash + static_salt)
+/// - Random 12-byte nonce prepended to ciphertext
+/// - Result is base64-encoded for storage/transmission
+///
+/// # Security Considerations
+/// - File hash is public, so anyone with the hash can decrypt the password
+/// - This is intentional: credentials are shared with peers who have the file hash
+/// - NOT suitable for private FTP servers - use WebRTC protocol instead
+///
+/// # Arguments
+/// * `password` - The plaintext FTP password to encrypt
+/// * `file_hash` - The file hash used as key derivation material
+///
+/// # Returns
+/// Base64-encoded string containing: nonce (12 bytes) + ciphertext
+pub fn encrypt_ftp_password(password: &str, file_hash: &str) -> Result<String> {
+    // Derive 256-bit key from file hash
+    let mut hasher = Sha256::new();
+    hasher.update(file_hash.as_bytes());
+    hasher.update(b"chiral_ftp_credential_salt_v1");
+    let key_bytes = hasher.finalize();
+
+    // Create cipher
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+
+    // Generate random nonce
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    // Encrypt
+    let ciphertext = cipher
+        .encrypt(nonce, password.as_bytes())
+        .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+
+    // Combine nonce + ciphertext and base64 encode
+    let mut combined = nonce_bytes.to_vec();
+    combined.extend_from_slice(&ciphertext);
+    Ok(general_purpose::STANDARD.encode(&combined))
+}
+
+/// Decrypts an FTP password encrypted with encrypt_ftp_password
+///
+/// # Arguments
+/// * `encrypted` - Base64-encoded string containing nonce + ciphertext
+/// * `file_hash` - The file hash used as key derivation material (must match encryption)
+///
+/// # Returns
+/// Decrypted plaintext password
+///
+/// # Errors
+/// Returns error if:
+/// - Base64 decoding fails
+/// - Data is too short (< 12 bytes for nonce)
+/// - Key derivation fails
+/// - Decryption fails (wrong key or tampered data)
+/// - UTF-8 decoding fails
+pub fn decrypt_ftp_password(encrypted: &str, file_hash: &str) -> Result<String> {
+    // Decode base64
+    let combined = general_purpose::STANDARD.decode(encrypted)
+        .map_err(|e| anyhow!("Base64 decode failed: {}", e))?;
+
+    if combined.len() < 12 {
+        return Err(anyhow!("Invalid encrypted password: too short"));
+    }
+
+    // Split nonce and ciphertext
+    let (nonce_bytes, ciphertext) = combined.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    // Derive same key
+    let mut hasher = Sha256::new();
+    hasher.update(file_hash.as_bytes());
+    hasher.update(b"chiral_ftp_credential_salt_v1");
+    let key_bytes = hasher.finalize();
+
+    // Create cipher
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| anyhow!("Failed to create cipher: {}", e))?;
+
+    // Decrypt
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow!("Decryption failed (wrong key or tampered data): {}", e))?;
+
+    String::from_utf8(plaintext)
+        .map_err(|e| anyhow!("UTF-8 decode failed: {}", e))
 }
